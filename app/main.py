@@ -1,4 +1,4 @@
-"""Bonki Intel - an intelligent Telegram group file agent.
+"""Bonki-Intelligence - an intelligent Telegram group file agent.
 
 FastAPI app: receives Telegram updates (webhook), runs the agent, and serves a
 small no-auth dashboard to configure the brain, the groups, and the user account.
@@ -36,6 +36,7 @@ def _mask(v):
 async def lifespan(app: FastAPI):
     db.init_db()
     threading_start_userbot()
+    await handlers.init_identity()
     _ensure_webhook_secret()
     if _use_polling():
         _disable_webhook()
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
         _set_webhook()
         log.info("telegram mode: webhook")
     _set_commands()
+    asyncio.create_task(_auto_index_loop())
     try:
         st = db.storage_info()
         log.info("startup: storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",
@@ -118,17 +120,53 @@ def _disable_webhook():
         log.warning("could not delete webhook: %s", e)
 
 
-async def _poll_loop():
-    """Long-poll Telegram and dispatch updates. Telegram keeps undelivered
-    updates for ~24h, so a sleeping free host catches up when it wakes."""
-    await asyncio.sleep(2)
-    offset = None
+async def _auto_index_loop():
+    """Background: index new files from every enabled group on a timer, so a
+    manual scan is never needed. Live capture handles files the bot sees at once;
+    this catches everything else (including files posted while it was asleep)."""
+    await asyncio.sleep(30)
     while True:
         try:
-            res = telegram.get_updates(offset=offset, timeout=25)
-            for u in res.get("result", []):
+            s = db.get_settings()
+            if (str(s.get("auto_scan") or "1") == "1" and not db.is_paused()
+                    and userbot.is_running()):
+                res = await indexer.scan_all()
+                added = sum(r.get("added", 0) for r in res)
+                if added:
+                    log.info("auto-index: %d new file(s)", added)
+        except Exception as e:
+            log.warning("auto-index failed: %s", e)
+        try:
+            interval = max(2.0, float(db.get_settings().get("scan_interval_minutes") or 10))
+        except (TypeError, ValueError):
+            interval = 10.0
+        await asyncio.sleep(interval * 60)
+
+
+async def _poll_loop():
+    """Long-poll Telegram and dispatch updates. Telegram keeps undelivered
+    updates for ~24h, so a sleeping free host catches up when it wakes.
+
+    The blocking HTTP call runs in a thread so it never starves the event loop,
+    and the last update id is remembered so a restart doesn't reprocess (and
+    re-answer) old messages.
+    """
+    await asyncio.sleep(2)
+    try:
+        saved = db.get_settings().get("tg_offset")
+        offset = int(saved) if saved else None
+    except (TypeError, ValueError):
+        offset = None
+    while True:
+        try:
+            res = await asyncio.to_thread(telegram.get_updates, offset, 25)
+            ups = res.get("result", [])
+            for u in ups:
                 offset = u.get("update_id", 0) + 1
                 asyncio.create_task(handlers.handle_update(u))
+            if ups:
+                db.set_settings({"tg_offset": str(offset)})
+                await asyncio.to_thread(db.flush, True)
         except Exception as e:
             log.warning("poll failed: %s", e)
             await asyncio.sleep(3)
@@ -150,7 +188,7 @@ def _set_commands():
         pass
 
 
-app = FastAPI(title="Bonki Intel", lifespan=lifespan)
+app = FastAPI(title="Bonki-Intelligence", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -230,7 +268,7 @@ async def group_scan(gid: int):
         return _redir("Group not found.")
     if not userbot.is_running():
         return _redir("User account not connected - log in at /userbot to scan history.")
-    asyncio.create_task(indexer.scan(row))
+    asyncio.create_task(indexer.scan(row, full=True))
     return _redir(f"Scanning {row.get('title')}… refresh in a moment.")
 
 
@@ -238,7 +276,7 @@ async def group_scan(gid: int):
 async def scan_all():
     if not userbot.is_running():
         return _redir("User account not connected - log in at /userbot to scan history.")
-    asyncio.create_task(indexer.scan_all())
+    asyncio.create_task(indexer.scan_all(full=True))
     return _redir("Scanning all groups…")
 
 
@@ -276,8 +314,9 @@ def settings_save(
     openai_model: str = Form("gpt-4o-mini"),
     openai_api_key: str = Form(""),
     scan_depth: str = Form("500"),
+    scan_interval_minutes: str = Form("10"),
     index_extensions: str = Form("apk, zip"),
-    reply_footer: str = Form("Bonki Intel"),
+    reply_footer: str = Form("Bonki-Intelligence"),
     max_upload_mb: str = Form("50"),
     allow_user_ids: str = Form(""),
     webhook_secret: str = Form(""),
@@ -286,6 +325,7 @@ def settings_save(
     tg_session: str = Form(""),
     require_mention: str = Form(None),
     index_live: str = Form(None),
+    auto_scan: str = Form(None),
     reply_with_file: str = Form(None),
     mention_requester: str = Form(None),
     add_hashtag: str = Form(None),
@@ -300,6 +340,7 @@ def settings_save(
         "openai_base_url": openai_base_url.strip() or "https://api.openai.com/v1",
         "openai_model": openai_model.strip() or "gpt-4o-mini",
         "scan_depth": scan_depth.strip() or "500",
+        "scan_interval_minutes": scan_interval_minutes.strip() or "10",
         "index_extensions": index_extensions.strip(),
         "reply_footer": reply_footer.strip(),
         "max_upload_mb": max_upload_mb.strip() or "50",
@@ -308,6 +349,7 @@ def settings_save(
         "tg_api_id": tg_api_id.strip(),
         "require_mention": "1" if require_mention is not None else "0",
         "index_live": "1" if index_live is not None else "0",
+        "auto_scan": "1" if auto_scan is not None else "0",
         "reply_with_file": "1" if reply_with_file is not None else "0",
         "mention_requester": "1" if mention_requester is not None else "0",
         "add_hashtag": "1" if add_hashtag is not None else "0",

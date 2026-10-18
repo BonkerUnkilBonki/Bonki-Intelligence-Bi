@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Settings · Bonki Intel{% endblock %}
+{% block title %}Settings · Bonki-Intelligence{% endblock %}
 {% block body %}
 <form method="post" action="/settings">
 
@@ -52,6 +52,10 @@
 
 <div class="card">
   <h2>Indexing</h2>
+  <label><input type="checkbox" name="auto_scan" {% if s.auto_scan=='1' %}checked{% endif %} style="width:auto"> <b>Auto-index new files</b> — no manual scan needed</label>
+  <div class="small muted" style="margin:4px 0 8px 24px">Indexes files live as they're posted, and a background pass scans each group for anything it missed.</div>
+  <label>Auto-scan interval (minutes)</label>
+  <input name="scan_interval_minutes" value="{{ s.scan_interval_minutes }}">
   <label>Scan depth (messages walked per scan)</label>
   <input name="scan_depth" value="{{ s.scan_depth }}">
   <label>File extensions to index (comma separated)</label>

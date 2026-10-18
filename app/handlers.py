@@ -5,7 +5,11 @@ For every message the bot receives it:
   * indexes any file posted (live capture), when enabled
   * checks whether Bonki is being addressed (wake word / @mention / reply to bot)
     and, if so, hands the instruction to the agent
+
+All Telegram / state-store calls are offloaded to a thread, so a slow network
+call can never freeze the bot and stop it replying.
 """
+import asyncio
 import logging
 import re
 
@@ -16,15 +20,23 @@ log = logging.getLogger("handlers")
 _bot_identity = {"username": None, "id": None}
 
 
+async def init_identity():
+    """Fetch the bot's own username/id once at startup (blocking call -> thread)."""
+    try:
+        me = await asyncio.to_thread(lambda: telegram.get_me().get("result") or {})
+        _bot_identity["username"] = me.get("username")
+        _bot_identity["id"] = me.get("id")
+    except Exception as e:
+        log.warning("getMe failed: %s", e)
+
+
 def _identity():
-    if _bot_identity["id"] is None:
-        try:
-            me = telegram.get_me().get("result") or {}
-            _bot_identity["username"] = me.get("username")
-            _bot_identity["id"] = me.get("id")
-        except Exception as e:
-            log.warning("getMe failed: %s", e)
     return _bot_identity
+
+
+async def _send(text, chat_id, reply_to=None):
+    return await asyncio.to_thread(telegram.send_message, text, chat_id=chat_id,
+                                   reply_to=reply_to)
 
 
 def _wake_words():
@@ -58,8 +70,7 @@ def strip_address(text):
     for w in _wake_words():
         out = re.sub(r"(?i)(^|[^a-z0-9])" + re.escape(w) + r"([^a-z0-9]|$)", " ", out)
     out = re.sub(r"^[\s,.:;!?\-]+", "", out)
-    out = re.sub(r"\s+", " ", out).strip()
-    return out
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def _allowed_dm(user_id):
@@ -79,18 +90,16 @@ async def handle_update(update):
     if frm.get("is_bot"):
         return                              # never react to bots (incl. itself)
 
-    # auto-register groups/channels so the dashboard can list and scan them
     if ctype in ("group", "supergroup", "channel"):
         if not db.get_group_by_chat(chat.get("id")):
             db.add_group(chat.get("id"), chat.get("title") or "",
                          chat.get("username") or "")
 
-    # index files posted in a group/channel, live
     if ctype in ("group", "supergroup", "channel") \
             and str(db.get_settings().get("index_live") or "1") == "1":
         try:
             indexer.capture_from_message(chat, msg)
-            db.flush()
+            await asyncio.to_thread(db.flush)
         except Exception as e:
             log.warning("live index failed: %s", e)
 
@@ -103,22 +112,20 @@ async def handle_update(update):
                 await agent.handle(chat, msg, frm, clean)
             except Exception as e:
                 log.warning("agent failed: %s", e)
-                telegram.send_message(f"Sorry, something went wrong: {telegram.esc(e)}",
-                                      chat_id=chat.get("id"),
-                                      reply_to=msg.get("message_id"))
+                await _send(f"Sorry, something went wrong: {telegram.esc(e)}",
+                            chat.get("id"), reply_to=msg.get("message_id"))
         return
 
     if ctype == "private":
         if not _allowed_dm(frm.get("id")):
-            telegram.send_message(
-                "Hi! Add your Telegram user id under Settings → Allowed DM ids, or use "
-                "me inside a group. (Get your id from @userinfobot.)",
-                chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+            await _send("Hi! Add your Telegram user id under Settings → Allowed DM "
+                        "ids, or use me inside a group. (Get your id from @userinfobot.)",
+                        chat.get("id"), reply_to=msg.get("message_id"))
             return
         if text:
             try:
                 await agent.handle(chat, msg, frm, strip_address(text) or text)
             except Exception as e:
                 log.warning("agent(DM) failed: %s", e)
-                telegram.send_message(f"Sorry, something went wrong: {telegram.esc(e)}",
-                                      chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+                await _send(f"Sorry, something went wrong: {telegram.esc(e)}",
+                            chat.get("id"), reply_to=msg.get("message_id"))

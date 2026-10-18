@@ -1,4 +1,4 @@
-# Bonki Intel
+# Bonki-Intelligence
 
 An **intelligent Telegram group agent**. Bonki indexes the files people share in a
 group, understands a plain-English request, finds the file you mean, and answers —
@@ -26,7 +26,10 @@ one is a *conversational file brain for groups*.
 | You say (in the group) | Bonki does |
 |---|---|
 | `Bonki, scan this group and tag apple music apk` | scans history, finds the APK, re-posts it, mentions you, tags `#AppleMusic` |
-| `Bonki, get the latest whatsapp mod apk` | finds the best match and re-posts it |
+| `Bonki, find apple music apk` | finds the best match and re-posts it |
+| `Bonki, find Antigravity-bypass.apk` | finds it by name — **no file type needed** |
+| `Bonki, find antigravty` | **fuzzy** — typos and partial names still match |
+| *(any new file posted)* | **indexed automatically** — no manual scan |
 | `Bonki, list apks` | lists indexed files |
 | `Bonki, how many zips` | counts them |
 | `Bonki, group stats` | breakdown by file type and top sharers |
@@ -36,6 +39,24 @@ one is a *conversational file brain for groups*.
 Bonki answers when it's **addressed** — its wake word (`bonki`, and the handle
 `bonki_intelligence_bot`, by default), an `@mention` (`@Bonki_Intelligence_bot`),
 or a reply to one of its messages. That's configurable.
+
+**Auto-indexing.** You never have to scan by hand. Files are indexed the moment
+they're posted (live capture), and a background pass re-scans each group on a
+timer for anything missed — including files posted while the service was asleep.
+Toggle it under Settings → **Auto-index new files**; set the interval there too.
+
+**Sharing the file, not a link.** When Bonki finds a file it shares the *actual
+file*, tried in this order: a server-side copy by the bot (full size, no upload,
+appears as Bonki), an upload by the bot (files up to the size limit), then a
+server-side forward via your user account (any size up to 2 GB). A link is sent
+only if all of those fail.
+
+**How matching works.** A query is split into *distinctive* words
+(`antigravity`) and *type* words (`apk`). Type words are only a hint — they never
+pick a file on their own, so "apple music apk" won't fall back to an unrelated
+APK. Distinctive words match fuzzily (typos, prefixes, partial names), and if
+nothing genuinely fits, Bonki says so instead of guessing. It uses `rapidfuzz`
+when available and falls back to a built-in matcher otherwise.
 
 ---
 
@@ -118,7 +139,7 @@ Bonki, scan this group and tag apple music apk
 1. **Push the code to GitHub** (a new repo, e.g. `bonki-intel`). Render deploys
    from a Git repo. From inside the `bonki-intel` folder:
    ```bash
-   git init && git add . && git commit -m "Bonki Intel"
+   git init && git add . && git commit -m "Bonki-Intelligence"
    git branch -M main
    git remote add origin https://github.com/<you>/bonki-intel.git
    git push -u origin main

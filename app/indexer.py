@@ -1,14 +1,19 @@
 """The group file index.
 
-Two ways files get into the index:
+Three ways files get into the index - so no manual scan is ever required:
 
-  * history scan - the user account walks a group's back-catalogue (indexer.scan)
-  * live capture - whenever a file is posted in a group the bot can see, it is
+  * live capture  - whenever a file is posted in a group the bot can see, it is
     indexed straight away (indexer.capture_from_message)
+  * auto-scan     - a background timer walks each group's history for new files
+    and indexes them (main._auto_index_loop -> indexer.scan_all)
+  * manual scan   - "Bonki, scan this group" (indexer.scan, full pass)
 
-Both funnel into db.upsert_file, so a later "find me X" has something to search.
+All three funnel into db.upsert_file, which de-duplicates, so a file is never
+indexed twice.
 """
+import asyncio
 import logging
+import time
 
 from . import db, userbot
 
@@ -61,39 +66,54 @@ def capture_from_message(chat, msg):
     return added
 
 
-async def scan(group_row):
-    """Scan one group's history with the user account and index its files."""
+def _newest_known(chat_id):
+    return max((f.get("message_id") or 0 for f in db.list_files(chat_id=chat_id)), default=0)
+
+
+async def scan(group_row, full=False):
+    """Scan one group's history with the user account and index its files.
+
+    Incremental by default: only messages newer than the newest we already have
+    are fetched. Pass full=True for a complete re-walk (the manual scan button).
+    """
     handle = group_row.get("handle") or group_row.get("chat_id")
+    chat_id = group_row.get("chat_id") or handle
     depth = int(db.get_settings().get("scan_depth") or 500)
     exts = index_exts()
+    min_id = 0 if full else _newest_known(chat_id)
     try:
-        files = await userbot.scan(handle, limit=depth, exts=exts)
+        files = await userbot.scan(handle, limit=depth, exts=exts, min_id=min_id)
     except Exception as e:
         db.update_group(group_row["id"], {"last_status": f"scan failed: {e}"})
-        db.flush(force=True)
+        await asyncio.to_thread(db.flush, True)
         return {"group": handle, "error": str(e), "added": 0, "found": 0}
     added = 0
     for f in files:
-        if db.upsert_file(chat_id=group_row.get("chat_id") or handle,
-                          message_id=f["message_id"], name=f["name"], ext=f["ext"],
-                          size=f["size"], mime=f["mime"], date=f["date"],
+        if db.upsert_file(chat_id=chat_id, message_id=f["message_id"], name=f["name"],
+                          ext=f["ext"], size=f["size"], mime=f["mime"], date=f["date"],
                           sender_id=f.get("sender_id"), sender_name=f.get("sender_name"),
                           caption=f.get("caption"), source="history"):
             added += 1
     db.update_group(group_row["id"], {
-        "last_scan": __import__("time").time(),
-        "last_status": f"scanned {len(files)} file(s), {added} new",
+        "last_scan": time.time(),
+        "last_status": (f"scanned {len(files)} new message(s), {added} file(s) added"
+                        if not full else
+                        f"full scan: {len(files)} file(s), {added} new"),
     })
-    db.flush(force=True)
-    db.log_activity("scan", group_row.get("chat_id"), f"{len(files)} files ({added} new)")
+    await asyncio.to_thread(db.flush, True)
+    if added:
+        db.log_activity("scan", chat_id, f"{added} new file(s) indexed")
     return {"group": handle, "added": added, "found": len(files)}
 
 
-async def scan_all():
+async def scan_all(full=False):
     if db.is_paused():
         return []
     out = []
     for g in db.list_groups():
         if g.get("enabled"):
-            out.append(await scan(g))
+            try:
+                out.append(await scan(g, full=full))
+            except Exception as e:
+                log.warning("scan %s failed: %s", g.get("chat_id"), e)
     return out

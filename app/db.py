@@ -1,4 +1,4 @@
-"""Durable state store for Bonki Intel.
+"""Durable state store for Bonki-Intelligence.
 
 Keeps the settings, the list of groups, the *file index* (every document the bot
 has scanned out of a group), tags and an activity log. Written to a local JSON

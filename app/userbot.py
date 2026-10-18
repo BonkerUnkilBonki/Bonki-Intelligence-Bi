@@ -114,15 +114,19 @@ async def _entity(handle):
     return await _client.get_entity(clean_handle(handle))
 
 
-async def scan(handle, limit=500, exts=None):
-    """Walk a group's history and return every matching file as a dict."""
+async def scan(handle, limit=500, exts=None, min_id=0):
+    """Walk a group's history and return every matching file as a dict.
+
+    `min_id` makes it incremental: only messages newer than that id are fetched,
+    so the periodic auto-scan is cheap after the first pass.
+    """
     if _client is None:
         raise RuntimeError("userbot is not connected")
     entity = await _entity(handle)
     found, offset_id = [], 0
     while len(found) < limit:
         batch = await _client.get_messages(entity, limit=min(100, limit - len(found)),
-                                           offset_id=offset_id)
+                                           offset_id=offset_id, min_id=int(min_id or 0))
         if not batch:
             break
         for m in batch:
@@ -148,6 +152,20 @@ async def download(handle, message_id, dest_path):
     return path
 
 
+async def _resolve_dest(dest_chat):
+    """Turn a stored destination (@name / -100… id) into something Telethon can
+    send to. Falls back to the raw value if it can't be resolved."""
+    if dest_chat is None:
+        return dest_chat
+    try:
+        if isinstance(dest_chat, str) and re.fullmatch(r"-?\d+", dest_chat.strip()):
+            return await _client.get_entity(int(dest_chat))
+        return await _client.get_entity(clean_handle(dest_chat))
+    except Exception as e:
+        log.warning("couldn't resolve destination %r: %s", dest_chat, e)
+        return dest_chat
+
+
 async def forward(handle, message_id, dest_chat, reply_to=None, caption=None):
     """Fallback for files too big for the bot to upload: forward from the account."""
     if _client is None:
@@ -156,14 +174,15 @@ async def forward(handle, message_id, dest_chat, reply_to=None, caption=None):
     msg = await _client.get_messages(entity, ids=int(message_id))
     if msg is None:
         return None
+    dest = await _resolve_dest(dest_chat)
     kwargs = {"drop_author": True}
     if reply_to:
         kwargs["reply_to"] = int(reply_to)
-    res = await _client.forward_messages(dest_chat, msg, **kwargs)
+    res = await _client.forward_messages(dest, msg, **kwargs)
     new = res[0] if isinstance(res, (list, tuple)) and res else res
     if caption and new is not None:
         try:
-            await _client.edit_message(dest_chat, new, text=caption)
+            await _client.edit_message(dest, new, text=caption)
         except Exception as e:
             log.warning("couldn't set caption on forwarded file: %s", e)
     return new

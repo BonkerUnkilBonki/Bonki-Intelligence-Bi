@@ -1,13 +1,25 @@
 """The agent - Bonki's intelligence.
 
-Given a plain-English instruction from a group ("scan this group and can you tag
-apple music apk?"), it works out the intent, searches the group's file index,
-picks the file that best fits, and replies the way the user asked for: re-posting
-the file, @mentioning whoever asked, and adding a hashtag.
+Given a plain-English instruction from a group ("Bonki, find apple music apk",
+"scan this group and tag apple music apk", "find Antigravity-bypass.apk"), it
+works out the intent, searches the group's file index with fuzzy matching, picks
+the file that best fits, and replies the way the user asked for: re-posting the
+file, @mentioning whoever asked, and adding a hashtag.
+
+Two things matter here:
+
+  * **Matching** separates *distinctive* words ("antigravity") from *type* words
+    ("apk"). A type word alone never selects a file, so "apple music apk" won't
+    fall back to some unrelated APK. Distinctive words match fuzzily, so typos
+    and partial names still work.
+  * **I/O is off the event loop.** Telegram, the LLM and the state store are all
+    blocking; every call is offloaded to a thread so the bot never freezes and
+    always answers.
 
 The brain is optional. With no LLM key it still works, using deterministic
-keyword matching for both intent parsing and file ranking.
+keyword matching for intent parsing and the same fuzzy file ranking.
 """
+import asyncio
 import difflib
 import logging
 import os
@@ -19,41 +31,42 @@ from . import db, indexer, llm, telegram, userbot
 
 log = logging.getLogger("agent")
 
+try:                                    # optional, much better fuzzy matching
+    from rapidfuzz import fuzz as _rf
+except Exception:                       # pragma: no cover - graceful fallback
+    _rf = None
+
 INTENTS = ("find", "list", "count", "stats", "summarise", "scan", "help", "unknown")
 
-# words that carry no search value once we're matching a file name
+# words that carry no search value
 _STOP = {
-    "the", "a", "an", "please", "pls", "can", "you", "could", "would", "me", "my",
-    "i", "want", "need", "get", "give", "send", "show", "find", "search", "for",
-    "of", "to", "is", "it", "this", "that", "from", "in", "on", "and", "or", "any",
-    "there", "do", "have", "has", "with", "tag", "tagged", "scan", "group", "here",
-    "file", "files", "the", "latest", "new", "newest", "old", "oldest", "app",
-    "apps", "kindly", "bro", "bhai", "yaar", "plz",
+    "the", "a", "an", "please", "pls", "plz", "can", "you", "could", "would", "me",
+    "my", "i", "want", "need", "get", "give", "send", "show", "find", "search",
+    "for", "of", "to", "is", "it", "this", "that", "these", "those", "from", "in",
+    "on", "at", "and", "or", "any", "there", "do", "have", "has", "with", "tag",
+    "tagged", "scan", "group", "here", "file", "files", "latest", "new", "newest",
+    "old", "oldest", "app", "apps", "kindly", "bro", "bhai", "yaar",
+    "hey", "hi", "hello", "yo", "ok", "okay", "sup", "dude", "mate",
 }
-# words that hint at a file type rather than a name
-_EXT_WORDS = {"apk", "apks", "xapk", "xapks", "zip", "zips", "7z", "rar", "obb", "ipa"}
-
-
-def canon_ext(word):
-    """'apks' -> 'apk', 'zips' -> 'zip', else the word unchanged."""
-    w = (word or "").lower().lstrip(".")
-    if w.endswith("s") and w[:-1] in _EXT_WORDS:
-        return w[:-1]
-    return w
+# file-type words: hints, never the deciding signal on their own
+_EXT_WORDS = {"apk", "apks", "xapk", "xapks", "zip", "zips", "7z", "rar", "obb",
+              "ipa", "sh", "txt", "deb", "exe", "iso", "tar", "gz"}
 
 _SYSTEM = (
-    "You are Bonki Intel, a Telegram group assistant that keeps an index of the "
-    "files (APKs, zips, etc.) shared in a group and helps people find them. "
+    "You are Bonki, a Telegram group assistant that keeps an index of the files "
+    "(APKs, zips, etc.) shared in a group and helps people find them. "
     "You turn a short instruction into JSON. Reply with ONLY JSON, no prose."
 )
 
+MIN_SCORE = 0.30          # below this, we say we found nothing
 
-# ------------------------------------------------------------- text utils ---
+
+# ------------------------------------------------------------ small utils ---
 def human_size(n):
     n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
 
 
@@ -63,6 +76,29 @@ def norm(s):
 
 def tokens(s):
     return [t for t in norm(s).split() if t and t not in _STOP]
+
+
+def canon_ext(word):
+    w = (word or "").lower().lstrip(".")
+    if w.endswith("s") and w[:-1] in _EXT_WORDS:
+        return w[:-1]
+    return w
+
+
+def _ratio(a, b):
+    if not a or not b:
+        return 0.0
+    if _rf:
+        return _rf.ratio(a, b)
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100
+
+
+def _partial(a, b):
+    if not a or not b:
+        return 0.0
+    if _rf:
+        return _rf.partial_ratio(a, b)
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100
 
 
 def _camel(words):
@@ -75,20 +111,23 @@ def _camel(words):
 
 
 def make_hashtag(query, name=""):
-    """#AppleMusic from 'apple music apk' (or from the file name)."""
-    base = query or name or ""
-    words = [w for w in tokens(base) if w not in _EXT_WORDS]
+    def clean(words):
+        out = []
+        for w in words:
+            w = re.sub(r"\.[a-z0-9]{1,6}$", "", w)     # drop a trailing .ext
+            if w and w not in _EXT_WORDS:
+                out.append(w)
+        return out
+    words = clean(tokens(query))
     if not words and name:
-        words = [w for w in tokens(name.rsplit(".", 1)[0]) if w not in _EXT_WORDS]
-    tag = _camel(words[:4])
-    return "#" + (tag or "File")
+        words = clean(tokens(_name_core(name)))
+    return "#" + (_camel(words[:4]) or "File")
 
 
 def normalize_hashtag(raw, query="", name=""):
     raw = (raw or "").strip()
     if raw:
         raw = raw.split()[0].lstrip("#")
-        # already a clean CamelCase token? keep it exactly as given
         if re.fullmatch(r"[A-Za-z0-9]{1,40}", raw) and any(c.isupper() for c in raw):
             return "#" + raw
         camel = _camel(re.split(r"[\s_\-]+", raw))
@@ -97,16 +136,118 @@ def normalize_hashtag(raw, query="", name=""):
     return make_hashtag(query, name)
 
 
+# ------------------------------------------------------------- file match ---
+def _name_core(name):
+    """Filename without its extension."""
+    name = (name or "").strip()
+    return re.sub(r"\.[A-Za-z0-9]{1,6}$", "", name) or name
+
+
+def _hay(f):
+    """The searchable text for one indexed file: name (no ext) + caption + tags."""
+    return norm(f"{_name_core(f.get('name', ''))} {f.get('caption', '')} "
+                f"{' '.join(f.get('tags') or [])}")
+
+
+def _tok_hit(t, hay_toks, hay):
+    """Does query token `t` appear in the file, allowing typos and prefixes?"""
+    if t in hay:
+        return True
+    for ht in hay_toks:
+        if len(t) >= 3 and (ht.startswith(t) or t.startswith(ht)):
+            return True
+        if len(t) >= 4 and _ratio(t, ht) >= 85:      # typo tolerance
+            return True
+    return False
+
+
+def rank(query, files, exts=None):
+    """Score index entries against a query. Returns [(score, file)] best first.
+
+    Type words ("apk") never decide a match on their own - only distinctive
+    words do. A file with none of the distinctive words is not a candidate.
+    """
+    q = norm(query)
+    ext_hint = None
+    m = re.search(r"\.([a-z0-9]{1,6})$", q)
+    if m and m.group(1) in _EXT_WORDS:
+        ext_hint = m.group(1)
+        q_core = re.sub(r"\.[a-z0-9]{1,6}$", "", q)
+    else:
+        q_core = q
+    qtok = tokens(q_core)
+    type_toks = {canon_ext(t) for t in qtok if canon_ext(t) in _EXT_WORDS}
+    if ext_hint:
+        type_toks.add(ext_hint)
+    name_toks = [t for t in qtok if t not in _EXT_WORDS]
+
+    scored = []
+    for f in files:
+        if exts and f.get("ext") not in exts:
+            continue
+        hay = _hay(f)
+        hay_toks = hay.split()
+        ncore = norm(_name_core(f.get("name", "")))
+        fr = max(_ratio(q_core, hay), _ratio(q_core, ncore)) / 100.0
+
+        if name_toks:
+            cov = sum(1 for t in name_toks if _tok_hit(t, hay_toks, hay)) / len(name_toks)
+            if cov == 0:
+                continue                    # none of the distinctive words match
+            score = 0.60 * cov + 0.30 * fr + 0.10 * (1.0 if cov >= 0.999 else 0.0)
+        else:
+            score = 0.60 * fr
+        if type_toks:
+            score += 0.08 if f.get("ext") in type_toks else -0.20
+        if score > 0:
+            scored.append((score, f))
+    scored.sort(key=lambda x: (-x[0], -(x[1].get("date") or 0)))
+    return scored
+
+
+async def _llm_pick(query, candidates):
+    if not llm.enabled() or len(candidates) < 2:
+        return candidates[0][1] if candidates else None
+    listing = "\n".join(
+        f"{i}. {f['name']} [{f.get('ext')}] size={human_size(f.get('size'))} "
+        f"tags={f.get('tags')} caption={(f.get('caption') or '')[:60]}"
+        for i, (_, f) in enumerate(candidates[:12]))
+    prompt = (
+        f'The user wants: "{query}"\n\n'
+        f"Candidate files (pick the single best match):\n{listing}\n\n"
+        'Reply with ONLY JSON: {"index": <number of the best match, or -1 if none '
+        'really fit>, "why": "<a few words>"}')
+    data = await asyncio.to_thread(llm.complete_json, prompt, system=_SYSTEM)
+    if isinstance(data, dict):
+        try:
+            i = int(data.get("index"))
+        except (TypeError, ValueError):
+            i = -1
+        if 0 <= i < len(candidates):
+            return candidates[i][1]
+    return candidates[0][1]
+
+
+async def find_best(query, chat_id):
+    files = db.list_files(chat_id=chat_id)
+    if not files:
+        return None, []
+    ranked = rank(query, files)
+    if not ranked or ranked[0][0] < MIN_SCORE:
+        return None, []
+    best_score, best = ranked[0]
+    best = await _llm_pick(query, ranked) or best
+    others = [f for s, f in ranked[1:6] if s >= max(MIN_SCORE, best_score * 0.55)]
+    return best, others
+
+
 # ------------------------------------------------------------- intent parse -
-def parse(text):
-    """Return {intent, query, hashtag, scan, reply}."""
-    hint = _llm_parse(text)
-    if hint:
-        return hint
-    return _heuristic_parse(text)
+async def parse(text):
+    hint = await _llm_parse(text)
+    return hint or _heuristic_parse(text)
 
 
-def _llm_parse(text):
+async def _llm_parse(text):
     if not llm.enabled():
         return None
     files = db.list_files()
@@ -114,10 +255,12 @@ def _llm_parse(text):
                        for f in files[:25]) or "(index is empty)"
     prompt = (
         "Intents:\n"
-        "- find: the user wants one specific file (get/send/show/give/find/tag a named file)\n"
+        "- find: the user wants one specific file (get/send/show/give/find/tag a "
+        "named file). The name may be given with or without a type, e.g. 'apple "
+        "music apk' or just 'Antigravity-bypass.apk'.\n"
         "- list: show the files (optionally filtered, e.g. 'list apks')\n"
         "- count: how many files (optionally filtered)\n"
-        "- stats: breakdown of the group's files (by type/sender)\n"
+        "- stats: breakdown of the group's files\n"
         "- summarise: summarise what's been shared recently\n"
         "- scan: (re)scan the group's history\n"
         "- help: what can you do\n"
@@ -125,22 +268,25 @@ def _llm_parse(text):
         f"Some files already indexed in this group:\n{sample}\n\n"
         f'User instruction: "{text}"\n\n'
         "Reply with ONLY this JSON:\n"
-        '{"intent":"...","query":"<the file/thing they want, or the filter; empty if none>",'
-        '"hashtag":"<#Tag the user asked for, else a short CamelCase tag for the file, else empty>",'
+        '{"intent":"...","query":"<the file/thing they want, or the filter; keep '
+        'only the distinctive words - drop the file type and words like \'in this '
+        'group\'; empty if none>",'
+        '"hashtag":"<#Tag the user asked for, else a short CamelCase tag for the '
+        'file, else empty>",'
         '"scan":<true if they asked to scan/index the group>,'
-        '"reply":"<one short friendly sentence to say while working, else empty>"}'
-    )
-    data = llm.complete_json(prompt, system=_SYSTEM)
+        '"reply":"<one short friendly sentence to say while working, else empty>"}')
+    data = await asyncio.to_thread(llm.complete_json, prompt, system=_SYSTEM)
     if not isinstance(data, dict):
         return None
     intent = str(data.get("intent") or "unknown").lower().strip()
     if intent not in INTENTS:
         intent = "unknown"
     scan = bool(data.get("scan")) or intent == "scan" or "scan" in norm(text)
+    q = str(data.get("query") or "").strip()
     return {
         "intent": "scan" if intent == "scan" else intent,
-        "query": str(data.get("query") or "").strip(),
-        "hashtag": normalize_hashtag(data.get("hashtag"), str(data.get("query") or "")),
+        "query": q,
+        "hashtag": normalize_hashtag(data.get("hashtag"), q),
         "scan": scan,
         "reply": str(data.get("reply") or "").strip(),
     }
@@ -159,82 +305,21 @@ def _heuristic_parse(text):
     elif re.search(r"\b(stats?|breakdown|top senders|by type)\b", low):
         intent = "stats"
     elif re.search(r"\b(list|show all|what files|which files|all apks?|all files?)\b", low) \
-            and not re.search(r"\b(get|send|give|find|tag)\b", low):
+            and not re.search(r"\b(get|send|give|find|tag|download)\b", low):
         intent = "list"
-    elif re.search(r"\b(get|send|give|find|search|tag|upload|share|need|want|looking for)\b", low):
+    elif re.search(r"\b(get|send|give|find|search|tag|upload|share|need|want|download|looking for)\b", low):
         intent = "find"
     elif scan:
         intent = "scan"
     else:
         intent = "find" if tokens(text) else "unknown"
 
-    # pull the query out of the instruction
     words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
     qwords = [w for w in words if norm(w) not in _STOP and not w.startswith("#")
               and not w.startswith("@")]
     query = " ".join(qwords).strip()
     hashtag = normalize_hashtag(hashtag_m.group(0) if hashtag_m else "", query)
     return {"intent": intent, "query": query, "hashtag": hashtag, "scan": scan, "reply": ""}
-
-
-# ------------------------------------------------------------- file match ---
-def rank(query, files, exts=None):
-    """Score index entries against a query. Returns [(score, file)] best first."""
-    q = norm(query)
-    qtok = tokens(query)
-    ext_wanted = {canon_ext(t) for t in qtok if canon_ext(t) in _EXT_WORDS}
-    scored = []
-    for f in files:
-        if exts and f.get("ext") not in exts:
-            continue
-        hay = norm(f"{f.get('name','')} {f.get('caption','')} {' '.join(f.get('tags') or [])}")
-        hit = sum(1 for t in qtok if t in hay)
-        token_score = (hit / len(qtok)) if qtok else 0.0
-        ratio = difflib.SequenceMatcher(None, q, hay).ratio() if q else 0.0
-        score = token_score * 0.7 + ratio * 0.3
-        if ext_wanted and f.get("ext") in ext_wanted:
-            score += 0.15
-        if score > 0:
-            scored.append((score, f))
-    scored.sort(key=lambda x: (-x[0], -(x[1].get("date") or 0)))
-    return scored
-
-
-def _llm_pick(query, candidates):
-    """Let the brain choose among the top fuzzy candidates."""
-    if not llm.enabled() or len(candidates) < 2:
-        return candidates[0][1] if candidates else None
-    listing = "\n".join(
-        f"{i}. {f['name']} [{f.get('ext')}] size={human_size(f.get('size'))} "
-        f"tags={f.get('tags')} caption={(f.get('caption') or '')[:60]}"
-        for i, (_, f) in enumerate(candidates[:12])
-    )
-    prompt = (
-        f'The user wants: "{query}"\n\n'
-        f"Candidate files (pick the single best match):\n{listing}\n\n"
-        'Reply with ONLY JSON: {"index": <number of the best match, or -1 if none really fit>, '
-        '"why": "<a few words>"}'
-    )
-    data = llm.complete_json(prompt, system=_SYSTEM)
-    if isinstance(data, dict):
-        try:
-            i = int(data.get("index"))
-        except (TypeError, ValueError):
-            i = -1
-        if 0 <= i < len(candidates):
-            return candidates[i][1]
-    return candidates[0][1]
-
-
-def find_best(query, chat_id):
-    files = db.list_files(chat_id=chat_id)
-    if not files:
-        return None, []
-    ranked = rank(query, files)
-    if not ranked:
-        return None, []
-    best = _llm_pick(query, ranked)
-    return best, [f for _, f in ranked[:5]]
 
 
 # --------------------------------------------------------------- replies ----
@@ -272,62 +357,104 @@ def _caption(file_row, user, hashtag):
         lines.append(f"📁 {human_size(file_row['size'])}")
     cap = file_row.get("caption")
     if cap:
-        lines.append("")
-        lines.append(telegram.esc(cap[:200]))
+        lines += ["", telegram.esc(cap[:200])]
     return _with_footer("\n".join(lines))
 
 
-async def _reply_with_file(chat, msg, user, file_row, hashtag):
-    """Re-post the found file as a reply, or send a link if we can't fetch it."""
-    s = db.get_settings()
-    chat_id = chat.get("id")
-    reply_to = msg.get("message_id")
-    limit_bytes = float(s.get("max_upload_mb") or 50) * 1024 * 1024
-    size = file_row.get("size") or 0
-    caption = _caption(file_row, user, hashtag)
-    want_file = str(s.get("reply_with_file") or "1") == "1"
+# ---- non-blocking I/O wrappers (Telegram + state store are blocking) ----
+async def _send(text, chat_id, reply_to=None):
+    return await asyncio.to_thread(telegram.send_message, text, chat_id=chat_id,
+                                   reply_to=reply_to)
 
-    if want_file and userbot.is_running() and (not size or size <= limit_bytes):
-        handle = (db.get_group_by_chat(chat_id) or {}).get("handle") or chat_id
-        tmp = os.path.join(tempfile.gettempdir(),
-                           f"bonki_{file_row.get('message_id')}_{int(time.time())}")
-        try:
-            path = await userbot.download(handle, file_row.get("message_id"), tmp)
-            if path:
-                telegram.send_document(path, file_row.get("name") or "file",
-                                       caption=caption, chat_id=chat_id, reply_to=reply_to)
-                _cleanup(path)
-                return "file"
-        except Exception as e:
-            log.warning("couldn't re-post file, falling back to link: %s", e)
-            _cleanup(tmp)
-    elif want_file and userbot.is_running() and size > limit_bytes:
-        # too big to re-upload as the bot - forward it from the account instead
-        try:
-            await userbot.forward(handle_of(chat), file_row.get("message_id"),
-                                  chat_id, reply_to=reply_to, caption=caption)
-            return "forwarded"
-        except Exception as e:
-            log.warning("forward fallback failed: %s", e)
 
-    # last resort: a message with the file's details and a link to the original
+async def _send_doc(path, filename, caption, chat_id, reply_to=None):
+    return await asyncio.to_thread(telegram.send_document, path, filename, caption,
+                                   chat_id=chat_id, reply_to=reply_to)
+
+
+async def _typing(chat_id):
+    return await asyncio.to_thread(telegram.send_chat_action, chat_id)
+
+
+async def _flush():
+    try:
+        await asyncio.to_thread(db.flush, True)
+    except Exception:
+        pass
+
+
+def handle_of(chat):
+    return (db.get_group_by_chat(chat.get("id")) or {}).get("handle") or chat.get("id")
+
+
+async def _send_link(chat, msg, user, file_row, hashtag):
+    """Last-resort reply: the file's details and a link to the original post."""
     link = _link(chat, file_row.get("message_id"))
     body = [f"📦 <b>{telegram.esc(file_row.get('name'))}</b>"]
     if hashtag:
         body.append(telegram.esc(hashtag))
     if user:
-        body.append(f"👤 {telegram.mention_html(user)}, I found it here:")
-    if size:
-        body.append(f"📁 {human_size(size)}")
+        body.append(f"👤 {telegram.mention_html(user)}")
+    if file_row.get("size"):
+        body.append(f"📁 {human_size(file_row['size'])}")
     if link:
         body.append(f'🔗 <a href="{link}">open the original message</a>')
-    telegram.send_message(_with_footer("\n".join(body), telegram.MAX_MESSAGE),
-                          chat_id=chat_id, reply_to=reply_to)
+    await _send(_with_footer("\n".join(body), telegram.MAX_MESSAGE), chat.get("id"),
+                reply_to=msg.get("message_id"))
+
+
+async def _reply_with_file(chat, msg, user, file_row, hashtag):
+    """Share the actual file - not a link. Tries, in order:
+
+      1. server-side copy by the bot  - any size, no re-upload, appears as Bonki
+      2. upload by the bot            - files up to the configured size limit
+      3. forward via the user account - any size, server-side (the account shares)
+      4. a link                       - only if every route above fails
+    """
+    s = db.get_settings()
+    chat_id = chat.get("id")
+    reply_to = msg.get("message_id")
+    mid = file_row.get("message_id")
+    size = file_row.get("size") or 0
+    limit_bytes = float(s.get("max_upload_mb") or 50) * 1024 * 1024
+    caption = _caption(file_row, user, hashtag)
+    name = file_row.get("name") or "file"
+
+    if str(s.get("reply_with_file") or "1") != "1":
+        return await _send_link(chat, msg, user, file_row, hashtag)
+
+    # 1) server-side copy by the bot - full size, no re-upload, from Bonki
+    try:
+        await asyncio.to_thread(telegram.copy_message, from_chat_id=chat_id,
+                                message_id=mid, chat_id=chat_id, caption=caption,
+                                reply_to=reply_to)
+        return "copied"
+    except Exception as e:
+        log.info("bot copyMessage failed (%s); trying upload/forward", e)
+
+    if userbot.is_running():
+        # 2) small enough to upload as the bot (so it still comes from Bonki)
+        if not size or size <= limit_bytes:
+            tmp = os.path.join(tempfile.gettempdir(), f"bonki_{mid}_{int(time.time())}")
+            try:
+                path = await userbot.download(handle_of(chat), mid, tmp)
+                if path:
+                    await _send_doc(path, name, caption, chat_id, reply_to=reply_to)
+                    _cleanup(path)
+                    return "file"
+            except Exception as e:
+                log.warning("upload route failed: %s", e)
+                _cleanup(tmp)
+        # 3) too big to upload: the account shares it server-side (up to 2 GB)
+        try:
+            await userbot.forward(handle_of(chat), mid, chat_id, reply_to=reply_to,
+                                  caption=caption)
+            return "forwarded"
+        except Exception as e:
+            log.warning("forward route failed: %s", e)
+
+    await _send_link(chat, msg, user, file_row, hashtag)
     return "link"
-
-
-def handle_of(chat):
-    return (db.get_group_by_chat(chat.get("id")) or {}).get("handle") or chat.get("id")
 
 
 def _cleanup(path):
@@ -338,97 +465,87 @@ def _cleanup(path):
         pass
 
 
-# ------------------------------------------------------------- dispatchers --
+# ------------------------------------------------------------ dispatchers ---
 async def handle(chat, msg, user, text):
     """Handle one addressed group instruction end-to-end."""
-    s = db.get_settings()
     chat_id = chat.get("id")
-    if db.is_paused():
+    if db.is_paused() or not _group_allowed(chat_id):
         return
-    if not _group_allowed(chat_id):
-        return
-
-    parsed = parse(text)
+    parsed = await parse(text)
     intent, query, hashtag, scan = (parsed["intent"], parsed["query"],
                                     parsed["hashtag"], parsed["scan"])
     log.info("agent: intent=%s query=%r scan=%s chat=%s", intent, query, scan, chat_id)
 
-    telegram.send_chat_action(chat_id)
+    await _typing(chat_id)
 
     if intent == "help":
-        return _help(chat, msg)
+        return await _help(chat, msg)
     if intent == "scan":
         return await _do_scan(chat, msg)
     if intent == "summarise":
-        return _summarise(chat, msg)
+        return await _summarise(chat, msg)
     if intent in ("list", "count", "stats"):
-        return _list_like(intent, chat, msg, query)
+        return await _list_like(intent, chat, msg, query)
     if intent == "find" or (intent == "unknown" and query):
         return await _do_find(chat, msg, user, query, hashtag, scan)
-    return _help(chat, msg)
+    return await _help(chat, msg)
 
 
 def _group_allowed(chat_id):
     raw = (db.get_settings().get("allowed_groups") or "").strip()
     if not raw:
         return True
-    allowed = {x.strip() for x in raw.split(",") if x.strip()}
-    return str(chat_id) in allowed
+    return str(chat_id) in {x.strip() for x in raw.split(",") if x.strip()}
 
 
 async def _do_scan(chat, msg):
     row = db.get_group_by_chat(chat.get("id"))
     if not row:
-        row_id = db.add_group(chat.get("id"), chat.get("title") or "",
-                              chat.get("username") or "")
-        row = db.get_group(row_id)
+        row = db.get_group(db.add_group(chat.get("id"), chat.get("title") or "",
+                                        chat.get("username") or ""))
     if not userbot.is_running():
-        telegram.send_message(
-            "I can't read the group's history without the user account connected "
-            "(a bot has no access to old messages). Log in at /userbot, or post the "
-            "files here and I'll index them as they arrive.",
-            chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+        await _send("I can't read the group's history without the user account "
+                    "connected (a bot has no access to old messages). Log in at "
+                    "/userbot, or post the files here and I'll index them as they arrive.",
+                    chat.get("id"), reply_to=msg.get("message_id"))
         return
-    telegram.send_message("🔎 Scanning this group's history…",
-                          chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+    await _send("🔎 Scanning this group's history…", chat.get("id"),
+                reply_to=msg.get("message_id"))
     res = await indexer.scan(row)
     if res.get("error"):
-        telegram.send_message(f"Scan failed: {telegram.esc(res['error'])}",
-                              chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+        await _send(f"Scan failed: {telegram.esc(res['error'])}", chat.get("id"),
+                    reply_to=msg.get("message_id"))
         return
     total = db.count_files(chat.get("id"))
-    telegram.send_message(
-        f"✅ Done — indexed <b>{total}</b> file(s) from this group "
-        f"({res['added']} new). Ask me for one, e.g. <i>“Bonki, get the apple music apk”</i>.",
-        chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+    await _send(f"✅ Done — indexed <b>{total}</b> file(s) from this group "
+                f"({res['added']} new). Ask me for one, e.g. "
+                f"<i>“Bonki, find apple music apk”</i>.", chat.get("id"),
+                reply_to=msg.get("message_id"))
 
 
 async def _do_find(chat, msg, user, query, hashtag, scan):
     chat_id = chat.get("id")
     if not query:
-        telegram.send_message("What file are you after? e.g. <i>get the apple music apk</i>",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+        await _send("What file are you after? e.g. <i>Bonki, find apple music apk</i>",
+                    chat_id, reply_to=msg.get("message_id"))
         return
 
-    # auto-scan on demand when the index is empty (or the user asked to scan)
     if (scan or db.count_files(chat_id) == 0) and userbot.is_running():
-        row = db.get_group_by_chat(chat_id) or {}
+        row = db.get_group_by_chat(chat_id)
         if row:
             await indexer.scan(row)
 
-    best, others = find_best(query, chat_id)
+    best, others = await find_best(query, chat_id)
     if not best:
         if db.count_files(chat_id) == 0:
-            telegram.send_message(
-                "I haven't indexed any files from this group yet. Say "
-                "<i>“Bonki, scan this group”</i> (with the user account connected) "
-                "or just post the files here.",
-                chat_id=chat_id, reply_to=msg.get("message_id"))
+            await _send("I haven't indexed any files from this group yet. Say "
+                        "<i>“Bonki, scan this group”</i> (with the user account "
+                        "connected) or just post the files here.", chat_id,
+                        reply_to=msg.get("message_id"))
         else:
-            telegram.send_message(
-                f"Couldn't find anything matching “{telegram.esc(query)}”. "
-                f"I have {db.count_files(chat_id)} file(s) indexed — try <i>list files</i>.",
-                chat_id=chat_id, reply_to=msg.get("message_id"))
+            await _send(f"Couldn't find anything matching “{telegram.esc(query)}”. "
+                        f"I have {db.count_files(chat_id)} file(s) indexed — try "
+                        f"<i>list files</i>.", chat_id, reply_to=msg.get("message_id"))
         return
 
     hashtag = normalize_hashtag(hashtag, query, best.get("name"))
@@ -437,34 +554,31 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
 
     how = await _reply_with_file(chat, msg, user, best, hashtag)
     db.log_activity("find", chat_id, f"{best.get('name')} ({how}) for {query}")
-    db.flush(force=True)
+    await _flush()
 
-    # a quiet note if the match was weak / there were close alternatives
-    if others and len(others) > 1 and (others[0].get("name") != others[1].get("name")):
-        names = ", ".join(telegram.esc(f["name"]) for f in others[1:4])
-        telegram.send_message(f"<i>Other close matches: {names}</i>",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+    if others:
+        names = ", ".join(telegram.esc(f["name"]) for f in others[:3])
+        await _send(f"<i>Other close matches: {names}</i>", chat_id,
+                    reply_to=msg.get("message_id"))
 
 
-def _list_like(intent, chat, msg, query):
+async def _list_like(intent, chat, msg, query):
     chat_id = chat.get("id")
     files = db.list_files(chat_id=chat_id)
+    ext = _ext_filter(query)
     if intent == "count":
-        ext = _ext_filter(query, files)
         n = len([f for f in files if not ext or f.get("ext") in ext])
         label = f" matching {', '.join(sorted(ext))}" if ext else ""
-        telegram.send_message(f"📊 I have <b>{n}</b> file(s){label} indexed from this group.",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+        await _send(f"📊 I have <b>{n}</b> file(s){label} indexed from this group.",
+                    chat_id, reply_to=msg.get("message_id"))
         return
     if intent == "stats":
-        return _stats(chat, msg, files)
-    # list
-    ext = _ext_filter(query, files)
+        return await _stats(chat, msg, files)
     sel = [f for f in files if not ext or f.get("ext") in ext]
     sel.sort(key=lambda f: -(f.get("date") or 0))
     if not sel:
-        telegram.send_message("Nothing indexed yet — say <i>“Bonki, scan this group”</i>.",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+        await _send("Nothing indexed yet — say <i>“Bonki, scan this group”</i>.",
+                    chat_id, reply_to=msg.get("message_id"))
         return
     lines = [f"🗂 <b>{len(sel)}</b> file(s):"]
     for f in sel[:30]:
@@ -472,23 +586,21 @@ def _list_like(intent, chat, msg, query):
         lines.append(f"• {telegram.esc(f['name'])} — {human_size(f.get('size'))} {tags}".rstrip())
     if len(sel) > 30:
         lines.append(f"…and {len(sel) - 30} more.")
-    telegram.send_message("\n".join(lines)[:telegram.MAX_MESSAGE],
-                          chat_id=chat_id, reply_to=msg.get("message_id"))
+    await _send("\n".join(lines)[:telegram.MAX_MESSAGE], chat_id,
+                reply_to=msg.get("message_id"))
 
 
-def _ext_filter(query, files):
-    q = {canon_ext(t) for t in tokens(query or "") if canon_ext(t) in _EXT_WORDS}
-    return q
+def _ext_filter(query):
+    return {canon_ext(t) for t in tokens(query or "") if canon_ext(t) in _EXT_WORDS}
 
 
-def _stats(chat, msg, files):
+async def _stats(chat, msg, files):
     chat_id = chat.get("id")
     if not files:
-        telegram.send_message("Nothing indexed yet — say <i>“Bonki, scan this group”</i>.",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+        await _send("Nothing indexed yet — say <i>“Bonki, scan this group”</i>.",
+                    chat_id, reply_to=msg.get("message_id"))
         return
-    by_ext, by_sender = {}, {}
-    total = 0
+    by_ext, by_sender, total = {}, {}, 0
     for f in files:
         by_ext[f.get("ext") or "?"] = by_ext.get(f.get("ext") or "?", 0) + 1
         s = f.get("sender_name") or "unknown"
@@ -496,44 +608,48 @@ def _stats(chat, msg, files):
         total += f.get("size") or 0
     top_ext = sorted(by_ext.items(), key=lambda x: -x[1])[:8]
     top_sender = sorted(by_sender.items(), key=lambda x: -x[1])[:5]
-    lines = [f"📊 <b>Group file stats</b>",
-             f"Total: <b>{len(files)}</b> file(s), {human_size(total)}",
-             "",
+    lines = ["📊 <b>Group file stats</b>",
+             f"Total: <b>{len(files)}</b> file(s), {human_size(total)}", "",
              "By type: " + ", ".join(f"{telegram.esc(e)}: {n}" for e, n in top_ext),
              "Top sharers: " + ", ".join(f"{telegram.esc(s)}: {n}" for s, n in top_sender)]
-    telegram.send_message("\n".join(lines), chat_id=chat_id, reply_to=msg.get("message_id"))
+    await _send("\n".join(lines), chat_id, reply_to=msg.get("message_id"))
 
 
-def _summarise(chat, msg):
+async def _summarise(chat, msg):
     chat_id = chat.get("id")
     files = sorted(db.list_files(chat_id=chat_id), key=lambda f: -(f.get("date") or 0))[:40]
     if not files:
-        telegram.send_message("Nothing to summarise yet — I haven't indexed any files here.",
-                              chat_id=chat_id, reply_to=msg.get("message_id"))
+        await _send("Nothing to summarise yet — I haven't indexed any files here.",
+                    chat_id, reply_to=msg.get("message_id"))
         return
     listing = "\n".join(
         f"- {f['name']} ({f.get('ext')}, {human_size(f.get('size'))}) by "
         f"{f.get('sender_name') or 'unknown'}" for f in files)
     if llm.enabled():
-        out = llm.complete(
+        out = await asyncio.to_thread(
+            llm.complete,
             "Summarise what has been shared in this Telegram group, in 3-5 short "
             "bullets, grouped sensibly (apps, tools, etc.). Be concrete.\n\n"
             f"Recent files:\n{listing}", system=_SYSTEM, max_tokens=400)
         if out:
-            telegram.send_message(f"🧠 <b>Recent activity</b>\n{telegram.esc(out)}",
-                                  chat_id=chat_id, reply_to=msg.get("message_id"))
+            await _send(f"🧠 <b>Recent activity</b>\n{telegram.esc(out)}", chat_id,
+                        reply_to=msg.get("message_id"))
             return
-    lines = ["🧠 <b>Recent files shared</b>"] + [f"• {telegram.esc(f['name'])}" for f in files[:15]]
-    telegram.send_message("\n".join(lines), chat_id=chat_id, reply_to=msg.get("message_id"))
+    lines = ["🧠 <b>Recent files shared</b>"] + [f"• {telegram.esc(f['name'])}"
+                                                for f in files[:15]]
+    await _send("\n".join(lines), chat_id, reply_to=msg.get("message_id"))
 
 
-def _help(chat, msg):
-    telegram.send_message(
-        "👋 I'm <b>Bonki</b>. I index the files shared in this group and find them for you.\n\n"
+async def _help(chat, msg):
+    await _send(
+        "👋 I'm <b>Bonki</b>. I index the files shared in this group and find them.\n\n"
         "Try:\n"
-        "• <i>Bonki, scan this group and tag apple music apk</i>\n"
-        "• <i>Bonki, get the latest whatsapp mod apk</i>\n"
+        "• <i>Bonki, find apple music apk</i>\n"
+        "• <i>Bonki, find Antigravity-bypass.apk</i> — just the name works, no file "
+        "type needed\n"
+        "• <i>Bonki, scan this group</i>\n"
         "• <i>Bonki, list apks</i> · <i>how many zips</i> · <i>group stats</i>\n"
         "• <i>Bonki, summarise what's been shared</i>\n\n"
-        "When I find a file I re-post it, @mention you, and tag it with a hashtag.",
-        chat_id=chat.get("id"), reply_to=msg.get("message_id"))
+        "When I find a file I re-post it, @mention you, and tag it with a hashtag. "
+        "Spelling doesn't have to be exact.",
+        chat.get("id"), reply_to=msg.get("message_id"))

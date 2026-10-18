@@ -1,6 +1,6 @@
-"""Defaults and settings keys for Bonki Intel.
+"""Defaults and settings keys for Bonki-Intelligence.
 
-Bonki Intel is the "brain" layer: an intelligent Telegram group agent that can
+Bonki-Intelligence is the "brain" layer: an intelligent Telegram group agent that can
 scan a group, understand a plain-English request, find the file being asked for,
 and reply with it - tagging the requester and adding a hashtag.
 """
@@ -33,6 +33,11 @@ DEFAULT_SETTINGS = {
     # ---- scanning ----
     # how many recent messages a "scan this group" walks back through
     "scan_depth": "500",
+    # "1" = index new files automatically, no manual scan needed
+    # (live capture when the bot sees a post + a background scan on a timer)
+    "auto_scan": "1",
+    # how often the background indexer scans groups for new files, in minutes
+    "scan_interval_minutes": "10",
     # file extensions the index keeps (comma separated, empty = all documents)
     "index_extensions": "apk, xapk, apks, zip, apks, 7z, rar, obb, ipa",
     # "1" = also index files as they are posted live (needs group privacy off)
@@ -48,7 +53,7 @@ DEFAULT_SETTINGS = {
     # "1" = also store the hashtag on the indexed file, so later searches hit it
     "persist_tags": "1",
     # footer appended to every reply (own line). Empty = off.
-    "reply_footer": "Bonki Intel",
+    "reply_footer": "Bonki-Intelligence",
     # max size (MB) the bot will re-upload as a file; larger files get a link
     "max_upload_mb": "50",
 
