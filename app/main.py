@@ -153,6 +153,19 @@ def _set_commands():
 app = FastAPI(title="Bonki Intel", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _head_as_get(request, call_next):
+    """Serve HEAD like GET.
+
+    Render's health checker probes with HEAD, and a plain @app.get route answers
+    HEAD with 405 here - which can make the deploy look unhealthy. Rewriting the
+    method before routing lets every GET route answer HEAD with a 2xx.
+    """
+    if request.method == "HEAD":
+        request.scope["method"] = "GET"
+    return await call_next(request)
+
+
 def _redir(msg, path="/"):
     try:
         db.flush(force=True)

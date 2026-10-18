@@ -131,33 +131,48 @@ Bonki, scan this group and tag apple music apk
    makes your groups and file index survive Render's restarts.
 4. **(Optional) Get Gemini key** at <https://aistudio.google.com/app/apikey>.
 
-### Deploy (Blueprint — easiest)
-1. On [render.com](https://render.com): **New +** → **Blueprint**.
-2. Pick your `bonki-intel` repo → **Apply**. Render reads `render.yaml` and
-   creates the web service.
-3. When prompted, fill the environment variables:
+### Deploy as a Web Service (recommended)
+1. On [render.com](https://render.com): **New +** → **Web Service**, then connect
+   your `bonki-intel` repo.
+2. Fill in these settings:
+   | Field | Value |
+   |---|---|
+   | Language / Runtime | **Python** |
+   | Build Command | `pip install -r requirements.txt` |
+   | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+   | Instance Type | **Free** |
+   | Health Check Path | `/healthz` |
+
+   `$PORT` is assigned by Render (you'll see `Uvicorn running on …:10000` in the
+   logs) — the start command already binds to it, and HEAD probes on `/healthz`
+   now answer 200 instead of 405.
+3. Under **Environment**, add:
    | Key | Value |
    |---|---|
    | `TELEGRAM_BOT_TOKEN` | from @BotFather (**required**) |
+   | `USE_POLLING` | `1` |
    | `GITHUB_TOKEN` | the `gist`-scope token (recommended) |
    | `GEMINI_API_KEY` | your Gemini key (optional) |
-   | `TG_API_ID` / `TG_API_HASH` / `TG_SESSION` | only for history scanning |
-4. **Create Web Service** and wait for the first deploy. The logs should end with
-   `startup: storage=gist, ...` and `telegram mode: long polling`.
+   | `TG_API_ID` / `TG_API_HASH` | only if you'll scan history (see below) |
+4. **Create Web Service** and wait for the deploy. The logs should end with
+   `startup: storage=…` and `telegram mode: long polling`.
 
-### Deploy (manual — if you'd rather not use the blueprint)
-**New +** → **Web Service** → pick the repo, then:
-- **Runtime:** Python
-- **Build Command:** `pip install -r requirements.txt`
-- **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-- **Health Check Path:** `/healthz`
-- Add env vars: `PYTHON_VERSION=3.12.6` (important — see below),
-  `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, and `USE_POLLING=1`.
+The Python version is pinned by the **`.python-version`** file in the repo root
+(`3.12.6`), so you don't need to set `PYTHON_VERSION` — a fresh Render service
+otherwise defaults to Python 3.14. Change the number in that file to move
+versions.
 
 ### After it's live
 - Open `https://<your-app>.onrender.com/` — the dashboard.
-- **Groups:** add your group (or just add the bot to it and post once). If you set
-  the `TG_*` vars, open **User account** to finish the login, then **Scan**.
+- **Telegram login (for scanning).** Open **User account** (`/userbot`) and log in
+  your own account, entirely in the browser — no computer needed:
+  1. `api_id` + `api_hash` from <https://my.telegram.org> → **API development tools**
+  2. your phone number (with country code) → **Send code**
+  3. the code Telegram sends — it arrives **inside the app**, in the “Telegram”
+     service chat, not by SMS → **Log in** (plus your 2FA password if you have one).
+
+  Then add the group and hit **Scan**. (Skip this and you still get live indexing.)
+  Keep `GITHUB_TOKEN` set, or the session is lost on restart and you'll log in again.
 - **Settings:** pick the brain (`gemini`/`openai`/`off`), paste a key, **Test**.
 - In the group, try: `Bonki, scan this group and tag apple music apk`.
 
@@ -179,10 +194,10 @@ Free services **sleep after ~15 minutes idle**. Bonki is built for that:
    state is stored in a private gist instead — durable across restarts. The
    dashboard shows a warning when storage is local-only.
 2. **Sleeping.** Long polling + Telegram's update queue means wake-ups catch up.
-3. **Python version.** `render.yaml` pins **`PYTHON_VERSION=3.12.6`** so builds are
-   reproducible against a version this was tested on. The whole stack (including
-   current Telethon) also runs on 3.13+, so you can change or drop the pin if you
-   prefer — it's for predictability, not a hard requirement.
+3. **Python version.** The repo pins **`3.12.6`** via a `.python-version` file
+   (Render's own default for a new service is Python 3.14, and 3.12 is the version
+   this was tested on). Edit that one-line file to change it — the whole stack also
+   runs on 3.13+.
 
 ### Docker (any host)
 ```bash
@@ -238,6 +253,7 @@ bonki-intel/
     templates/     dashboard (no auth)
   requirements.txt
   .env.example
-  Dockerfile · docker-compose.yml · render.yaml
+  .python-version      pins Python 3.12.6 for Render
+  Dockerfile · docker-compose.yml
   userbot_login.py
 ```
