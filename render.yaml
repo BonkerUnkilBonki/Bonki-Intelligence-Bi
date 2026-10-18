@@ -1,0 +1,46 @@
+# Render Blueprint for Bonki Intel.
+# New + > Blueprint > pick this repo > Apply. Fill the `sync: false` vars.
+services:
+  - type: web
+    name: bonki-intel
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Pin a Python version for reproducible builds (3.12 is well-tested here;
+      # the stack also runs on 3.13+).
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      # Polling is more robust on Render's free tier (the service sleeps when
+      # idle; Telegram queues updates and they arrive when it wakes). Set to 0
+      # to use a webhook instead (RENDER_EXTERNAL_URL is used automatically).
+      - key: USE_POLLING
+        value: "1"
+      # --- required ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # --- recommended: durable state (token with the `gist` scope) ---
+      - key: GITHUB_TOKEN
+        sync: false
+      # --- the brain (optional; also settable in the dashboard) ---
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: OPENAI_BASE_URL
+      #   value: https://api.openai.com/v1
+      # --- user account for scanning group history (optional) ---
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_SESSION
+        sync: false
+      # --- webhook (only if USE_POLLING=0; auto-generated if left blank) ---
+      # - key: WEBHOOK_SECRET
+      #   sync: false

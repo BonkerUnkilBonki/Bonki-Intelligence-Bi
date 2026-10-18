@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Settings · Bonki Intel{% endblock %}
+{% block body %}
+<form method="post" action="/settings">
+
+<div class="card">
+  <h2>Brain</h2>
+  <p class="small muted">Current: <span class="pill {{ 'ok' if llm_on else 'warn' }}">{{ brain }}</span></p>
+  <label>Provider</label>
+  <select name="llm_provider">
+    {% for p in ["gemini","openai","off"] %}
+    <option value="{{ p }}" {% if s.llm_provider==p %}selected{% endif %}>{{ p }}</option>
+    {% endfor %}
+  </select>
+  <div class="row" style="gap:16px;margin-top:10px">
+    <div style="flex:1;min-width:220px">
+      <label>Gemini API key {% if s._has.gemini_api_key %}<span class="pill ok">saved</span>{% endif %}</label>
+      <input name="gemini_api_key" type="password" placeholder="{{ 'leave blank to keep' if s._has.gemini_api_key else 'AIza…' }}">
+      <label>Gemini model</label>
+      <input name="gemini_model" value="{{ s.gemini_model }}">
+    </div>
+    <div style="flex:1;min-width:220px">
+      <label>OpenAI-compatible key {% if s._has.openai_api_key %}<span class="pill ok">saved</span>{% endif %}</label>
+      <input name="openai_api_key" type="password" placeholder="{{ 'leave blank to keep' if s._has.openai_api_key else 'sk-…' }}">
+      <label>Base URL</label>
+      <input name="openai_base_url" value="{{ s.openai_base_url }}">
+      <label>Model</label>
+      <input name="openai_model" value="{{ s.openai_model }}">
+    </div>
+  </div>
+  <div class="small muted" style="margin-top:8px">Works with OpenAI, OpenRouter, Groq, Ollama, vLLM, LM Studio — any OpenAI-compatible endpoint. Set provider to <code>off</code> to run on keyword matching alone.</div>
+</div>
+
+<div class="card">
+  <h2>Behaviour</h2>
+  <label>Wake words (comma separated)</label>
+  <input name="wake_words" value="{{ s.wake_words }}">
+  <label>Only answer in these group ids (comma separated — blank = any group)</label>
+  <input name="allowed_groups" value="{{ s.allowed_groups }}">
+  <div class="row" style="gap:20px;margin-top:10px">
+    <label><input type="checkbox" name="require_mention" {% if s.require_mention=='1' %}checked{% endif %} style="width:auto"> Only when addressed</label>
+    <label><input type="checkbox" name="reply_with_file" {% if s.reply_with_file=='1' %}checked{% endif %} style="width:auto"> Re-post the found file</label>
+    <label><input type="checkbox" name="mention_requester" {% if s.mention_requester=='1' %}checked{% endif %} style="width:auto"> @mention the requester</label>
+    <label><input type="checkbox" name="add_hashtag" {% if s.add_hashtag=='1' %}checked{% endif %} style="width:auto"> Add a hashtag</label>
+    <label><input type="checkbox" name="persist_tags" {% if s.persist_tags=='1' %}checked{% endif %} style="width:auto"> Save hashtags on files</label>
+  </div>
+  <label>Reply footer</label>
+  <input name="reply_footer" value="{{ s.reply_footer }}">
+  <label>Max size to re-upload (MB)</label>
+  <input name="max_upload_mb" value="{{ s.max_upload_mb }}">
+</div>
+
+<div class="card">
+  <h2>Indexing</h2>
+  <label>Scan depth (messages walked per scan)</label>
+  <input name="scan_depth" value="{{ s.scan_depth }}">
+  <label>File extensions to index (comma separated)</label>
+  <input name="index_extensions" value="{{ s.index_extensions }}">
+  <label><input type="checkbox" name="index_live" {% if s.index_live=='1' %}checked{% endif %} style="width:auto"> Index files live as they're posted (needs group privacy off)</label>
+</div>
+
+<div class="card">
+  <h2>Webhook &amp; DMs</h2>
+  <label>Webhook secret</label>
+  <input name="webhook_secret" value="{{ s.webhook_secret }}">
+  <div class="small muted">Webhook: <code>{{ webhook_url or "set WEBHOOK_BASE / RENDER_EXTERNAL_URL + a secret" }}</code></div>
+  <label>Allowed DM user ids (comma separated)</label>
+  <input name="allow_user_ids" value="{{ s.allow_user_ids }}">
+</div>
+
+<div class="card">
+  <h2>User account (for scanning history)</h2>
+  <div class="small muted">Set these here, or use the <a href="/userbot">web login</a>. Env vars TG_API_ID / TG_API_HASH / TG_SESSION also work.</div>
+  <div class="row" style="gap:16px;margin-top:6px">
+    <div style="flex:1;min-width:200px">
+      <label>API ID</label><input name="tg_api_id" value="{{ s.tg_api_id }}">
+    </div>
+    <div style="flex:1;min-width:200px">
+      <label>API hash {% if s._has.tg_api_hash %}<span class="pill ok">saved</span>{% endif %}</label>
+      <input name="tg_api_hash" type="password" placeholder="{{ 'leave blank to keep' if s._has.tg_api_hash else '' }}">
+    </div>
+  </div>
+  <label>Session string {% if s._has.tg_session %}<span class="pill ok">saved</span>{% endif %}</label>
+  <input name="tg_session" type="password" placeholder="{{ 'leave blank to keep' if s._has.tg_session else 'from /userbot' }}">
+</div>
+
+<button type="submit">Save settings</button>
+</form>
+{% endblock %}

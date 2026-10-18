@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}User account · Bonki Intel{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>User account (MTProto)</h2>
+  <p class="small muted">
+    A bot can't read a group's message history or download files over 20&nbsp;MB.
+    Bonki uses <b>your own Telegram account</b> to scan groups and fetch files.
+    The account must be a member of the groups you want scanned.
+  </p>
+  <p>
+    Status:
+    {% if running %}<span class="pill ok">connected</span>
+    {% elif configured %}<span class="pill warn">configured, not connected</span>
+    {% else %}<span class="pill bad">not set up</span>{% endif %}
+    {% if me %} · @{{ me.username or me.id }}{% endif %}
+  </p>
+  {% if last_error %}<div class="small" style="color:#ffb4ae">Last error: {{ last_error }}</div>{% endif %}
+</div>
+
+{% if not running %}
+<div class="card">
+  <h2>Log in</h2>
+  <p class="small muted">Get <code>api_id</code> / <code>api_hash</code> from
+  <a href="https://my.telegram.org" target="_blank">my.telegram.org → API development tools</a>.
+  Telegram sends the login code <b>inside the app</b> (the “Telegram” service chat), not by SMS.</p>
+  <form method="post" action="/userbot/start">
+    <div class="row" style="gap:16px">
+      <div style="flex:1;min-width:160px"><label>API ID</label><input name="api_id" value="{{ s.tg_api_id }}"></div>
+      <div style="flex:1;min-width:200px"><label>API hash</label><input name="api_hash"></div>
+    </div>
+    <label>Phone (with country code)</label>
+    <input name="phone" placeholder="+91…">
+    <div style="margin-top:12px"><button type="submit">Send code</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Enter the code</h2>
+  <form method="post" action="/userbot/verify">
+    <div class="row" style="gap:16px">
+      <div style="flex:1;min-width:160px"><label>Login code</label><input name="code"></div>
+      <div style="flex:1;min-width:200px"><label>2FA password (if any)</label><input name="password" type="password"></div>
+    </div>
+    <div style="margin-top:12px"><button type="submit">Log in</button></div>
+  </form>
+</div>
+{% else %}
+<div class="card">
+  <p class="small muted">Connected. You can now scan groups from the <a href="/">Groups</a> page.</p>
+  <form method="post" action="/userbot/clear"><button class="bad" type="submit">Log out / clear session</button></form>
+</div>
+{% endif %}
+{% endblock %}
