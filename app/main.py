@@ -16,7 +16,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.templating import Jinja2Templates
 
-from . import agent, db, handlers, indexer, learn, llm, telegram, userbot
+from . import agent, approval, db, handlers, indexer, learn, llm, telegram, userbot
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +41,8 @@ async def lifespan(app: FastAPI):
     if _use_polling():
         _disable_webhook()
         asyncio.create_task(_poll_loop())
-        log.info("telegram mode: long polling (robust on hosts that sleep)")
+        log.info("telegram mode: long polling (robust on hosts that sleep) - "
+                 "run only ONE instance of this bot, or Telegram returns 409")
     else:
         _set_webhook()
         log.info("telegram mode: webhook")
@@ -167,8 +168,24 @@ async def _poll_loop():
             if ups:
                 db.set_settings({"tg_offset": str(offset)})
                 await asyncio.to_thread(db.flush, True)
+            if db.get_settings().get("poll_last_error"):
+                db.set_settings({"poll_last_error": ""})
         except Exception as e:
+            msg = str(e)
+            if "409" in msg or "Conflict" in msg:
+                # Another process is polling the SAME bot token. Telegram only
+                # allows one getUpdates at a time, so we back off and say why.
+                log.warning(
+                    "poll conflict (409): another instance is polling this bot "
+                    "token. Run only ONE instance - check for a second Render "
+                    "service, a local run, or a deploy that is still overlapping. "
+                    "Retrying in 15s.")
+                db.set_settings({"poll_last_error":
+                                 "409 conflict - another instance is polling this bot"})
+                await asyncio.sleep(15)
+                continue
             log.warning("poll failed: %s", e)
+            db.set_settings({"poll_last_error": msg[:200]})
             await asyncio.sleep(3)
 
 
@@ -225,8 +242,10 @@ def dashboard(request: Request, msg: str = ""):
         g["file_count"] = db.count_files(g.get("chat_id"))
         g["last_scan_str"] = (time.strftime("%Y-%m-%d %H:%M", time.localtime(g["last_scan"]))
                               if g.get("last_scan") else "never")
+    pending = [g for g in groups if not g.get("approved")]
     return TEMPLATES.TemplateResponse(request, "index.html", {
-        "groups": groups, "msg": msg, "total_files": db.count_files(),
+        "groups": groups, "pending": pending, "owner_set": bool(approval.owner_id()),
+        "msg": msg, "total_files": db.count_files(),
         "storage": db.storage_info(), "brain": llm.describe(),
         "llm_on": llm.enabled(), "userbot_on": userbot.is_running(),
         "userbot_configured": userbot.configured(),
@@ -240,8 +259,8 @@ def dashboard(request: Request, msg: str = ""):
 def group_add(chat_id: str = Form(...), title: str = Form("")):
     handle = userbot.clean_handle(chat_id)
     cid = handle if handle.lstrip("-").isdigit() else ("@" + handle if handle else "")
-    if db.add_group(cid, title.strip() or cid, handle):
-        return _redir(f"Added group {cid}. Click Scan to index its files.")
+    if db.add_group(cid, title.strip() or cid, handle, approved=1):
+        return _redir(f"Added group {cid} (approved). Click Scan to index its files.")
     return _redir(f"{cid} is already added.")
 
 
@@ -278,6 +297,22 @@ async def scan_all():
         return _redir("User account not connected - log in at /userbot to scan history.")
     asyncio.create_task(indexer.scan_all(full=True))
     return _redir("Scanning all groups…")
+
+
+@app.post("/groups/{gid}/approve")
+def group_approve(gid: int):
+    row = db.get_group(gid)
+    if row:
+        db.update_group(gid, {"approved": 1, "enabled": 1})
+    return _redir(f"Verified {row.get('title') if row else gid} — Bonki can work there now.")
+
+
+@app.post("/groups/{gid}/reject")
+def group_reject(gid: int):
+    row = db.get_group(gid)
+    if row:
+        db.update_group(gid, {"approved": 0, "enabled": 0})
+    return _redir(f"Rejected {row.get('title') if row else gid} — Bonki won't index it.")
 
 
 @app.post("/groups/{gid}/clear")
@@ -317,13 +352,17 @@ def settings_save(
     scan_interval_minutes: str = Form("10"),
     index_extensions: str = Form("apk, zip"),
     reply_footer: str = Form("Bonki-Intelligence"),
+    feedback_delete_minutes: str = Form("10"),
     max_upload_mb: str = Form("50"),
+    owner_id: str = Form(""),
     allow_user_ids: str = Form(""),
     webhook_secret: str = Form(""),
     tg_api_id: str = Form(""),
     tg_api_hash: str = Form(""),
     tg_session: str = Form(""),
     require_mention: str = Form(None),
+    require_approval: str = Form(None),
+    announce_approval: str = Form(None),
     index_live: str = Form(None),
     auto_scan: str = Form(None),
     reply_with_file: str = Form(None),
@@ -343,11 +382,15 @@ def settings_save(
         "scan_interval_minutes": scan_interval_minutes.strip() or "10",
         "index_extensions": index_extensions.strip(),
         "reply_footer": reply_footer.strip(),
+        "feedback_delete_minutes": feedback_delete_minutes.strip() or "10",
         "max_upload_mb": max_upload_mb.strip() or "50",
+        "owner_id": owner_id.strip(),
         "allow_user_ids": allow_user_ids.strip(),
         "webhook_secret": webhook_secret.strip(),
         "tg_api_id": tg_api_id.strip(),
         "require_mention": "1" if require_mention is not None else "0",
+        "require_approval": "1" if require_approval is not None else "0",
+        "announce_approval": "1" if announce_approval is not None else "0",
         "index_live": "1" if index_live is not None else "0",
         "auto_scan": "1" if auto_scan is not None else "0",
         "reply_with_file": "1" if reply_with_file is not None else "0",
@@ -450,9 +493,10 @@ def diagnostics_page(request: Request, msg: str = ""):
     return TEMPLATES.TemplateResponse(request, "diagnostics.html", {
         "msg": msg, "storage": db.storage_info(), "brain": llm.describe(),
         "llm_on": llm.enabled(), "provider": llm.provider(),
-        "userbot_configured": userbot.configured(), "userbot_running": userbot.is_running(),
-        "userbot_error": db.get_settings().get("userbot_last_error") or "",
-        "groups": groups, "total_files": db.count_files(),
+        "userbot_configured": userbot.configured(), "userbot_running": userbot.is_running(),         "userbot_error": db.get_settings().get("userbot_last_error") or "",
+         "poll_mode": _use_polling(),
+         "poll_error": db.get_settings().get("poll_last_error") or "",
+         "groups": groups, "total_files": db.count_files(),
         "webhook": _webhook_url(), "paused": db.is_paused(),
         "activity": [dict(a, time=time.strftime("%H:%M:%S", time.localtime(a["t"])))
                      for a in db.list_activity(40)],

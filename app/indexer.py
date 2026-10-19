@@ -111,7 +111,7 @@ async def scan_all(full=False):
         return []
     out = []
     for g in db.list_groups():
-        if g.get("enabled"):
+        if g.get("enabled") and g.get("approved"):      # verified groups only
             try:
                 out.append(await scan(g, full=full))
             except Exception as e:

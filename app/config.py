@@ -16,6 +16,13 @@ DEFAULT_SETTINGS = {
     # only act in these group chat ids (comma separated). Empty = any group the
     # bot is added to.
     "allowed_groups": "",
+    # ---- approval (so a stranger can't add the bot and have it index files) ----
+    # Telegram user id of the owner. New groups stay inactive until the owner
+    # approves. Also settable with the OWNER_ID env var.
+    "owner_id": "",
+    # "1" = a group the bot is added to must be approved by the owner before it
+    # will scan, index or answer there. "0" = approve automatically.
+    "require_approval": "1",
     # "1" = answer only when addressed (wake word / @mention / reply to bot)
     "require_mention": "1",
     # "1" = PAUSE everything
@@ -52,6 +59,11 @@ DEFAULT_SETTINGS = {
     "add_hashtag": "1",
     # "1" = also store the hashtag on the indexed file, so later searches hit it
     "persist_tags": "1",
+    # minutes after which the "other close matches" message deletes itself if the
+    # user never taps a choice (0 = never delete)
+    "feedback_delete_minutes": "10",
+    # "1" = when a group is approved, tell the group and post a welcome
+    "announce_approval": "1",
     # footer appended to every reply (own line). Empty = off.
     "reply_footer": "Bonki-Intelligence",
     # max size (MB) the bot will re-upload as a file; larger files get a link

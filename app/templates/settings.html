@@ -46,6 +46,8 @@
   </div>
   <label>Reply footer</label>
   <input name="reply_footer" value="{{ s.reply_footer }}">
+  <label>Auto-delete the “close matches” message after (minutes, 0 = never)</label>
+  <input name="feedback_delete_minutes" value="{{ s.feedback_delete_minutes }}">
   <label>Max size to re-upload (MB)</label>
   <input name="max_upload_mb" value="{{ s.max_upload_mb }}">
 </div>
@@ -61,6 +63,21 @@
   <label>File extensions to index (comma separated)</label>
   <input name="index_extensions" value="{{ s.index_extensions }}">
   <label><input type="checkbox" name="index_live" {% if s.index_live=='1' %}checked{% endif %} style="width:auto"> Index files live as they're posted (needs group privacy off)</label>
+</div>
+
+<div class="card">
+  <h2>Owner &amp; verification</h2>
+  <label>Owner Telegram user id (get it from <code>@userinfobot</code>)</label>
+  <input name="owner_id" value="{{ s.owner_id }}" placeholder="e.g. 123456789">
+  <div class="small muted" style="margin:6px 0 10px 0">
+    With an Owner ID set, a group the bot is added to stays inactive until you
+    approve it — and you can approve straight from Telegram: the bot posts a
+    <b>✅ Approve</b> button in the group and DMs you the same buttons. Send the
+    bot <code>/start</code> once so it's allowed to message you, then
+    <code>/pending</code> to verify any group anytime.
+  </div>
+  <label><input type="checkbox" name="require_approval" {% if s.require_approval=='1' %}checked{% endif %} style="width:auto"> Require owner approval before indexing a new group</label>
+  <label><input type="checkbox" name="announce_approval" {% if s.announce_approval=='1' %}checked{% endif %} style="width:auto"> Tell the group when it's approved</label>
 </div>
 
 <div class="card">

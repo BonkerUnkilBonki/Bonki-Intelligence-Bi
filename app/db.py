@@ -229,6 +229,11 @@ def init_db():
         if state is None:
             state = _default_state()
         _STATE = _normalize(state)
+        # groups that existed before approval was introduced are grandfathered in,
+        # so turning the gate on doesn't disable groups the owner already trusts.
+        for _g in _STATE["groups"]:
+            if "approved" not in _g:
+                _g["approved"] = 1
         _save_local()
         # one-time migration: an earlier version saved the old footer default
         # ("Bonki Intel"); a stored value overrides the new default, so move it
@@ -290,28 +295,51 @@ def get_group(gid):
     return None
 
 
-def get_group_by_chat(chat_id):
+def _norm_key(v):
+    return str(v or "").strip().lstrip("@").lower()
+
+
+def get_group_by_chat(chat_id, username=None):
+    """Find a group by its numeric id OR its @username/handle.
+
+    A group can be stored under either form (the dashboard may save @name while
+    messages arrive with the -100… id), and both must resolve to the same row -
+    otherwise the approval check misses it and the bot goes silent.
+    """
+    keys = {_norm_key(chat_id)}
+    if username:
+        keys.add(_norm_key(username))
     with _lock:
         for g in _STATE["groups"]:
-            if str(g.get("chat_id")) == str(chat_id):
+            gid = _norm_key(g.get("chat_id"))
+            gh = _norm_key(g.get("handle"))
+            if gid in keys or (gh and gh in keys):
                 return dict(g)
     return None
 
 
-def add_group(chat_id, title="", handle=""):
+def add_group(chat_id, title="", handle="", approved=0):
     with _lock:
-        if any(str(g.get("chat_id")) == str(chat_id) for g in _STATE["groups"]):
+        if get_group_by_chat(chat_id, handle):      # already known under either form
             return None
         row = {"id": max([g.get("id", 0) for g in _STATE["groups"]] or [0]) + 1,
                "chat_id": chat_id, "handle": handle, "title": title,
-               "enabled": 1, "last_scan": None, "last_status": None}
+               "enabled": 1, "approved": int(approved), "approval_notified": 0,
+               "last_scan": None, "last_status": None}
         _STATE["groups"].append(row)
         _touch()
         return row["id"]
 
 
+def is_approved(chat_id, username=None):
+    """A group only scans/indexes/answers once the owner has approved it."""
+    g = get_group_by_chat(chat_id, username)
+    return bool(g and g.get("approved"))
+
+
 def update_group(gid, fields):
-    allowed = {"chat_id", "handle", "title", "enabled", "last_scan", "last_status"}
+    allowed = {"chat_id", "handle", "title", "enabled", "approved",
+               "approval_notified", "last_scan", "last_status"}
     with _lock:
         for g in _STATE["groups"]:
             if g.get("id") == gid:

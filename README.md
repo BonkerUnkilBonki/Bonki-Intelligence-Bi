@@ -51,6 +51,33 @@ appears as Bonki), an upload by the bot (files up to the size limit), then a
 server-side forward via your user account (any size up to 2 GB). A link is sent
 only if all of those fail.
 
+## Verification — the bot only works in *your* groups
+
+Anyone can add a bot to a group, so **nothing happens in a new group until you
+approve it**. This is on by default.
+
+**Approve from Telegram (no dashboard needed):**
+
+1. Set your **Owner ID** in Settings (get it from `@userinfobot`) and send the bot
+   `/start` in DM once — that's what lets it message you.
+2. When the bot is added to a group it posts a **✅ Approve this group** button
+   *in the group*, and DMs you the same buttons.
+3. Tap **✅ Approve** — done. (Tap **🚫 Reject** and the bot leaves the group.)
+
+Until then the bot won't index, scan, or answer there, and it says so if someone
+asks. Only your tap counts — anyone else tapping gets *"Only the bot owner can
+approve this group."*
+
+**Any time, from the chat:** DM the bot `/pending` for a list of unverified groups,
+each with its own Approve / Reject buttons. Or `/approve <chat_id>` / `/reject <chat_id>`.
+
+**From the dashboard:** unverified groups appear in a *Waiting for your approval*
+card on the home page with the same Approve / Reject buttons.
+
+Groups you had before this feature stay approved, and a group you add yourself in
+the dashboard is approved on the spot. Turn the whole gate off with
+**Settings → Require owner approval** if you don't want it.
+
 ## Learning — what it actually does
 
 Bonki learns from real usage. No pretrained weights, no GPU, nothing invented.
@@ -64,6 +91,10 @@ Two things are genuinely learned, both from data that arrives in your group:
    When someone taps the file they actually wanted, that query's words are linked
    to that file (and the others are marked wrong). Next time those words pull the
    right file up — even if the words don't appear in its name at all.
+
+The close-matches message **deletes itself after 10 minutes** if nobody taps a
+choice, so the group stays tidy; if someone does tap, it stays. Set the timeout
+under Settings → *Auto-delete the “close matches” message after* (`0` = never).
 
 Both feed a re-ranker: `score = fuzzy + 0.35·TF-IDF + 0.6·learned`. The candidate
 set is the *union* of what each signal likes, so a file the fuzzy matcher never
@@ -235,6 +266,27 @@ Free services **sleep after ~15 minutes idle**. Bonki is built for that:
 - If you'd rather use a webhook, set `USE_POLLING=0` — Render's
   `RENDER_EXTERNAL_URL` is picked up automatically and the webhook is registered
   on boot (a secret is generated for you).
+
+### Troubleshooting: `409 Conflict: terminated by other getUpdates request`
+
+Telegram allows **one** `getUpdates` poll per bot token. This error means a
+**second copy of the bot is running** with the same token. It is not a code bug —
+the bot now backs off for 15s and shows the conflict on `/diagnostics`, but you
+need to stop the duplicate. In order of likelihood:
+
+1. **A second Render service.** If you created the bot twice (e.g. once from the
+   Blueprint *and* again as a Web Service), both poll the same token. Delete or
+   suspend the extra one: Render dashboard → the other service → **Suspend**.
+2. **A run on your own machine** — a local `uvicorn` you left running.
+3. **A deploy still overlapping.** Render starts the new instance before stopping
+   the old, so a few 409s right after a deploy are normal and clear on their own.
+4. **More than one worker.** Keep the start command as `uvicorn app.main:app
+   --host 0.0.0.0 --port $PORT` — no `--workers`.
+
+Only one instance should ever run. (If you'd rather not think about it, set
+`USE_POLLING=0` and the bot uses a webhook instead — Render's URL is picked up
+automatically — but you must then make sure the webhook points at the one live
+service.)
 
 ### The three Render gotchas, handled
 1. **Ephemeral disk.** Render wipes the filesystem on every deploy/restart, so a

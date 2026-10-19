@@ -28,8 +28,12 @@ _FILE_ATTR = "DocumentAttributeFilename"
 
 
 def clean_handle(text):
-    """@name / t.me/name / t.me/c/123 / numeric id -> a resolvable handle."""
-    t = (text or "").strip()
+    """@name / t.me/name / t.me/c/123 / numeric id -> a resolvable handle.
+
+    Accepts ints too: a private group has no @username, so its handle falls back
+    to the numeric chat id, which arrives as an int.
+    """
+    t = str(text or "").strip()
     m = re.search(r"t\.me/c/(\d+)", t)
     if m:
         return "-100" + m.group(1)
@@ -111,7 +115,10 @@ def _keeps(ext, exts):
 
 
 async def _entity(handle):
-    return await _client.get_entity(clean_handle(handle))
+    h = clean_handle(handle)
+    if re.fullmatch(r"-?\d+", h):          # a numeric id -> hand Telethon an int
+        h = int(h)
+    return await _client.get_entity(h)
 
 
 async def scan(handle, limit=500, exts=None, min_id=0):
@@ -158,9 +165,10 @@ async def _resolve_dest(dest_chat):
     if dest_chat is None:
         return dest_chat
     try:
-        if isinstance(dest_chat, str) and re.fullmatch(r"-?\d+", dest_chat.strip()):
-            return await _client.get_entity(int(dest_chat))
-        return await _client.get_entity(clean_handle(dest_chat))
+        h = clean_handle(dest_chat)
+        if re.fullmatch(r"-?\d+", h):
+            return await _client.get_entity(int(h))
+        return await _client.get_entity(h)
     except Exception as e:
         log.warning("couldn't resolve destination %r: %s", dest_chat, e)
         return dest_chat

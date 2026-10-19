@@ -27,7 +27,7 @@ import re
 import tempfile
 import time
 
-from . import db, indexer, learn, llm, telegram, userbot
+from . import approval, db, indexer, learn, llm, telegram, userbot
 
 log = logging.getLogger("agent")
 
@@ -432,7 +432,8 @@ async def _flush():
 
 
 def handle_of(chat):
-    return (db.get_group_by_chat(chat.get("id")) or {}).get("handle") or chat.get("id")
+    return (db.get_group_by_chat(chat.get("id"), chat.get("username")) or {}).get("handle") \
+        or chat.get("id")
 
 
 async def _send_link(chat, msg, user, file_row, hashtag):
@@ -519,6 +520,22 @@ async def handle(chat, msg, user, text):
     chat_id = chat.get("id")
     if db.is_paused() or not _group_allowed(chat_id):
         return
+    if approval.gate(chat_id, chat.get("username")):
+        return                      # not verified by the owner yet - do nothing
+    text = (text or "").strip()
+    if text.startswith("/"):                     # explicit /commands
+        parts = text.split(None, 1)
+        cmd = parts[0].lstrip("/").split("@")[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if cmd in ("start", "help"):
+            return await _help(chat, msg)
+        if cmd == "scan":
+            return await _do_scan(chat, msg)
+        if cmd in ("list", "files"):
+            return await _list_like("list", chat, msg, rest)
+        if cmd == "stats":
+            return await _list_like("stats", chat, msg, rest)
+        text = (rest or cmd) if cmd == "find" else f"{cmd} {rest}".strip()
     parsed = await parse(text)
     intent, query, hashtag, scan = (parsed["intent"], parsed["query"],
                                     parsed["hashtag"], parsed["scan"])
@@ -547,7 +564,7 @@ def _group_allowed(chat_id):
 
 
 async def _do_scan(chat, msg):
-    row = db.get_group_by_chat(chat.get("id"))
+    row = db.get_group_by_chat(chat.get("id"), chat.get("username"))
     if not row:
         row = db.get_group(db.add_group(chat.get("id"), chat.get("title") or "",
                                         chat.get("username") or ""))
@@ -579,7 +596,7 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
         return
 
     if (scan or db.count_files(chat_id) == 0) and userbot.is_running():
-        row = db.get_group_by_chat(chat_id)
+        row = db.get_group_by_chat(chat_id, chat.get("username"))
         if row:
             await indexer.scan(row)
 
@@ -620,8 +637,36 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
             link = _link(chat, f.get("message_id"))
             parts.append(f'<a href="{link}">{nm}</a>' if link else nm)   # link in the name
         head = "🔎 <b>Other close matches:</b> " + ", ".join(parts) + "\n\n"
-    await _send(head + "<i>Tap the right file so I learn — or “None”.</i>", chat_id,
-                reply_to=msg.get("message_id"), reply_markup={"inline_keyboard": rows})
+    resp = await _send(head + "<i>Tap the right file so I learn — or “None”.</i>",
+                       chat_id, reply_to=msg.get("message_id"),
+                       reply_markup={"inline_keyboard": rows})
+    sent_id = ((resp or {}).get("result") or {}).get("message_id")
+    if sent_id:
+        asyncio.create_task(_autodelete_close_matches(chat_id, sent_id, token))
+
+
+async def _autodelete_close_matches(chat_id, message_id, token):
+    """Delete the 'other close matches' message if the user never taps a choice.
+
+    A tap removes the pending search (learn.drop_pending), so a still-pending
+    token at the deadline means nothing was selected - then the message goes.
+    """
+    try:
+        minutes = float(db.get_settings().get("feedback_delete_minutes") or 10)
+    except (TypeError, ValueError):
+        minutes = 10.0
+    if minutes <= 0:
+        return
+    await asyncio.sleep(minutes * 60)
+    if learn.get_pending(token) is None:
+        return                      # a choice was made - keep the message
+    try:
+        await asyncio.to_thread(telegram.delete_message, chat_id, message_id)
+        log.info("auto-deleted close-matches message in %s", chat_id)
+    except Exception as e:
+        log.warning("could not auto-delete close-matches message: %s", e)
+    finally:
+        learn.drop_pending(token)
 
 
 async def handle_feedback(token, idx, positive, chat):

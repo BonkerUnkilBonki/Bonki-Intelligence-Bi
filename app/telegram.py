@@ -65,6 +65,14 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
     return _post("answerCallbackQuery", data)
 
 
+def delete_message(chat_id, message_id):
+    return _post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+def leave_chat(chat_id):
+    return _post("leaveChat", {"chat_id": chat_id})
+
+
 def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
     data = {"chat_id": chat_id, "message_id": message_id,
             "reply_markup": json.dumps(reply_markup or {"inline_keyboard": []})}
@@ -145,7 +153,7 @@ def download_file(file_path):
 
 def set_webhook(url, secret_token=None):
     data = {"url": url,
-            "allowed_updates": '["message","edited_message","channel_post","callback_query"]'}
+            "allowed_updates": '["message","edited_message","channel_post","callback_query","my_chat_member"]'}
     if secret_token:
         data["secret_token"] = secret_token
     return _post("setWebhook", data)
@@ -157,7 +165,7 @@ def delete_webhook():
 
 def get_updates(offset=None, timeout=25):
     data = {"timeout": timeout,
-            "allowed_updates": '["message","edited_message","channel_post","callback_query"]'}
+            "allowed_updates": '["message","edited_message","channel_post","callback_query","my_chat_member"]'}
     if offset is not None:
         data["offset"] = offset
     return _post("getUpdates", data, timeout=timeout + 10)

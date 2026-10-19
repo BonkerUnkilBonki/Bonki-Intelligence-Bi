@@ -21,6 +21,13 @@
       {% if userbot_error %}<span class="small" style="color:#ffb4ae">· {{ userbot_error }}</span>{% endif %}</td></tr>
     <tr><td>Files indexed</td><td>{{ total_files }}</td></tr>
     <tr><td>Groups</td><td>{{ groups|length }}</td></tr>
+    <tr><td>Update mode</td><td>
+      {% if poll_mode %}<span class="pill ok">long polling</span>{% else %}<span class="pill ok">webhook</span>{% endif %}
+      <span class="small muted">one instance only</span></td></tr>
+    {% if poll_error %}
+    <tr><td>Poll error</td><td><span class="pill bad">{{ poll_error }}</span>
+      <div class="small muted">Telegram allows one <code>getUpdates</code> per bot token. If this says 409, another copy of the bot is running — a second Render service, a local run, or a deploy still overlapping. Stop the extra one.</div></td></tr>
+    {% endif %}
     <tr><td>Webhook</td><td class="small muted">{{ webhook or "not set" }}</td></tr>
   </table>
 </div>
