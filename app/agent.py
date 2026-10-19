@@ -48,9 +48,18 @@ _STOP = {
     "old", "oldest", "app", "apps", "kindly", "bro", "bhai", "yaar",
     "hey", "hi", "hello", "yo", "ok", "okay", "sup", "dude", "mate",
 }
-# file-type words: hints, never the deciding signal on their own
-_EXT_WORDS = {"apk", "apks", "xapk", "xapks", "zip", "zips", "7z", "rar", "obb",
-              "ipa", "sh", "txt", "deb", "exe", "iso", "tar", "gz"}
+# file-type words: hints, never the deciding signal on their own. Broad on
+# purpose - a query like "keybox.xml" should treat "xml" as a type, not a name.
+_EXT_WORDS = {
+    "apk", "apks", "xapk", "xapks", "apkm", "obb", "ipa", "aab",
+    "zip", "zips", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz",
+    "iso", "img", "bin", "dat", "pak", "deb", "rpm", "exe", "msi", "dmg", "elf",
+    "sh", "bat", "cmd", "ps1", "py", "js", "lua", "json", "xml", "yaml", "yml",
+    "ini", "cfg", "conf", "log", "csv", "tsv", "txt", "md", "sqlite", "db",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "png", "jpg", "jpeg", "webp", "gif", "svg", "ico",
+    "mp3", "wav", "flac", "m4a", "mp4", "mkv", "avi", "mov", "srt", "torrent",
+}
 
 _SYSTEM = (
     "You are Bonki, a Telegram group assistant that keeps an index of the files "
@@ -144,8 +153,8 @@ def _name_core(name):
 
 
 def _hay(f):
-    """The searchable text for one indexed file: name (no ext) + caption + tags."""
-    return norm(f"{_name_core(f.get('name', ''))} {f.get('caption', '')} "
+    """The searchable text for one indexed file: full name + caption + tags."""
+    return norm(f"{f.get('name', '')} {f.get('caption', '')} "
                 f"{' '.join(f.get('tags') or [])}")
 
 
@@ -161,13 +170,13 @@ def _tok_hit(t, hay_toks, hay):
     return False
 
 
-def rank(query, files, exts=None):
-    """Score index entries against a query. Returns [(score, file)] best first.
+def _score(q, f):
+    """Relevance of one file to one normalised query string (0 = not a match).
 
-    Type words ("apk") never decide a match on their own - only distinctive
-    words do. A file with none of the distinctive words is not a candidate.
+    Type words ("apk", "xml") never decide a match on their own - only
+    distinctive words do. A file with none of the distinctive words scores 0.
+    A near-exact filename match gets a strong bonus.
     """
-    q = norm(query)
     ext_hint = None
     m = re.search(r"\.([a-z0-9]{1,6})$", q)
     if m and m.group(1) in _EXT_WORDS:
@@ -181,26 +190,40 @@ def rank(query, files, exts=None):
         type_toks.add(ext_hint)
     name_toks = [t for t in qtok if t not in _EXT_WORDS]
 
+    hay = _hay(f)
+    hay_toks = hay.split()
+    ncore = norm(_name_core(f.get("name", "")))
+    fr = max(_ratio(q_core, hay), _ratio(q_core, ncore)) / 100.0
+
+    if name_toks:
+        cov = sum(1 for t in name_toks if _tok_hit(t, hay_toks, hay)) / len(name_toks)
+        if cov == 0:
+            return 0.0
+        score = 0.60 * cov + 0.30 * fr + 0.10 * (1.0 if cov >= 0.999 else 0.0)
+    else:
+        score = 0.60 * fr
+    # a near-exact filename match should always win
+    if len(q_core) >= 3 and (q_core in ncore or ncore in q_core):
+        score += 0.25
+    if type_toks:
+        score += 0.08 if f.get("ext") in type_toks else -0.20
+    return score
+
+
+def rank(query, files, exts=None, variants=None):
+    """Score index entries against a query. Returns [(score, file)] best first.
+
+    `variants` are alternative query strings (e.g. LLM-suggested synonyms); each
+    file takes its best score across the main query and the variants.
+    """
+    qs = [norm(query)] + [norm(v) for v in (variants or []) if v]
     scored = []
     for f in files:
         if exts and f.get("ext") not in exts:
             continue
-        hay = _hay(f)
-        hay_toks = hay.split()
-        ncore = norm(_name_core(f.get("name", "")))
-        fr = max(_ratio(q_core, hay), _ratio(q_core, ncore)) / 100.0
-
-        if name_toks:
-            cov = sum(1 for t in name_toks if _tok_hit(t, hay_toks, hay)) / len(name_toks)
-            if cov == 0:
-                continue                    # none of the distinctive words match
-            score = 0.60 * cov + 0.30 * fr + 0.10 * (1.0 if cov >= 0.999 else 0.0)
-        else:
-            score = 0.60 * fr
-        if type_toks:
-            score += 0.08 if f.get("ext") in type_toks else -0.20
-        if score > 0:
-            scored.append((score, f))
+        s = max((_score(q, f) for q in qs), default=0.0)
+        if s > 0:
+            scored.append((s, f))
     scored.sort(key=lambda x: (-x[0], -(x[1].get("date") or 0)))
     return scored
 
@@ -228,16 +251,39 @@ async def _llm_pick(query, candidates):
     return candidates[0][1]
 
 
+async def _llm_expand(query):
+    """Ask the brain for aliases/synonyms to widen a weak search."""
+    if not llm.enabled():
+        return []
+    prompt = (
+        f'A user is searching a Telegram group\'s file list for: "{query}".\n'
+        "Give up to 5 alternative search terms or common aliases that might appear "
+        'in a file name (e.g. "wa" -> "whatsapp", "yt" -> "youtube"). '
+        'Reply with ONLY JSON: {"terms": ["...", "..."]}')
+    data = await asyncio.to_thread(llm.complete_json, prompt, system=_SYSTEM)
+    if isinstance(data, dict) and isinstance(data.get("terms"), list):
+        return [str(x) for x in data["terms"] if str(x).strip()][:5]
+    return []
+
+
 async def find_best(query, chat_id):
     files = db.list_files(chat_id=chat_id)
     if not files:
         return None, []
     ranked = rank(query, files)
+    # weak result? let the brain suggest synonyms and re-rank.
+    if (not ranked or ranked[0][0] < 0.60) and llm.enabled():
+        aliases = await _llm_expand(query)
+        if aliases:
+            ranked2 = rank(query, files, variants=aliases)
+            if ranked2 and (not ranked or ranked2[0][0] > ranked[0][0] + 0.01):
+                log.info("search widened via aliases %s", aliases)
+                ranked = ranked2
     if not ranked or ranked[0][0] < MIN_SCORE:
         return None, []
     best_score, best = ranked[0]
     best = await _llm_pick(query, ranked) or best
-    others = [f for s, f in ranked[1:6] if s >= max(MIN_SCORE, best_score * 0.55)]
+    others = [f for s, f in ranked[1:6] if s >= max(MIN_SCORE, best_score * 0.6)]
     return best, others
 
 
@@ -557,9 +603,14 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     await _flush()
 
     if others:
-        names = ", ".join(telegram.esc(f["name"]) for f in others[:3])
-        await _send(f"<i>Other close matches: {names}</i>", chat_id,
-                    reply_to=msg.get("message_id"))
+        parts = []
+        for f in others[:4]:
+            nm = telegram.esc(f["name"])
+            link = _link(chat, f.get("message_id"))
+            # embed the link inside the file name itself
+            parts.append(f'<a href="{link}">{nm}</a>' if link else nm)
+        await _send("🔎 <b>Other close matches:</b> " + ", ".join(parts),
+                    chat_id, reply_to=msg.get("message_id"))
 
 
 async def _list_like(intent, chat, msg, query):

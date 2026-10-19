@@ -230,6 +230,18 @@ def init_db():
             state = _default_state()
         _STATE = _normalize(state)
         _save_local()
+        # one-time migration: an earlier version saved the old footer default
+        # ("Bonki Intel"); a stored value overrides the new default, so move it
+        # to the current brand.
+        _st = _STATE.get("settings") or {}
+        if str(_st.get("reply_footer", "")).strip() == "Bonki Intel":
+            _st["reply_footer"] = "Bonki-Intelligence"
+            _dirty = True
+            _save_local()
+            if _REMOTE:
+                _remote_save(_REMOTE, _STATE)
+                _dirty = False
+            log.info("migrated footer: 'Bonki Intel' -> 'Bonki-Intelligence'")
         if _REMOTE and _STORAGE_MODE == "local":
             if _remote_save(_REMOTE, _STATE):
                 _STORAGE_MODE = _REMOTE["kind"]
