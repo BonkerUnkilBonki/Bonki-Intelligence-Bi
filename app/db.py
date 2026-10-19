@@ -45,14 +45,14 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 
 # --------------------------------------------------------------- helpers ---
 def _default_state():
-    return {"settings": {}, "groups": [], "files": [], "activity": []}
+    return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": []}
 
 
 def _normalize(state):
     base = _default_state()
     if not isinstance(state, dict):
         return base
-    for k in ("groups", "files", "activity"):
+    for k in ("groups", "files", "activity", "feedback"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -404,6 +404,37 @@ def clear_files(chat_id):
     with _lock:
         _STATE["files"] = [f for f in _STATE["files"]
                            if str(f.get("chat_id")) != str(chat_id)]
+        _touch()
+
+
+# --------------------------------------------------------------- feedback ---
+def add_feedback(chat_id, query, file_name, message_id, positive=True, source="button"):
+    """Record one search outcome the bot can learn from."""
+    with _lock:
+        fb = _STATE.setdefault("feedback", [])
+        fb.append({"t": time.time(), "chat_id": str(chat_id or ""),
+                   "query": str(query or "")[:200], "file": str(file_name or "")[:200],
+                   "message_id": message_id, "positive": bool(positive),
+                   "source": str(source)})
+        del fb[:-2000]          # keep the store bounded
+        _touch()
+
+
+def list_feedback(chat_id=None, limit=0):
+    with _lock:
+        out = [dict(f) for f in (_STATE.get("feedback") or [])]
+    if chat_id is not None:
+        out = [f for f in out if str(f.get("chat_id")) == str(chat_id)]
+    return out[-limit:] if limit else out
+
+
+def clear_feedback(chat_id=None):
+    with _lock:
+        if chat_id is None:
+            _STATE["feedback"] = []
+        else:
+            _STATE["feedback"] = [f for f in (_STATE.get("feedback") or [])
+                                  if str(f.get("chat_id")) != str(chat_id)]
         _touch()
 
 

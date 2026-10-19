@@ -51,6 +51,33 @@ appears as Bonki), an upload by the bot (files up to the size limit), then a
 server-side forward via your user account (any size up to 2 GB). A link is sent
 only if all of those fail.
 
+## Learning — what it actually does
+
+Bonki learns from real usage. No pretrained weights, no GPU, nothing invented.
+Two things are genuinely learned, both from data that arrives in your group:
+
+1. **A TF-IDF vector model** over the files actually in each group — their real
+   names, captions and tags. It is rebuilt as files are indexed, so retrieval
+   improves as the corpus grows. This is a real vector-space retrieval model.
+2. **Association weights from feedback.** Under each result the bot shows
+   buttons — *"1. KernelSU v3.3.0.apk"*, *"2. KernelSU_Next…"*, *"None of these"*.
+   When someone taps the file they actually wanted, that query's words are linked
+   to that file (and the others are marked wrong). Next time those words pull the
+   right file up — even if the words don't appear in its name at all.
+
+Both feed a re-ranker: `score = fuzzy + 0.35·TF-IDF + 0.6·learned`. The candidate
+set is the *union* of what each signal likes, so a file the fuzzy matcher never
+saw can still surface because real users taught it. The **Learning** page shows
+what it has learned per group — examples, confirmed-correct rate, and the
+strongest learned word→file links — with **Rebuild model** and **Clear feedback**.
+
+**Honest limits.** This is classical retrieval ML (vector-space model plus a
+learned re-ranker) — not a neural network, and not "on-device deep learning".
+There is no training on data you haven't given it, and no model weights shipped:
+the model *is* your group's files plus the feedback your users leave. It needs no
+GPU and runs inside the same small service. The more real files and real
+confirmations it sees, the better it ranks.
+
 **How matching works.** A query is split into *distinctive* words
 (`antigravity`) and *type* words (`apk`). Type words are only a hint — they never
 pick a file on their own, so "apple music apk" won't fall back to an unrelated
@@ -267,11 +294,12 @@ bonki-intel/
     agent.py       the intelligence (intent, matching, reply)
     indexer.py     group file index (history scan + live capture)
     llm.py         switchable brain (Gemini / OpenAI-compatible / off)
+    learn.py       the learning layer: TF-IDF model + feedback associations
     userbot.py     Telethon user account (scan + fetch files)
     telegram.py    Bot API wrapper
     db.py          durable state store
     config.py      defaults
-    templates/     dashboard (no auth)
+    templates/     dashboard (no auth, incl. Learning page)
   requirements.txt
   .env.example
   .python-version      pins Python 3.12.6 for Render

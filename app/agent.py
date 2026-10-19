@@ -27,7 +27,7 @@ import re
 import tempfile
 import time
 
-from . import db, indexer, llm, telegram, userbot
+from . import db, indexer, learn, llm, telegram, userbot
 
 log = logging.getLogger("agent")
 
@@ -279,6 +279,8 @@ async def find_best(query, chat_id):
             if ranked2 and (not ranked or ranked2[0][0] > ranked[0][0] + 0.01):
                 log.info("search widened via aliases %s", aliases)
                 ranked = ranked2
+    # blend in what the bot has learned: TF-IDF similarity + feedback associations
+    ranked = learn.rerank(ranked, files, query, chat_id)
     if not ranked or ranked[0][0] < MIN_SCORE:
         return None, []
     best_score, best = ranked[0]
@@ -408,9 +410,9 @@ def _caption(file_row, user, hashtag):
 
 
 # ---- non-blocking I/O wrappers (Telegram + state store are blocking) ----
-async def _send(text, chat_id, reply_to=None):
+async def _send(text, chat_id, reply_to=None, reply_markup=None):
     return await asyncio.to_thread(telegram.send_message, text, chat_id=chat_id,
-                                   reply_to=reply_to)
+                                   reply_to=reply_to, reply_markup=reply_markup)
 
 
 async def _send_doc(path, filename, caption, chat_id, reply_to=None):
@@ -602,15 +604,52 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     db.log_activity("find", chat_id, f"{best.get('name')} ({how}) for {query}")
     await _flush()
 
+    # feedback buttons: the candidates the user can confirm - this is the
+    # signal the bot learns from (which file a real query actually wanted).
+    cands = [best] + [f for f in others if _fkey(f) != _fkey(best)][:3]
+    token = learn.remember_search(chat_id, query, cands, user,
+                                  msg.get("message_id"), hashtag)
+    rows = [[{"text": f"{i + 1}. {f.get('name')}"[:60],
+              "callback_data": f"fb|p|{token}|{i}"}] for i, f in enumerate(cands)]
+    rows.append([{"text": "❌ None of these", "callback_data": f"fb|n|{token}"}])
+    head = ""
     if others:
         parts = []
         for f in others[:4]:
             nm = telegram.esc(f["name"])
             link = _link(chat, f.get("message_id"))
-            # embed the link inside the file name itself
-            parts.append(f'<a href="{link}">{nm}</a>' if link else nm)
-        await _send("🔎 <b>Other close matches:</b> " + ", ".join(parts),
-                    chat_id, reply_to=msg.get("message_id"))
+            parts.append(f'<a href="{link}">{nm}</a>' if link else nm)   # link in the name
+        head = "🔎 <b>Other close matches:</b> " + ", ".join(parts) + "\n\n"
+    await _send(head + "<i>Tap the right file so I learn — or “None”.</i>", chat_id,
+                reply_to=msg.get("message_id"), reply_markup={"inline_keyboard": rows})
+
+
+async def handle_feedback(token, idx, positive, chat):
+    """A user confirmed a file (or rejected them all) - learn from it."""
+    ctx = learn.get_pending(token)
+    if not ctx:
+        return "expired"
+    files = ctx.get("files") or []
+    if positive and 0 <= idx < len(files):
+        chosen = files[idx]
+        learn.record(ctx["chat_id"], ctx["query"], chosen, True, source="button")
+        for i, f in enumerate(files):                 # the rest were not it
+            if i != idx:
+                learn.record(ctx["chat_id"], ctx["query"], f, False, source="button")
+        await _reply_with_file(chat, {"message_id": ctx.get("reply_to")},
+                               ctx.get("user"), chosen, ctx.get("hashtag"))
+        learn.drop_pending(token)
+        await _flush()
+        return "shared"
+    for f in files:                                   # "None" - none of them
+        learn.record(ctx["chat_id"], ctx["query"], f, False, source="button")
+    learn.drop_pending(token)
+    await _flush()
+    return "noted"
+
+
+def _fkey(f):
+    return f"{f.get('chat_id')}:{f.get('message_id')}"
 
 
 async def _list_like(intent, chat, msg, query):

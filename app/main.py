@@ -16,7 +16,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.templating import Jinja2Templates
 
-from . import agent, db, handlers, indexer, llm, telegram, userbot
+from . import agent, db, handlers, indexer, learn, llm, telegram, userbot
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -408,6 +408,37 @@ async def userbot_verify(code: str = Form(""), password: str = Form("")):
 def userbot_clear():
     db.set_settings({"tg_session": ""})
     return _redir("Session cleared.", path="/userbot")
+
+
+# ------------------------------------------------------------- learning ----
+@app.get("/learning", response_class=HTMLResponse)
+def learning_page(request: Request, msg: str = ""):
+    rows = []
+    for g in db.list_groups():
+        cid = g.get("chat_id")
+        st = learn.stats(cid)
+        st["title"] = g.get("title") or cid
+        st["aliases"] = learn.top_aliases(cid, 5)
+        rows.append(st)
+    fb = db.list_feedback(limit=30)
+    return TEMPLATES.TemplateResponse(request, "learning.html", {
+        "msg": msg, "rows": rows, "overall": learn.stats(None),
+        "recent": [dict(f, time=time.strftime("%d %b %H:%M", time.localtime(f["t"])))
+                   for f in reversed(fb)],
+    })
+
+
+@app.post("/learning/train")
+def learning_train():
+    learn.train()
+    return _redir("Model rebuilt from the real corpus + feedback.", path="/learning")
+
+
+@app.post("/learning/clear")
+def learning_clear():
+    db.clear_feedback()
+    learn.invalidate()
+    return _redir("Feedback cleared - back to pure text matching.", path="/learning")
 
 
 # ----------------------------------------------------------- diagnostics ----

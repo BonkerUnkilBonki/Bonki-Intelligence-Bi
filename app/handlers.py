@@ -73,12 +73,43 @@ def strip_address(text):
     return re.sub(r"\s+", " ", out).strip()
 
 
+async def _handle_callback(cq):
+    """A feedback button was tapped - learn from the real choice."""
+    data = cq.get("data") or ""
+    if not data.startswith("fb|"):
+        return
+    parts = data.split("|")
+    await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "Learning from that…")
+    m = cq.get("message") or {}
+    chat = m.get("chat") or {}
+    if parts[1] == "n":
+        await agent.handle_feedback(parts[2], -1, False, chat)
+    else:
+        try:
+            idx = int(parts[3])
+        except (IndexError, ValueError):
+            idx = -1
+        await agent.handle_feedback(parts[2], idx, True, chat)
+    if m.get("message_id"):                     # clear the keyboard
+        try:
+            await asyncio.to_thread(telegram.edit_message_reply_markup,
+                                    chat.get("id"), m.get("message_id"), None)
+        except Exception:
+            pass
+
+
 def _allowed_dm(user_id):
     ids = [x.strip() for x in (db.get_settings().get("allow_user_ids") or "").split(",") if x.strip()]
     return user_id is not None and str(user_id) in ids
 
 
 async def handle_update(update):
+    if update.get("callback_query"):
+        try:
+            await _handle_callback(update["callback_query"])
+        except Exception as e:
+            log.warning("callback failed: %s", e)
+        return
     msg = (update.get("message") or update.get("edited_message")
            or update.get("channel_post"))
     if not msg:

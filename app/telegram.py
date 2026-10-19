@@ -1,5 +1,6 @@
 """Thin wrapper over the Telegram Bot API (what Bonki uses to *speak*)."""
 import html
+import json
 import logging
 import os
 
@@ -38,7 +39,7 @@ def esc(s):
 
 
 def send_message(text, chat_id, reply_to=None, thread_id=None, silent=False,
-                 disable_preview=True, parse_mode="HTML"):
+                 disable_preview=True, parse_mode="HTML", reply_markup=None):
     data = {
         "chat_id": chat_id,
         "text": (text or "")[:MAX_MESSAGE],
@@ -51,7 +52,23 @@ def send_message(text, chat_id, reply_to=None, thread_id=None, silent=False,
         data["allow_sending_without_reply"] = True
     if thread_id:
         data["message_thread_id"] = thread_id
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
     return _post("sendMessage", data)
+
+
+def answer_callback_query(callback_query_id, text=None, show_alert=False):
+    data = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = text[:200]
+        data["show_alert"] = bool(show_alert)
+    return _post("answerCallbackQuery", data)
+
+
+def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
+    data = {"chat_id": chat_id, "message_id": message_id,
+            "reply_markup": json.dumps(reply_markup or {"inline_keyboard": []})}
+    return _post("editMessageReplyMarkup", data)
 
 
 def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
@@ -128,7 +145,7 @@ def download_file(file_path):
 
 def set_webhook(url, secret_token=None):
     data = {"url": url,
-            "allowed_updates": '["message","edited_message","channel_post"]'}
+            "allowed_updates": '["message","edited_message","channel_post","callback_query"]'}
     if secret_token:
         data["secret_token"] = secret_token
     return _post("setWebhook", data)
@@ -139,7 +156,8 @@ def delete_webhook():
 
 
 def get_updates(offset=None, timeout=25):
-    data = {"timeout": timeout, "allowed_updates": '["message","edited_message","channel_post"]'}
+    data = {"timeout": timeout,
+            "allowed_updates": '["message","edited_message","channel_post","callback_query"]'}
     if offset is not None:
         data["offset"] = offset
     return _post("getUpdates", data, timeout=timeout + 10)
