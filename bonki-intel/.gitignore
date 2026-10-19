@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+bonki-intel-state.json
+*.session
+*.session-journal

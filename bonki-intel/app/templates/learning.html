@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Learning · Bonki-Intelligence{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">What Bonki has learned</h2>
+    <div class="row" style="gap:8px">
+      <form method="post" action="/learning/train"><button class="ghost sm" type="submit">Rebuild model</button></form>
+      <form method="post" action="/learning/clear"><button class="bad sm" type="submit">Clear feedback</button></form>
+    </div>
+  </div>
+  <p class="small muted">
+    No pretrained model, no GPU. Bonki builds a TF-IDF vector model over the files
+    actually in each group (names, captions, tags) and learns association weights
+    from the feedback buttons under its results. Both improve ranking as real
+    files arrive and real users confirm results.
+  </p>
+  <div class="grid">
+    <div class="stat"><b>{{ overall.files }}</b><span>files learned from</span></div>
+    <div class="stat"><b>{{ overall.examples }}</b><span>feedback examples</span></div>
+    <div class="stat"><b>{% if overall.accuracy is not none %}{{ "%.0f%%"|format(overall.accuracy*100) }}{% else %}—{% endif %}</b><span>confirmed correct</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Per group</h2>
+  {% if rows %}
+  <table>
+    <tr><th>Group</th><th>Files</th><th>Vocabulary</th><th>Examples</th><th>Learned links</th><th>Top learned associations</th></tr>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.title }}<div class="small muted">{{ r.chat_id }}</div></td>
+      <td>{{ r.files }}</td>
+      <td>{{ r.vocab }}</td>
+      <td>{{ r.examples }}{% if r.accuracy is not none %} <span class="pill ok">{{ "%.0f%%"|format(r.accuracy*100) }}</span>{% endif %}</td>
+      <td>{{ r.associations }}</td>
+      <td class="small">
+        {% for w, tok, name in r.aliases %}<code>{{ tok }}</code> → {{ name }}<br>{% else %}<span class="muted">—</span>{% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted small">No groups indexed yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Recent feedback</h2>
+  {% if recent %}
+  <table>
+    <tr><th>When</th><th></th><th>Query</th><th>File</th><th>Source</th></tr>
+    {% for f in recent %}
+    <tr>
+      <td class="small muted">{{ f.time }}</td>
+      <td>{% if f.positive %}<span class="pill ok">yes</span>{% else %}<span class="pill bad">no</span>{% endif %}</td>
+      <td class="small">{{ f.query }}</td>
+      <td class="small">{{ f.file }}</td>
+      <td class="small muted">{{ f.source }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted small">No feedback yet — confirm a result with the buttons in the group and it shows up here.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics · Bonki-Intelligence{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">Status</h2>
+    <div class="row" style="gap:8px">
+      <form method="post" action="/diagnostics/scan"><button class="ghost sm" type="submit">Scan all now</button></form>
+      <form method="post" action="/pause"><button class="{{ 'bad' if not paused else '' }} sm" type="submit">{{ "▶ Resume" if paused else "⏸ Pause" }}</button></form>
+    </div>
+  </div>
+  <table>
+    <tr><td>Storage</td><td>
+      <span class="pill {{ 'ok' if storage.durable else 'warn' }}">{{ storage.mode }}</span>
+      <span class="small muted">{{ storage.note }}</span></td></tr>
+    <tr><td>Brain</td><td><span class="pill {{ 'ok' if llm_on else 'warn' }}">{{ brain }}</span></td></tr>
+    <tr><td>User account</td><td>
+      {% if userbot_running %}<span class="pill ok">connected</span>
+      {% elif userbot_configured %}<span class="pill warn">configured, not connected</span>
+      {% else %}<span class="pill bad">not set up</span>{% endif %}
+      {% if userbot_error %}<span class="small" style="color:#ffb4ae">· {{ userbot_error }}</span>{% endif %}</td></tr>
+    <tr><td>Files indexed</td><td>{{ total_files }}</td></tr>
+    <tr><td>Groups</td><td>{{ groups|length }}</td></tr>
+    <tr><td>Update mode</td><td>
+      {% if poll_mode %}<span class="pill ok">long polling</span>{% else %}<span class="pill ok">webhook</span>{% endif %}
+      <span class="small muted">one instance only</span></td></tr>
+    {% if poll_error %}
+    <tr><td>Poll error</td><td><span class="pill bad">{{ poll_error }}</span>
+      <div class="small muted">Telegram allows one <code>getUpdates</code> per bot token. If this says 409, another copy of the bot is running — a second Render service, a local run, or a deploy still overlapping. Stop the extra one.</div></td></tr>
+    {% endif %}
+    <tr><td>Webhook</td><td class="small muted">{{ webhook or "not set" }}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Activity (last 40)</h2>
+  {% if activity %}
+  <table>
+    <tr><th>Time</th><th>Kind</th><th>Chat</th><th>Summary</th></tr>
+    {% for a in activity %}
+    <tr><td class="small muted">{{ a.time }}</td><td class="small">{{ a.kind }}</td>
+        <td class="small muted">{{ a.chat_id }}</td><td class="small">{{ a.summary }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted small">Nothing yet.</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Group index</h2>
+  {% if groups %}
+  <table>
+    <tr><th>Group</th><th>Files</th><th>Status</th></tr>
+    {% for g in groups %}
+    <tr><td>{{ g.title or g.chat_id }} <span class="small muted">{{ g.chat_id }}</span></td>
+        <td>{{ g.file_count if g.file_count is defined else "" }}</td>
+        <td class="small muted">{{ g.last_status or "" }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted small">No groups.</p>{% endif %}
+</div>
+{% endblock %}
