@@ -49,7 +49,9 @@ def _key_tokens(s):
 
 
 def _version(chat_id):
-    return (len(db.list_files(chat_id=chat_id)), len(db.list_feedback(chat_id=chat_id)))
+    """A cheap change-token. Uses counts, not list copies - this runs on every
+    search, so copying thousands of dicts here was pure waste."""
+    return (db.count_files(chat_id), db.count_feedback(chat_id))
 
 
 def invalidate(chat_id=None):

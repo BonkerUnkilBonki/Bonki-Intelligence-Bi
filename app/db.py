@@ -33,6 +33,7 @@ GIST_FILE = "bonki-intel-state.json"
 API = "https://api.github.com"
 
 _lock = threading.RLock()
+_save_lock = threading.Lock()   # serialises remote writes only
 _STATE = None
 _REMOTE = None
 _STORAGE_MODE = "local"
@@ -142,8 +143,11 @@ def _remote_load(cfg):
 
 
 def _remote_save(cfg, state):
+    return _remote_save_body(cfg, json.dumps(state, separators=(",", ":")))
+
+
+def _remote_save_body(cfg, body):
     h = _headers(cfg["token"])
-    body = json.dumps(state, separators=(",", ":"))
     try:
         if cfg["kind"] == "gist":
             gid = _gist_id(cfg)
@@ -172,37 +176,66 @@ def _remote_save(cfg, state):
         return False
 
 
-def _save_local():
+def _save_local_body(body):
     try:
         with open(LOCAL_FILE, "w") as f:
-            json.dump(_STATE, f, separators=(",", ":"))
+            f.write(body)
     except Exception as e:
         log.warning("local save failed: %s", e)
 
 
+def _save_local():
+    _save_local_body(json.dumps(_STATE, separators=(",", ":")))
+
+
+_last_local = 0.0
+LOCAL_MIN_INTERVAL = 2.0        # seconds between full-state disk writes
+
+
 def _touch():
-    global _dirty
+    """Mark the state dirty.
+
+    The full-state file write is DEBOUNCED. Writing the whole JSON on every
+    change made indexing crawl - a 500-file scan meant 500 full rewrites.
+    """
+    global _dirty, _last_local
     _dirty = True
-    _save_local()
+    now = time.time()
+    if now - _last_local >= LOCAL_MIN_INTERVAL:
+        _last_local = now
+        _save_local()
 
 
 def flush(force=False):
+    """Push state to the durable store.
+
+    Serialisation happens under the state lock, but the *network* write happens
+    OUTSIDE it - otherwise every read/write in the bot blocked behind a slow
+    gist/HTTP call, which is what made the bot laggy and unresponsive.
+    """
     global _dirty, _last_remote
     with _lock:
         if not _dirty and not force:
             return
         if not _REMOTE:
             _dirty = False
-            return
-        now = time.time()
-        if not force and now - _last_remote < REMOTE_MIN_INTERVAL:
-            return
-        ok = _remote_save(_REMOTE, _STATE)
+            body = json.dumps(_STATE, separators=(",", ":"))
+        else:
+            now = time.time()
+            if not force and now - _last_remote < REMOTE_MIN_INTERVAL:
+                return
+            body = json.dumps(_STATE, separators=(",", ":"))
+            _last_remote = now
+    _save_local_body(body)                          # cheap, off the lock
+    if not _REMOTE:
+        return
+    with _save_lock:
+        ok = _remote_save_body(_REMOTE, body)       # network, off the state lock
+    with _lock:
         _last_save["ok"] = bool(ok)
         _last_save["at"] = time.time()
         if ok:
             _dirty = False
-            _last_remote = now
 
 
 def storage_info():
@@ -425,7 +458,12 @@ def add_tag(chat_id, message_id, tag):
 
 
 def count_files(chat_id=None):
-    return len(list_files(chat_id))
+    """Cheap count - does NOT copy the list (used on hot paths)."""
+    with _lock:
+        if chat_id is None:
+            return len(_STATE["files"])
+        return sum(1 for f in _STATE["files"]
+                   if str(f.get("chat_id")) == str(chat_id))
 
 
 def clear_files(chat_id):
@@ -454,6 +492,14 @@ def list_feedback(chat_id=None, limit=0):
     if chat_id is not None:
         out = [f for f in out if str(f.get("chat_id")) == str(chat_id)]
     return out[-limit:] if limit else out
+
+
+def count_feedback(chat_id=None):
+    with _lock:
+        fb = _STATE.get("feedback") or []
+        if chat_id is None:
+            return len(fb)
+        return sum(1 for f in fb if str(f.get("chat_id")) == str(chat_id))
 
 
 def clear_feedback(chat_id=None):

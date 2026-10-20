@@ -28,6 +28,11 @@
     <tr><td>Poll error</td><td><span class="pill bad">{{ poll_error }}</span>
       <div class="small muted">Telegram allows one <code>getUpdates</code> per bot token. If this says 409, another copy of the bot is running — a second Render service, a local run, or a deploy still overlapping. Stop the extra one.</div></td></tr>
     {% endif %}
+    <tr><td>Keep-alive</td><td>
+      {% if keepalive_on %}<span class="pill ok">on</span>{% else %}<span class="pill warn">off</span>{% endif %}
+      <span class="small muted">last ping: {{ keepalive_last }}</span>
+      {% if not public_url %}<div class="small" style="color:#ffb4ae">No public URL known — set WEBHOOK_BASE (or run on Render, which sets RENDER_EXTERNAL_URL) so the self-ping has a target.</div>{% endif %}
+    </td></tr>
     <tr><td>Webhook</td><td class="small muted">{{ webhook or "not set" }}</td></tr>
   </table>
 </div>

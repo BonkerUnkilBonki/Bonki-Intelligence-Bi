@@ -267,6 +267,31 @@ Free services **sleep after ~15 minutes idle**. Bonki is built for that:
   `RENDER_EXTERNAL_URL` is picked up automatically and the webhook is registered
   on boot (a secret is generated for you).
 
+### Staying online ("the bot and the dashboard keep going offline")
+
+On Render's **free** tier a service is spun down after **~15 minutes with no
+traffic**. When it sleeps, the web dashboard is unreachable *and* the Telegram
+bot stops answering — both, together, because they are the same service. This is
+normal free-tier behaviour, not a crash.
+
+**Bonki now keeps itself awake.** With **Settings → Keep-alive** on (the
+default), it pings its own public URL every 10 minutes. Render counts that as
+traffic, so the service never idles and stays online. Check
+**/diagnostics → Keep-alive** to see the last ping and its HTTP status.
+
+Two caveats, stated plainly:
+
+- The self-ping only works **while the service is already awake**. If it has
+  genuinely gone to sleep, something outside has to wake it. Open the app URL in
+  a browser, or (better) add a free external cron at
+  [cron-job.org](https://cron-job.org) hitting `https://<your-app>.onrender.com/healthz`
+  every 10 minutes. Once it's up, the self-ping keeps it up.
+- Keeping one service awake ~24/7 uses ~730 of Render's 750 free
+  instance-hours per month — it fits, but only for a single always-on service.
+
+On a paid always-on plan (or any host that doesn't sleep) you can turn keep-alive
+**off**; it isn't needed there.
+
 ### Troubleshooting: `409 Conflict: terminated by other getUpdates request`
 
 Telegram allows **one** `getUpdates` poll per bot token. This error means a

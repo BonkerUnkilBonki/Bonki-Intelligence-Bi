@@ -231,6 +231,9 @@ def rank(query, files, exts=None, variants=None):
 async def _llm_pick(query, candidates):
     if not llm.enabled() or len(candidates) < 2:
         return candidates[0][1] if candidates else None
+    # a clear leader doesn't need a second opinion - skip the round-trip
+    if candidates[0][0] - candidates[1][0] >= 0.25:
+        return candidates[0][1]
     listing = "\n".join(
         f"{i}. {f['name']} [{f.get('ext')}] size={human_size(f.get('size'))} "
         f"tags={f.get('tags')} caption={(f.get('caption') or '')[:60]}"
@@ -271,8 +274,8 @@ async def find_best(query, chat_id):
     if not files:
         return None, []
     ranked = rank(query, files)
-    # weak result? let the brain suggest synonyms and re-rank.
-    if (not ranked or ranked[0][0] < 0.60) and llm.enabled():
+    # only reach for the brain when the search genuinely found little
+    if (not ranked or ranked[0][0] < MIN_SCORE + 0.05) and llm.enabled():
         aliases = await _llm_expand(query)
         if aliases:
             ranked2 = rank(query, files, variants=aliases)
@@ -291,8 +294,18 @@ async def find_best(query, chat_id):
 
 # ------------------------------------------------------------- intent parse -
 async def parse(text):
-    hint = await _llm_parse(text)
-    return hint or _heuristic_parse(text)
+    """Understand the instruction - fast path first.
+
+    The heuristics handle the common cases instantly; the brain is only asked
+    when they're unsure. Calling the LLM on every single message is what made
+    replies slow.
+    """
+    hint = _heuristic_parse(text)
+    if llm.enabled() and (hint["intent"] == "unknown" or not hint["query"]):
+        smart = await _llm_parse(text)
+        if smart:
+            return smart
+    return hint
 
 
 async def _llm_parse(text):
@@ -425,8 +438,9 @@ async def _typing(chat_id):
 
 
 async def _flush():
+    """Persist in the background - never make the user wait on a gist write."""
     try:
-        await asyncio.to_thread(db.flush, True)
+        asyncio.create_task(asyncio.to_thread(db.flush, True))
     except Exception:
         pass
 

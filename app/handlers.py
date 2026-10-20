@@ -260,7 +260,7 @@ async def handle_update(update):
         if str(db.get_settings().get("index_live") or "1") == "1":
             try:
                 indexer.capture_from_message(chat, msg)
-                await asyncio.to_thread(db.flush)
+                asyncio.create_task(asyncio.to_thread(db.flush))   # don't block the reply
             except Exception as e:
                 log.warning("live index failed: %s", e)
 

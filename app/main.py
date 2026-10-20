@@ -11,6 +11,8 @@ import time
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
+import requests
+
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
@@ -48,6 +50,7 @@ async def lifespan(app: FastAPI):
         log.info("telegram mode: webhook")
     _set_commands()
     asyncio.create_task(_auto_index_loop())
+    asyncio.create_task(_keepalive_loop())
     try:
         st = db.storage_info()
         log.info("startup: storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",
@@ -121,6 +124,48 @@ def _disable_webhook():
         log.warning("could not delete webhook: %s", e)
 
 
+def _keepalive_str():
+    raw = db.get_settings().get("keepalive_last") or ""
+    if not raw or ":" not in raw:
+        return "never"
+    ts, code = raw.split(":", 1)
+    try:
+        return f"{time.strftime('%d %b %H:%M:%S', time.localtime(int(ts)))} · HTTP {code}"
+    except (TypeError, ValueError):
+        return raw
+
+
+async def _keepalive_loop():
+    """Ping our own public URL so the host never sees us as idle.
+
+    On Render's free tier a service is spun down after ~15 minutes without
+    traffic - which takes BOTH the bot and the dashboard offline. A request to
+    our own URL every few minutes counts as traffic, so it stays awake. (The
+    first wake after a real sleep needs an external ping - see the README.)
+    """
+    await asyncio.sleep(45)
+    while True:
+        try:
+            if str(db.get_settings().get("keepalive") or "1") == "1":
+                base = (os.environ.get("RENDER_EXTERNAL_URL")
+                        or os.environ.get("WEBHOOK_BASE") or "").rstrip("/")
+                if base:
+                    def _ping():
+                        try:
+                            return requests.get(base + "/healthz", timeout=20).status_code
+                        except Exception as e:
+                            return str(e)[:60]
+                    code = await asyncio.to_thread(_ping)
+                    db.set_settings({"keepalive_last": f"{int(time.time())}:{code}"})
+        except Exception as e:
+            log.warning("keepalive failed: %s", e)
+        try:
+            mins = max(2.0, float(db.get_settings().get("keepalive_minutes") or 10))
+        except (TypeError, ValueError):
+            mins = 10.0
+        await asyncio.sleep(mins * 60)
+
+
 async def _auto_index_loop():
     """Background: index new files from every enabled group on a timer, so a
     manual scan is never needed. Live capture handles files the bot sees at once;
@@ -167,7 +212,7 @@ async def _poll_loop():
                 asyncio.create_task(handlers.handle_update(u))
             if ups:
                 db.set_settings({"tg_offset": str(offset)})
-                await asyncio.to_thread(db.flush, True)
+                await asyncio.to_thread(db.flush)      # debounced - not a forced write per batch
             if db.get_settings().get("poll_last_error"):
                 db.set_settings({"poll_last_error": ""})
         except Exception as e:
@@ -360,7 +405,9 @@ def settings_save(
     tg_api_id: str = Form(""),
     tg_api_hash: str = Form(""),
     tg_session: str = Form(""),
+    keepalive_minutes: str = Form("10"),
     require_mention: str = Form(None),
+    keepalive: str = Form(None),
     require_approval: str = Form(None),
     announce_approval: str = Form(None),
     index_live: str = Form(None),
@@ -388,7 +435,9 @@ def settings_save(
         "allow_user_ids": allow_user_ids.strip(),
         "webhook_secret": webhook_secret.strip(),
         "tg_api_id": tg_api_id.strip(),
+        "keepalive_minutes": keepalive_minutes.strip() or "10",
         "require_mention": "1" if require_mention is not None else "0",
+        "keepalive": "1" if keepalive is not None else "0",
         "require_approval": "1" if require_approval is not None else "0",
         "announce_approval": "1" if announce_approval is not None else "0",
         "index_live": "1" if index_live is not None else "0",
@@ -496,6 +545,10 @@ def diagnostics_page(request: Request, msg: str = ""):
         "userbot_configured": userbot.configured(), "userbot_running": userbot.is_running(),         "userbot_error": db.get_settings().get("userbot_last_error") or "",
          "poll_mode": _use_polling(),
          "poll_error": db.get_settings().get("poll_last_error") or "",
+         "keepalive_on": str(db.get_settings().get("keepalive") or "1") == "1",
+         "keepalive_last": _keepalive_str(),
+         "public_url": (os.environ.get("RENDER_EXTERNAL_URL")
+                        or os.environ.get("WEBHOOK_BASE") or ""),
          "groups": groups, "total_files": db.count_files(),
         "webhook": _webhook_url(), "paused": db.is_paused(),
         "activity": [dict(a, time=time.strftime("%H:%M:%S", time.localtime(a["t"])))

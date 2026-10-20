@@ -110,7 +110,7 @@ def _gemini(prompt, system, temperature, max_tokens, json_mode):
     if json_mode:
         body["generationConfig"]["responseMimeType"] = "application/json"
     r = requests.post(f"{GEMINI_API}/{model}:generateContent",
-                      params={"key": key}, json=body, timeout=45)
+                      params={"key": key}, json=body, timeout=10)
     r.raise_for_status()
     text = ""
     for cand in r.json().get("candidates", []):
@@ -131,7 +131,7 @@ def _openai(prompt, system, temperature, max_tokens, json_mode):
             "temperature": temperature, "max_tokens": max_tokens}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
-    r = requests.post(f"{base}/chat/completions", json=body, timeout=45,
+    r = requests.post(f"{base}/chat/completions", json=body, timeout=10,
                       headers={"Authorization": f"Bearer {key}",
                                "Content-Type": "application/json"})
     r.raise_for_status()

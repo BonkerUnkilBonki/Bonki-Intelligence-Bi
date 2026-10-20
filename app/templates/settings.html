@@ -81,6 +81,19 @@
 </div>
 
 <div class="card">
+  <h2>Keep-alive (stay online)</h2>
+  <div class="small muted" style="margin-bottom:8px">
+    On Render's free tier the service is spun down after ~15 minutes without
+    traffic — which takes <b>both the bot and this dashboard offline</b>. With
+    keep-alive on, Bonki pings its own public URL on a timer so the host never
+    sees it idle. Leave this on unless you're on a paid always-on plan.
+  </div>
+  <label><input type="checkbox" name="keepalive" {% if s.keepalive=='1' %}checked{% endif %} style="width:auto"> Keep the service awake (self-ping)</label>
+  <label>Ping every (minutes)</label>
+  <input name="keepalive_minutes" value="{{ s.keepalive_minutes }}">
+</div>
+
+<div class="card">
   <h2>Webhook &amp; DMs</h2>
   <label>Webhook secret</label>
   <input name="webhook_secret" value="{{ s.webhook_secret }}">

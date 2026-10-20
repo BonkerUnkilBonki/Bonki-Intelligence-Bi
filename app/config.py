@@ -27,6 +27,12 @@ DEFAULT_SETTINGS = {
     "require_mention": "1",
     # "1" = PAUSE everything
     "paused": "0",
+    # ---- keep-alive (Render free tier sleeps the service when idle) ----
+    # "1" = ping our own public URL on a timer, so Render never sees the service
+    # as idle and never spins it down (which takes the bot AND the dashboard down)
+    "keepalive": "1",
+    "keepalive_minutes": "10",
+    "keepalive_last": "",      # informational: "<epoch>:<status>" of the last ping
 
     # ---- the brain ----
     # "gemini" | "openai" | "off"
