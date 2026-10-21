@@ -287,10 +287,16 @@ def dashboard(request: Request, msg: str = ""):
         g["file_count"] = db.count_files(g.get("chat_id"))
         g["last_scan_str"] = (time.strftime("%Y-%m-%d %H:%M", time.localtime(g["last_scan"]))
                               if g.get("last_scan") else "never")
+        g["link"] = telegram.chat_link(g.get("chat_id"), g.get("handle"))
     pending = [g for g in groups if not g.get("approved")]
+    history = []
+    for a in db.list_approvals(80):
+        a["time"] = time.strftime("%d %b %H:%M", time.localtime(a["t"]))
+        a["link"] = telegram.chat_link(a.get("chat_id"), a.get("username"))
+        history.append(a)
     return TEMPLATES.TemplateResponse(request, "index.html", {
         "groups": groups, "pending": pending, "owner_set": bool(approval.owner_id()),
-        "msg": msg, "total_files": db.count_files(),
+        "history": history, "msg": msg, "total_files": db.count_files(),
         "storage": db.storage_info(), "brain": llm.describe(),
         "llm_on": llm.enabled(), "userbot_on": userbot.is_running(),
         "userbot_configured": userbot.configured(),
@@ -305,6 +311,7 @@ def group_add(chat_id: str = Form(...), title: str = Form("")):
     handle = userbot.clean_handle(chat_id)
     cid = handle if handle.lstrip("-").isdigit() else ("@" + handle if handle else "")
     if db.add_group(cid, title.strip() or cid, handle, approved=1):
+        db.log_approval(cid, title.strip() or cid, handle, "add", by="dashboard")
         return _redir(f"Added group {cid} (approved). Click Scan to index its files.")
     return _redir(f"{cid} is already added.")
 
@@ -332,6 +339,8 @@ async def group_scan(gid: int):
         return _redir("Group not found.")
     if not userbot.is_running():
         return _redir("User account not connected - log in at /userbot to scan history.")
+    db.log_approval(row.get("chat_id"), row.get("title"), row.get("handle") or "",
+                    "scan", by="dashboard")
     asyncio.create_task(indexer.scan(row, full=True))
     return _redir(f"Scanning {row.get('title')}… refresh in a moment.")
 
@@ -340,6 +349,9 @@ async def group_scan(gid: int):
 async def scan_all():
     if not userbot.is_running():
         return _redir("User account not connected - log in at /userbot to scan history.")
+    for _g in db.list_groups():
+        db.log_approval(_g.get("chat_id"), _g.get("title"), _g.get("handle") or "",
+                        "scan", by="dashboard")
     asyncio.create_task(indexer.scan_all(full=True))
     return _redir("Scanning all groups…")
 

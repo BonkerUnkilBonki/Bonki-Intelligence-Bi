@@ -46,14 +46,15 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 
 # --------------------------------------------------------------- helpers ---
 def _default_state():
-    return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": []}
+    return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
+            "approvals": []}
 
 
 def _normalize(state):
     base = _default_state()
     if not isinstance(state, dict):
         return base
-    for k in ("groups", "files", "activity", "feedback"):
+    for k in ("groups", "files", "activity", "feedback", "approvals"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -509,6 +510,30 @@ def clear_feedback(chat_id=None):
         else:
             _STATE["feedback"] = [f for f in (_STATE.get("feedback") or [])
                                   if str(f.get("chat_id")) != str(chat_id)]
+        _touch()
+
+
+# -------------------------------------------------------------- approvals ---
+def log_approval(chat_id, title, username, action, by=""):
+    """Append to the approval / request history (who asked, which channel, what
+    happened). Shown on the dashboard with a link to the channel."""
+    with _lock:
+        log = _STATE.setdefault("approvals", [])
+        log.append({"t": time.time(), "chat_id": str(chat_id or ""),
+                    "title": str(title or "")[:120], "username": str(username or ""),
+                    "action": str(action), "by": str(by or "")})
+        del log[:-300]
+        _touch()
+
+
+def list_approvals(limit=100):
+    with _lock:
+        return [dict(a) for a in (_STATE.get("approvals") or [])[-limit:]][::-1]
+
+
+def clear_approvals():
+    with _lock:
+        _STATE["approvals"] = []
         _touch()
 
 

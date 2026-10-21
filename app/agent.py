@@ -590,6 +590,8 @@ async def _do_scan(chat, msg):
         return
     await _send("🔎 Scanning this group's history…", chat.get("id"),
                 reply_to=msg.get("message_id"))
+    db.log_approval(chat.get("id"), chat.get("title"), chat.get("username") or "",
+                    "scan", by="telegram")
     res = await indexer.scan(row)
     if res.get("error"):
         await _send(f"Scan failed: {telegram.esc(res['error'])}", chat.get("id"),

@@ -128,6 +128,19 @@ def send_chat_action(chat_id, action="typing"):
         return None
 
 
+def chat_link(chat_id, username=None):
+    """A tappable link to a chat: @username when public, else the t.me/c/ form
+    (which opens for members). Returns None if there's nothing linkable."""
+    if username:
+        return f"https://t.me/{str(username).lstrip('@')}"
+    cid = str(chat_id or "").strip()
+    if cid.startswith("@"):
+        return f"https://t.me/{cid[1:]}"
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}"
+    return None
+
+
 def get_me():
     return _post("getMe", {})
 

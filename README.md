@@ -74,6 +74,16 @@ each with its own Approve / Reject buttons. Or `/approve <chat_id>` / `/reject <
 **From the dashboard:** unverified groups appear in a *Waiting for your approval*
 card on the home page with the same Approve / Reject buttons.
 
+**Channel links.** Every group on the home page is a clickable link to the chat
+itself — `https://t.me/<username>` for public ones, `https://t.me/c/<id>` for
+private ones (opens for members). So you can jump straight to the channel the bot
+was added to.
+
+**Approval & request history.** The home page keeps a log of every event: the bot
+being added to a channel (with who added it), each approval request, each
+yours-approve/reject, and every scan requested — each row linked to its channel,
+newest first. It's durable, so it survives restarts (keep `GITHUB_TOKEN` set).
+
 Groups you had before this feature stay approved, and a group you add yourself in
 the dashboard is approved on the spot. Turn the whole gate off with
 **Settings → Require owner approval** if you don't want it.

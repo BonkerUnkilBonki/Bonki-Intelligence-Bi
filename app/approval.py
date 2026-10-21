@@ -69,7 +69,7 @@ async def notify_owner(text, reply_markup=None):
         return False
 
 
-async def announce(chat):
+async def announce(chat, by=""):
     """Tell the group + the owner that this group needs approving (once)."""
     cid = chat.get("id")
     title = chat.get("title") or str(cid)
@@ -79,6 +79,7 @@ async def announce(chat):
     if not g or g.get("approval_notified"):
         return
     db.update_group(g["id"], {"approval_notified": 1})
+    db.log_approval(cid, title, chat.get("username") or "", "request", by=by)
     await asyncio.to_thread(db.flush, True)
 
     try:

@@ -90,8 +90,10 @@ async def _handle_membership(cm):
     if status in ("member", "administrator", "creator"):
         if not db.get_group_by_chat(chat.get("id"), chat.get("username")):
             db.add_group(chat.get("id"), chat.get("title") or "", chat.get("username") or "")
+        who = cm.get("from") or {}
+        by = who.get("first_name") or who.get("username") or str(who.get("id") or "")
         if approval.gate(chat.get("id"), chat.get("username")):
-            await approval.announce(chat)          # post the verify button + DM owner
+            await approval.announce(chat, by=by)   # post the verify button + DM owner
     elif status in ("left", "kicked"):
         g = db.get_group_by_chat(chat.get("id"), chat.get("username"))
         if g:
@@ -132,6 +134,9 @@ async def _handle_approval(cq):
             except Exception as e:
                 log.warning("could not announce approval in %s: %s", cid, e)
         db.log_activity("approve", (g or {}).get("chat_id") or cid, "group approved by owner")
+        db.log_approval((g or {}).get("chat_id") or cid, (g or {}).get("title") or cid,
+                        (g or {}).get("handle") or "", "approve",
+                        by=str((cq.get("from") or {}).get("id") or "owner"))
     else:
         if g:
             db.update_group(g["id"], {"approved": 0, "enabled": 0})
@@ -148,6 +153,9 @@ async def _handle_approval(cq):
             except Exception as e:
                 log.warning("could not leave %s: %s", cid, e)
         db.log_activity("reject", (g or {}).get("chat_id") or cid, "group rejected by owner")
+        db.log_approval((g or {}).get("chat_id") or cid, (g or {}).get("title") or cid,
+                        (g or {}).get("handle") or "", "reject",
+                        by=str((cq.get("from") or {}).get("id") or "owner"))
     await asyncio.to_thread(db.flush, True)
 
 
@@ -206,6 +214,8 @@ async def _owner_command(text, chat, msg):
             return
         ok = low.startswith("/approve")
         db.update_group(g["id"], {"approved": 1 if ok else 0, "enabled": 1 if ok else 0})
+        db.log_approval(g.get("chat_id"), g.get("title"), g.get("handle") or "",
+                        "approve" if ok else "reject", by="owner (DM)")
         await asyncio.to_thread(db.flush, True)
         await _send(("✅ Approved " if ok else "🚫 Rejected ")
                     + telegram.esc(g.get("title") or parts[1]), chat.get("id"))
