@@ -47,7 +47,8 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 # --------------------------------------------------------------- helpers ---
 def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
-            "approvals": [], "notes": [], "warns": [], "chatconf": []}
+            "approvals": [], "notes": [], "warns": [], "chatconf": [], "stickerpacks": [],
+            "feds": []}
 
 
 def _normalize(state):
@@ -55,7 +56,7 @@ def _normalize(state):
     if not isinstance(state, dict):
         return base
     for k in ("groups", "files", "activity", "feedback", "approvals",
-              "notes", "warns", "chatconf"):
+              "notes", "warns", "chatconf", "stickerpacks", "feds"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -599,6 +600,133 @@ def set_chatconf(chat_id, fields):
         row = {"chat_id": str(chat_id)}
         row.update(fields)
         cc.append(row)
+        _touch()
+
+
+# ------------------------------------------------------------ federations --
+def list_feds():
+    with _lock:
+        return [dict(f) for f in _STATE.get("feds", [])]
+
+
+def get_fed(fed_id):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("id")) == str(fed_id):
+                return dict(f)
+    return None
+
+
+def get_fed_by_name(name):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("name", "")).lower() == str(name or "").lower():
+                return dict(f)
+    return None
+
+
+def get_fed_for_chat(chat_id):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(chat_id) in [str(g) for g in (f.get("groups") or [])]:
+                return dict(f)
+    return None
+
+
+def add_fed(name, owner):
+    with _lock:
+        feds = _STATE.setdefault("feds", [])
+        if any(str(f.get("name", "")).lower() == str(name).lower() for f in feds):
+            return None
+        row = {"id": max([f.get("id", 0) for f in feds] or [0]) + 1,
+               "name": name, "owner": str(owner), "admins": [str(owner)],
+               "groups": [], "bans": [], "t": time.time()}
+        feds.append(row)
+        _touch()
+        return dict(row)
+
+
+def update_fed(fed_id, fields):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("id")) == str(fed_id):
+                f.update(fields)
+                _touch()
+                return
+
+
+def delete_fed(fed_id):
+    with _lock:
+        before = len(_STATE.get("feds", []))
+        _STATE["feds"] = [f for f in _STATE.get("feds", [])
+                          if str(f.get("id")) != str(fed_id)]
+        if len(_STATE["feds"]) != before:
+            _touch()
+            return True
+    return False
+
+
+def fed_ban(fed_id, user, reason, by):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("id")) != str(fed_id):
+                continue
+            bans = f.setdefault("bans", [])
+            for b in bans:
+                if str(b.get("user")) == str(user):
+                    b.update({"reason": reason, "by": str(by), "t": time.time()})
+                    _touch()
+                    return
+            bans.append({"user": str(user), "reason": reason[:200],
+                         "by": str(by), "t": time.time()})
+            _touch()
+            return
+
+
+def fed_unban(fed_id, user):
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("id")) != str(fed_id):
+                continue
+            before = len(f.get("bans") or [])
+            f["bans"] = [b for b in (f.get("bans") or [])
+                         if str(b.get("user")) != str(user)]
+            if len(f["bans"]) != before:
+                _touch()
+                return True
+    return False
+
+
+def fed_is_banned(fed_id, user):
+    key = str(user or "").lower()
+    with _lock:
+        for f in _STATE.get("feds", []):
+            if str(f.get("id")) != str(fed_id):
+                continue
+            return any(str(b.get("user") or "").lower() == key
+                       for b in (f.get("bans") or []))
+    return False
+
+
+# ------------------------------------------------------------ stickerpacks --
+def get_stickerpack(user_id):
+    with _lock:
+        for p in _STATE.get("stickerpacks", []):
+            if str(p.get("user_id")) == str(user_id):
+                return dict(p)
+    return None
+
+
+def set_stickerpack(user_id, name, title, count):
+    with _lock:
+        packs = _STATE.setdefault("stickerpacks", [])
+        for p in packs:
+            if str(p.get("user_id")) == str(user_id):
+                p.update({"name": name, "title": title, "count": int(count)})
+                _touch()
+                return
+        packs.append({"user_id": str(user_id), "name": name, "title": title,
+                      "count": int(count), "t": time.time()})
         _touch()
 
 

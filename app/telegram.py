@@ -27,8 +27,22 @@ def _url(method):
     return f"{_base()}/bot{_token()}/{method}"
 
 
+class RateLimited(Exception):
+    """Telegram said 429 - wait `retry_after` seconds and try again."""
+
+    def __init__(self, retry_after=5):
+        self.retry_after = int(retry_after or 5)
+        super().__init__(f"rate limited - retry after {self.retry_after}s")
+
+
 def _post(method, data, **kw):
     r = requests.post(_url(method), data=data, timeout=kw.pop("timeout", 30), **kw)
+    if r.status_code == 429:                 # flood control - not a fatal error
+        try:
+            retry = (r.json().get("parameters") or {}).get("retry_after", 5)
+        except Exception:
+            retry = 5
+        raise RateLimited(retry)
     if not r.ok:
         raise RuntimeError(f"{method} failed: {r.status_code} {r.text[:300]}")
     return r.json()
@@ -199,6 +213,50 @@ def unpin_chat_message(chat_id, message_id=None):
 
 def get_file(file_id):
     return _post("getFile", {"file_id": file_id})
+
+
+def send_photo(file_path, filename="quote.png", caption="", chat_id=None, reply_to=None):
+    data = {"chat_id": chat_id, "caption": (caption or "")[:MAX_CAPTION]}
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+        data["allow_sending_without_reply"] = True
+    with open(file_path, "rb") as fh:
+        r = requests.post(_url("sendPhoto"), data=data,
+                          files={"photo": (filename, fh, "image/png")}, timeout=120)
+    if not r.ok:
+        raise RuntimeError(f"sendPhoto failed: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+# ---------------------------------------------------------------- stickers ---
+def get_sticker_set(name):
+    return _post("getStickerSet", {"name": name})
+
+
+def create_new_sticker_set(user_id, name, title, png_bytes, emoji="🤔"):
+    data = {"user_id": user_id, "name": name, "title": title[:64],
+            "stickers": json.dumps([{"sticker": "attach://file0", "format": "static",
+                                     "emoji_list": [emoji]}], ensure_ascii=False)}
+    r = requests.post(_url("createNewStickerSet"), data=data,
+                      files={"file0": ("sticker.png", png_bytes, "image/png")}, timeout=60)
+    if not r.ok:
+        raise RuntimeError(r.text[:300])
+    return r.json()
+
+
+def add_sticker_to_set(user_id, name, png_bytes, emoji="🤔"):
+    data = {"user_id": user_id, "name": name,
+            "sticker": json.dumps({"sticker": "attach://file0", "format": "static",
+                                   "emoji_list": [emoji]}, ensure_ascii=False)}
+    r = requests.post(_url("addStickerToSet"), data=data,
+                      files={"file0": ("sticker.png", png_bytes, "image/png")}, timeout=60)
+    if not r.ok:
+        raise RuntimeError(r.text[:300])
+    return r.json()
+
+
+def delete_sticker_from_set(sticker_file_id):
+    return _post("deleteStickerFromSet", {"sticker": sticker_file_id})
 
 
 def download_file(file_path):

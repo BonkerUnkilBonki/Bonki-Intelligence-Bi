@@ -22,14 +22,22 @@ import logging
 import re
 import time
 
-from . import db, telegram
+from . import db, federation, stickers, telegram
 
 log = logging.getLogger("rose")
 
 MAX_WARNS = 3
-MAX_PURGE = 100
-TAG_MAX = 20                 # hard cap on repeated tags per command
+TAG_MAX = 50                 # ceiling; the actual cap comes from settings tag_max
 TAG_COOLDOWN = 60            # seconds between tag commands, per user
+MAX_PURGE = 200              # messages per purge
+LOCK_TYPES = ("media", "sticker", "gif", "link", "forward", "bots", "commands")
+
+
+def _tag_cap():
+    try:
+        return max(1, min(int(db.get_settings().get("tag_max") or TAG_MAX), 100))
+    except (TypeError, ValueError):
+        return TAG_MAX
 ADMIN_STATUS = ("administrator", "creator")
 
 _tag_last = {}
@@ -244,25 +252,122 @@ async def cmd_del(chat, msg, user, args):
         await _reply(chat, msg, f"⚠️ Couldn't delete: {_esc(e)}")
 
 
-async def cmd_purge(chat, msg, user, args):
-    if not await _need_admin(chat, msg, user):
-        return
-    rt = msg.get("reply_to_message") or {}
-    start = rt.get("message_id")
-    end = msg.get("message_id")
-    if not start:
-        return await _reply(chat, msg, "Reply to the first message to purge from.")
-    ids = list(range(int(start), int(end) + 1))
-    if len(ids) > MAX_PURGE:
-        ids = ids[-MAX_PURGE:]
+async def _delete_ids(chat_id, ids):
     ok = 0
     for mid in ids:
         try:
-            await asyncio.to_thread(telegram.delete_message, chat.get("id"), mid)
+            await asyncio.to_thread(telegram.delete_message, chat_id, mid)
             ok += 1
         except Exception:
             pass
-    log.info("purged %d messages in %s", ok, chat.get("id"))
+        await asyncio.sleep(0.05)          # gentle: don't trip flood control
+    return ok
+
+
+async def cmd_purge(chat, msg, user, args):
+    """Purge messages.
+
+    Works in forum topics too: message ids are unique across the whole chat, so
+    deleting the id range from the replied-to message up to this one only ever
+    touches messages inside that same topic.
+
+      /purge        reply -> delete from that message up to here
+      /purge 20     delete the last 20 messages
+    """
+    if not await _need_admin(chat, msg, user):
+        return
+    rt = msg.get("reply_to_message") or {}
+    end = int(msg.get("message_id") or 0)
+    arg = (args or "").strip()
+    if arg.isdigit():
+        n = max(1, min(int(arg), MAX_PURGE))
+        ids = list(range(max(1, end - n + 1), end + 1))   # exactly n messages
+    elif rt.get("message_id"):
+        start = int(rt["message_id"])
+        if start > end:
+            start, end = end, start
+        ids = list(range(start, end + 1))
+        if len(ids) > MAX_PURGE:
+            ids = ids[-MAX_PURGE:]
+    else:
+        return await _reply(chat, msg, "Reply to the first message to purge from, "
+                                       "or use <code>/purge 20</code>.")
+    deleted = await _delete_ids(chat.get("id"), ids)
+    log.info("purged %d/%d messages in %s", deleted, len(ids), chat.get("id"))
+    try:
+        await _reply(chat, msg, f"🧹 Deleted {deleted} message(s).")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ locks ---
+async def cmd_lock(chat, msg, user, args):
+    if not await _need_admin(chat, msg, user):
+        return
+    kind = (args or "").strip().lower().split()[0] if (args or "").strip() else ""
+    if kind not in LOCK_TYPES:
+        return await _reply(chat, msg, f"Usage: <code>/lock {'|'.join(LOCK_TYPES)}</code>")
+    conf = db.get_chatconf(chat.get("id"))
+    locks = set(conf.get("locks") or [])
+    locks.add(kind)
+    db.set_chatconf(chat.get("id"), {"locks": sorted(locks)})
+    await _reply(chat, msg, f"🔒 Locked <b>{kind}</b>.")
+
+
+async def cmd_unlock(chat, msg, user, args):
+    if not await _need_admin(chat, msg, user):
+        return
+    kind = (args or "").strip().lower().split()[0] if (args or "").strip() else ""
+    if kind not in LOCK_TYPES:
+        return await _reply(chat, msg, f"Usage: <code>/unlock {'|'.join(LOCK_TYPES)}</code>")
+    conf = db.get_chatconf(chat.get("id"))
+    locks = set(conf.get("locks") or [])
+    locks.discard(kind)
+    db.set_chatconf(chat.get("id"), {"locks": sorted(locks)})
+    await _reply(chat, msg, f"🔓 Unlocked <b>{kind}</b>.")
+
+
+async def cmd_locks(chat, msg, user, args):
+    conf = db.get_chatconf(chat.get("id"))
+    locks = conf.get("locks") or []
+    if not locks:
+        return await _reply(chat, msg, "No locks set in this chat.")
+    await _reply(chat, msg, "🔒 <b>Locked</b>: " + ", ".join(locks))
+
+
+async def enforce_locks(chat, msg, user):
+    """Delete a message that breaks an active lock. Returns True if deleted."""
+    conf = db.get_chatconf(chat.get("id"))
+    locks = conf.get("locks") or []
+    if not locks:
+        return False
+    if await _is_admin(chat.get("id"), (user or {}).get("id")):
+        return False
+    text = msg.get("text") or msg.get("caption") or ""
+    hit = None
+    if "bots" in locks and (user or {}).get("is_bot"):
+        hit = "bots"
+    if not hit and "forward" in locks and (msg.get("forward_from") or msg.get("forward_origin")
+                                            or msg.get("forward_from_chat")):
+        hit = "forward"
+    if not hit and "sticker" in locks and msg.get("sticker"):
+        hit = "sticker"
+    if not hit and "gif" in locks and msg.get("animation"):
+        hit = "gif"
+    if not hit and "media" in locks and any(msg.get(k) for k in
+                                            ("photo", "video", "audio", "document", "voice")):
+        hit = "media"
+    if not hit and "link" in locks and re.search(r"(https?://|t\.me/|www\.)", text, re.I):
+        hit = "link"
+    if not hit and "commands" in locks and text.startswith("/"):
+        hit = "commands"
+    if hit:
+        try:
+            await asyncio.to_thread(telegram.delete_message, chat.get("id"), msg.get("message_id"))
+            return True
+        except Exception as e:
+            log.warning("lock delete failed: %s", e)
+    return False
 
 
 async def cmd_pin(chat, msg, user, args):
@@ -486,9 +591,11 @@ async def cmd_tag(chat, msg, user, args):
     except Exception:
         pass
 
-    m = re.search(r"\b(\d{1,3})\b", rest or "")
+    m = re.search(r"\b(\d{1,4})\b", rest or "")
     count = int(m.group(1)) if m else 1
-    count = max(1, min(count, TAG_MAX))
+    cap = _tag_cap()
+    wanted = count
+    count = max(1, min(count, cap))
 
     key = (str(cid), str(user.get("id")))
     now = time.time()
@@ -498,19 +605,41 @@ async def cmd_tag(chat, msg, user, args):
     _tag_last[key] = now
 
     mention = _mention(uid, un)
+    if count > 5:
+        try:                        # the notice must never abort the command
+            await _reply(chat, msg, f"⏳ Sending {count} tags. Telegram allows about "
+                                    f"20 messages a minute per group, so this takes "
+                                    f"a couple of minutes — please wait.")
+        except Exception:
+            pass
+
     sent = 0
     for _ in range(count):
-        try:
-            await _reply(chat, msg, mention)
-            sent += 1
-        except Exception as e:                 # rate limited or blocked - stop
-            log.warning("tag send failed after %d: %s", sent, e)
+        ok = False
+        for _attempt in range(5):
+            try:
+                await _reply(chat, msg, mention)
+                sent += 1
+                ok = True
+                break
+            except telegram.RateLimited as rl:
+                # Telegram told us exactly how long to wait - obey it, don't give up
+                await asyncio.sleep(min(rl.retry_after + 1, 60))
+            except Exception as e:
+                log.warning("tag send failed after %d: %s", sent, e)
+                break
+        if not ok:
             break
-        await asyncio.sleep(0.4)               # stay under Telegram's per-group limit
+        await asyncio.sleep(0.9)               # gentle pacing, under the per-group cap
 
+    note = f"⚠️ Only {sent} of {count} tags went through (Telegram flood limit)."
+    if wanted > cap:
+        note += f" The cap is {cap} per command — raise it in Settings → Tag cap."
     if sent < count:
-        await _reply(chat, msg, f"⚠️ Only {sent} of {count} tags went through "
-                                f"(Telegram rate limit).")
+        try:
+            await _reply(chat, msg, note)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ help ----
@@ -524,6 +653,11 @@ HELP = (
     "<b>Rules</b>: /setrules text · /rules\n"
     "<b>Welcome</b>: /setwelcome text ({name}) · /welcome on|off · /setgoodbye · /goodbye\n"
     "<b>Info</b>: /id · /info · /admins\n"
+    "<b>Stickers</b>: /kang — reply to a sticker/image to add it to your pack\n"
+    "/packs · /getsticker · /stickerid · /delsticker\n"
+    "<b>Quotes</b>: /q — reply to a message to make a quote image\n"
+    "<b>Locks</b>: /lock media|sticker|gif|link|forward|bots|commands · /unlock · /locks\n"
+    "<b>Federation</b>: /newfed name · /joinfed id · /leavefed · /fedinfo · /fban · /unfban\n"
     "<b>Special</b>: /tag @user 5 — tags them 5 times, in 5 separate messages (max 20)\n\n"
     "Files: <i>Bonki, find apple music apk</i> · <i>Bonki, scan this group</i>"
 )
@@ -546,6 +680,21 @@ COMMANDS = {
     "id": cmd_id, "info": cmd_info, "admins": cmd_admins,
     "tag": cmd_tag, "help": cmd_help,
 }
+
+
+# locks, federations, quote + sticker commands
+COMMANDS.update({
+    "lock": cmd_lock, "unlock": cmd_unlock, "locks": cmd_locks,
+    "newfed": federation.cmd_newfed, "joinfed": federation.cmd_joinfed,
+    "leavefed": federation.cmd_leavefed, "fedinfo": federation.cmd_fedinfo,
+    "fedlist": federation.cmd_fedlist, "fedadmins": federation.cmd_fedadmins,
+    "fban": federation.cmd_fban, "unfban": federation.cmd_unfban,
+    "delfed": federation.cmd_delfed,
+    "q": stickers.cmd_quote, "quote": stickers.cmd_quote, "quotly": stickers.cmd_quote,
+    "kang": stickers.cmd_kang, "getsticker": stickers.cmd_getsticker,
+    "stickerid": stickers.cmd_stickerid, "packs": stickers.cmd_packs,
+    "delsticker": stickers.cmd_delsticker,
+})
 
 
 async def handle_command(chat, msg, user, cmd, args):

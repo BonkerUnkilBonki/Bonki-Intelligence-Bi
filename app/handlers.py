@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 
-from . import agent, approval, db, indexer, rose, telegram
+from . import agent, approval, db, federation, indexer, rose, telegram
 
 log = logging.getLogger("handlers")
 
@@ -266,6 +266,16 @@ async def handle_update(update):
                             "to approve it before I can index or answer here.",
                             chat.get("id"), reply_to=msg.get("message_id"))
             return
+
+        # moderation first: federation bans and active locks can remove the
+        # message before we index or answer it.
+        try:
+            if await federation.enforce(chat, msg, frm):
+                return
+            if await rose.enforce_locks(chat, msg, frm):
+                return
+        except Exception as e:
+            log.warning("moderation check failed: %s", e)
 
         if str(db.get_settings().get("index_live") or "1") == "1":
             try:

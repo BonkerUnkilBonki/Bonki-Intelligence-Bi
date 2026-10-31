@@ -5,3 +5,4 @@ requests>=2.31
 python-multipart>=0.0.9
 telethon>=1.34
 rapidfuzz>=3.0
+Pillow>=10.0

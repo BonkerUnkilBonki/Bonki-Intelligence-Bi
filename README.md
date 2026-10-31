@@ -69,15 +69,72 @@ Moderation needs the **bot to be an admin** with the relevant rights (ban/mute/p
 and the person issuing it to be a **group admin** (or you, the owner). At 3
 warnings the member is muted for an hour and warnings reset.
 
-**`/tag` guardrails.** Capped at **20 tags per command** and rate-limited to one
-tag command per user per minute, so it can't be turned into a spam/harassment tool.
-Works as `/tag @user 5` or `Bonki tag @user 5`.
+**`/tag` guardrails.** Capped at **50 per command** (change it in Settings → Tag
+cap, hard ceiling 100) and limited to one tag command per user per minute. Works
+as `/tag @user 5`, `Bonki tag @user 5`, or reply to a user with `/tag 5`.
+
+It also understands natural phrasing: `Bonki <anything> @user 5 times`, or reply
+to someone with `… 10 times`. **Only the @mention is sent** — the bot never
+repeats the wording of your message, so it can't be used to fire an insult at
+someone. Commands like `/scan`, `/find` and `/list` are excluded, so "scan this
+group 3 times" stays a scan.
+
+> **Why a big tag count takes time:** Telegram allows roughly **20 messages per
+> minute per group**. Bonki paces the sends and, when Telegram returns `429`, it
+> obeys the `retry_after` and continues instead of giving up — so `/tag @user 50`
+> genuinely delivers 50 messages, in about 2–3 minutes.
+
+### Purge, locks and federations
+
+| Command | Does |
+|---|---|
+| `/purge` | Reply to the first message → deletes everything up to your command |
+| `/purge 20` | Deletes the last 20 messages |
+| `/lock media\|sticker\|gif\|link\|forward\|bots\|commands` | Deletes offending messages from non-admins |
+| `/unlock <type>` · `/locks` | Remove a lock · list active locks |
+| `/newfed <name>` | Create a federation (you become owner) |
+| `/joinfed <id>` · `/leavefed` | Attach / detach this group |
+| `/fban <user> [reason]` · `/unfban <user>` | Ban across every group in the federation |
+| `/fedinfo` · `/fedlist` · `/fedadmins` · `/delfed` | Inspect / manage |
+
+**Purge works in forum topics.** Message ids are unique across the whole chat, so
+deleting the id range from the replied-to message to your command only ever
+touches messages inside that same topic.
+
+**Federation bans are enforced automatically** — a fedbanned user who posts in any
+attached group is banned there and the message removed.
+
+> **Honest limit — Rose interoperability is not possible.** This is Bonki's own
+> federation system. Rose publishes **no API or export** for its federation data,
+> so there is no supported way for another bot to read, join or share Rose feds.
+> Any tool claiming to "sync with Rose federations" is either scraping private
+> data or guessing. Your own feds work fully; Rose's cannot be imported.
 
 **Honest scope.** This is a practical core of Rose's behaviour, not a
-reimplementation of all of it. **Not included:** filters, locks (media/link
-locks), blacklists, antiflood, federations, connections, captcha, scheduled
-messages. Those are separate large modules — tell me which you actually use and
-I'll add them next.
+reimplementation of all of it. **Not included:** filters, blacklists, antiflood,
+connections, captcha, nightmode, scheduled messages. Those are separate large
+modules — tell me which you actually use and I'll add them next.
+
+## Quotes & sticker packs (Stickerkang-style)
+
+| Command | Does |
+|---|---|
+| `/q` `/quote` `/quotly` | Reply to a message → a rendered quote image (name, text, timestamp) |
+| `/kang [emoji]` | Reply to a sticker / photo / image → adds it to **your own** sticker pack, creating the pack on first use |
+| `/packs` | Link to your pack and its sticker count |
+| `/getsticker` | Reply to a sticker → its raw PNG |
+| `/stickerid` | Reply to a sticker → its `file_id`, emoji and set name |
+| `/delsticker` | Reply to a sticker **in your pack** → removes it |
+
+`/kang` creates a pack named `b<your_id>_by_<bot_username>` — the name Telegram
+requires for a bot-created pack — and resizes any image to 512 px PNG. You can
+rename and reorder it later from @Stickers.
+
+**Honest scope.** Static stickers only. **Animated (`.tgs`) and video (`.webm`)
+stickers are rejected** with a clear message — converting those needs extra
+tooling. The quote card is a clean custom design (coloured initial instead of an
+avatar image), not QuotLy's exact layout, and it has no background/emoji/rating
+options.
 
 ## Verification — the bot only works in *your* groups
 

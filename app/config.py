@@ -32,6 +32,9 @@ DEFAULT_SETTINGS = {
     # as idle and never spins it down (which takes the bot AND the dashboard down)
     "keepalive": "1",
     "keepalive_minutes": "10",
+    # max tags in one /tag command (Telegram allows ~20 messages/min per group,
+    # so a big number simply takes proportionally longer)
+    "tag_max": "50",
     "keepalive_last": "",      # informational: "<epoch>:<status>" of the last ping
 
     # ---- the brain ----

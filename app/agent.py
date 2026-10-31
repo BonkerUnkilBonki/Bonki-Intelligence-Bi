@@ -552,6 +552,20 @@ async def handle(chat, msg, user, text):
         text = (rest or cmd) if cmd == "find" else f"{cmd} {rest}".strip()
     if text.lower().startswith("tag "):            # "Bonki tag @user 5"
         return await rose.handle_command(chat, msg, user, "tag", text[4:].strip())
+
+    # Natural phrasing: "Bonki <anything> @user 5 times" or reply + "10 times".
+    # NOTE: only the @mention is sent - the bot never repeats the user's wording,
+    # so it can't be used to fire an insult at someone. Caps + cooldown still apply.
+    mt = re.search(r"\b(\d{1,3})\s*times?\b", text, re.I)
+    if mt and not re.search(r"\b(scan|find|list|count|stats|summar|search|index)\b",
+                            text, re.I):
+        n = max(1, int(mt.group(1)))
+        un = re.search(r"@([A-Za-z0-9_]{3,})", text)
+        rt_from = ((msg.get("reply_to_message") or {}).get("from") or {})
+        if un:
+            return await rose.handle_command(chat, msg, user, "tag", f"@{un.group(1)} {n}")
+        if rt_from.get("id"):
+            return await rose.handle_command(chat, msg, user, "tag", str(n))
     parsed = await parse(text)
     intent, query, hashtag, scan = (parsed["intent"], parsed["query"],
                                     parsed["hashtag"], parsed["scan"])
