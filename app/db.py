@@ -47,14 +47,15 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 # --------------------------------------------------------------- helpers ---
 def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
-            "approvals": []}
+            "approvals": [], "notes": [], "warns": [], "chatconf": []}
 
 
 def _normalize(state):
     base = _default_state()
     if not isinstance(state, dict):
         return base
-    for k in ("groups", "files", "activity", "feedback", "approvals"):
+    for k in ("groups", "files", "activity", "feedback", "approvals",
+              "notes", "warns", "chatconf"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -510,6 +511,94 @@ def clear_feedback(chat_id=None):
         else:
             _STATE["feedback"] = [f for f in (_STATE.get("feedback") or [])
                                   if str(f.get("chat_id")) != str(chat_id)]
+        _touch()
+
+
+# ------------------------------------------------- notes / warns / config --
+def save_note(chat_id, name, content, by=""):
+    with _lock:
+        notes = _STATE.setdefault("notes", [])
+        for n in notes:
+            if str(n.get("chat_id")) == str(chat_id) and str(n.get("name", "")).lower() == name.lower():
+                n.update({"content": content, "by": str(by), "t": time.time()})
+                _touch()
+                return
+        notes.append({"chat_id": str(chat_id), "name": name, "content": content,
+                      "by": str(by), "t": time.time()})
+        del notes[:-500]
+        _touch()
+
+
+def get_note(chat_id, name):
+    with _lock:
+        for n in _STATE.get("notes", []):
+            if str(n.get("chat_id")) == str(chat_id) and str(n.get("name", "")).lower() == name.lower():
+                return dict(n)
+    return None
+
+
+def delete_note(chat_id, name):
+    with _lock:
+        before = len(_STATE.get("notes", []))
+        _STATE["notes"] = [n for n in _STATE.get("notes", [])
+                           if not (str(n.get("chat_id")) == str(chat_id)
+                                   and str(n.get("name", "")).lower() == name.lower())]
+        if len(_STATE["notes"]) != before:
+            _touch()
+            return True
+    return False
+
+
+def list_notes(chat_id):
+    with _lock:
+        return [n["name"] for n in _STATE.get("notes", [])
+                if str(n.get("chat_id")) == str(chat_id)]
+
+
+def add_warn(chat_id, user, reason, by=""):
+    with _lock:
+        w = _STATE.setdefault("warns", [])
+        w.append({"chat_id": str(chat_id), "user": str(user), "reason": str(reason or "")[:200],
+                  "by": str(by), "t": time.time()})
+        _touch()
+        return sum(1 for x in w if str(x.get("chat_id")) == str(chat_id)
+                   and str(x.get("user")) == str(user))
+
+
+def list_warns(chat_id, user=None):
+    with _lock:
+        return [dict(x) for x in _STATE.get("warns", [])
+                if str(x.get("chat_id")) == str(chat_id)
+                and (user is None or str(x.get("user")) == str(user))]
+
+
+def reset_warns(chat_id, user):
+    with _lock:
+        _STATE["warns"] = [x for x in _STATE.get("warns", [])
+                           if not (str(x.get("chat_id")) == str(chat_id)
+                                   and str(x.get("user")) == str(user))]
+        _touch()
+
+
+def get_chatconf(chat_id):
+    with _lock:
+        for c in _STATE.get("chatconf", []):
+            if str(c.get("chat_id")) == str(chat_id):
+                return dict(c)
+    return {}
+
+
+def set_chatconf(chat_id, fields):
+    with _lock:
+        cc = _STATE.setdefault("chatconf", [])
+        for c in cc:
+            if str(c.get("chat_id")) == str(chat_id):
+                c.update(fields)
+                _touch()
+                return
+        row = {"chat_id": str(chat_id)}
+        row.update(fields)
+        cc.append(row)
         _touch()
 
 

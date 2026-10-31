@@ -51,6 +51,34 @@ appears as Bonki), an upload by the bot (files up to the size limit), then a
 server-side forward via your user account (any size up to 2 GB). A link is sent
 only if all of those fail.
 
+## Group management (Rose-style)
+
+Commands work as ordinary slash commands in any **approved** group — **no wake
+word needed**, so it behaves like a normal group-management bot:
+
+| Area | Commands |
+|---|---|
+| Moderation (admins) | `/ban` `/unban` `/kick` `/mute [30m]` `/unmute` `/warn` `/warns` `/resetwarns` `/purge` `/del` `/pin` `/unpin` `/report` |
+| Notes | `/save name text` `/get name` `/clear name` `/notes` |
+| Rules | `/setrules text` `/rules` |
+| Welcome | `/setwelcome text ({name})` `/welcome on\|off` `/setgoodbye` `/goodbye` |
+| Info | `/id` `/info` `/admins` `/help` |
+| Special | `/tag @user 5` — tags them 5 times |
+
+Moderation needs the **bot to be an admin** with the relevant rights (ban/mute/pin),
+and the person issuing it to be a **group admin** (or you, the owner). At 3
+warnings the member is muted for an hour and warnings reset.
+
+**`/tag` guardrails.** Capped at **20 tags per command** and rate-limited to one
+tag command per user per minute, so it can't be turned into a spam/harassment tool.
+Works as `/tag @user 5` or `Bonki tag @user 5`.
+
+**Honest scope.** This is a practical core of Rose's behaviour, not a
+reimplementation of all of it. **Not included:** filters, locks (media/link
+locks), blacklists, antiflood, federations, connections, captcha, scheduled
+messages. Those are separate large modules — tell me which you actually use and
+I'll add them next.
+
 ## Verification — the bot only works in *your* groups
 
 Anyone can add a bot to a group, so **nothing happens in a new group until you

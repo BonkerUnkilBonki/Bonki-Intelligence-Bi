@@ -153,6 +153,50 @@ def get_chat_member(chat_id, user_id):
     return _post("getChatMember", {"chat_id": chat_id, "user_id": user_id})
 
 
+def get_chat_administrators(chat_id):
+    return _post("getChatAdministrators", {"chat_id": chat_id})
+
+
+_MUTED = {k: False for k in (
+    "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
+    "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
+    "can_send_other_messages", "can_add_web_page_previews", "can_change_info",
+    "can_invite_users", "can_pin_messages", "can_manage_topics")}
+_UNMUTED = {k: True for k in _MUTED}
+
+
+def ban_chat_member(chat_id, user_id, until_date=None, revoke=True):
+    data = {"chat_id": chat_id, "user_id": user_id, "revoke_messages": bool(revoke)}
+    if until_date:
+        data["until_date"] = int(until_date)
+    return _post("banChatMember", data)
+
+
+def unban_chat_member(chat_id, user_id, only_if_banned=True):
+    return _post("unbanChatMember", {"chat_id": chat_id, "user_id": user_id,
+                                     "only_if_banned": bool(only_if_banned)})
+
+
+def restrict_chat_member(chat_id, user_id, mute=True, until_date=None):
+    data = {"chat_id": chat_id, "user_id": user_id,
+            "permissions": json.dumps(_MUTED if mute else _UNMUTED)}
+    if until_date:
+        data["until_date"] = int(until_date)
+    return _post("restrictChatMember", data)
+
+
+def pin_chat_message(chat_id, message_id, notify=False):
+    return _post("pinChatMessage", {"chat_id": chat_id, "message_id": message_id,
+                                    "disable_notification": not notify})
+
+
+def unpin_chat_message(chat_id, message_id=None):
+    data = {"chat_id": chat_id}
+    if message_id:
+        data["message_id"] = message_id
+    return _post("unpinChatMessage", data)
+
+
 def get_file(file_id):
     return _post("getFile", {"file_id": file_id})
 

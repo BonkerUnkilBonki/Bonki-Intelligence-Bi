@@ -27,7 +27,7 @@ import re
 import tempfile
 import time
 
-from . import approval, db, indexer, learn, llm, telegram, userbot
+from . import approval, db, indexer, learn, llm, rose, telegram, userbot
 
 log = logging.getLogger("agent")
 
@@ -550,6 +550,8 @@ async def handle(chat, msg, user, text):
         if cmd == "stats":
             return await _list_like("stats", chat, msg, rest)
         text = (rest or cmd) if cmd == "find" else f"{cmd} {rest}".strip()
+    if text.lower().startswith("tag "):            # "Bonki tag @user 5"
+        return await rose.handle_command(chat, msg, user, "tag", text[4:].strip())
     parsed = await parse(text)
     intent, query, hashtag, scan = (parsed["intent"], parsed["query"],
                                     parsed["hashtag"], parsed["scan"])

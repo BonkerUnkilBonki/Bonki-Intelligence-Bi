@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 
-from . import agent, approval, db, indexer, telegram
+from . import agent, approval, db, indexer, rose, telegram
 
 log = logging.getLogger("handlers")
 
@@ -273,6 +273,28 @@ async def handle_update(update):
                 asyncio.create_task(asyncio.to_thread(db.flush))   # don't block the reply
             except Exception as e:
                 log.warning("live index failed: %s", e)
+
+        # Rose-style commands need NO wake word - that's what makes it behave
+        # like a normal group-management bot in every approved chat.
+        if ctype in ("group", "supergroup") and text.startswith("/"):
+            parts = text.split(None, 1)
+            cmd = parts[0].lstrip("/").split("@")[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            if await rose.handle_command(chat, msg, frm, cmd, args):
+                return
+            try:                       # /scan, /find, /list, /stats still work
+                await agent.handle(chat, msg, frm, text)
+            except Exception as e:
+                log.warning("agent (command) failed: %s", e)
+            return
+
+        # welcome new members
+        members = msg.get("new_chat_members") or []
+        if members:
+            try:
+                await rose.welcome_new(chat, msg, members)
+            except Exception as e:
+                log.warning("welcome failed: %s", e)
 
         if ctype in ("group", "supergroup") and text and is_addressed(msg, text):
             clean = strip_address(text) or text
