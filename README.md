@@ -330,6 +330,37 @@ Two caveats, stated plainly:
 On a paid always-on plan (or any host that doesn't sleep) you can turn keep-alive
 **off**; it isn't needed there.
 
+### Panel hosts (Pterodactyl, bot-hosting, Falcon, etc.)
+
+These panels ask you to pick **the file your server should run**. Choose:
+
+```
+main.py        (in the project root - NOT app/main.py)
+```
+
+and set the start command to:
+
+```
+python main.py
+```
+
+(or `sh start.sh` if the panel wants a shell command). `main.py` reads the port
+the panel gives you — `SERVER_PORT`, `PORT`, `SERVER_PORT_WEB` or `WEB_PORT` — so
+there's nothing to configure by hand.
+
+Then set these environment variables in the panel:
+
+| Key | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | from @BotFather (**required**) |
+| `USE_POLLING` | `1` |
+| `GITHUB_TOKEN` | optional — only if the panel's disk is wiped between restarts |
+| `TG_API_ID` / `TG_API_HASH` / `TG_SESSION` | optional — history scanning only |
+
+> **Do not put `TG_SESSION` on a shared free panel.** A Telethon session string
+> is a full login to your personal Telegram account. Run bot-token only there —
+> everything except history scanning still works.
+
 ### Troubleshooting: `409 Conflict: terminated by other getUpdates request`
 
 Telegram allows **one** `getUpdates` poll per bot token. This error means a
