@@ -48,7 +48,8 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
             "approvals": [], "notes": [], "warns": [], "chatconf": [], "stickerpacks": [],
-            "feds": [], "ranker_rows": [], "memory": []}
+            "feds": [], "ranker_rows": [], "memory": [], "skills": [],
+            "decisions": [], "snapshots": [], "fed_push": []}
 
 
 def _normalize(state):
@@ -56,7 +57,8 @@ def _normalize(state):
     if not isinstance(state, dict):
         return base
     for k in ("groups", "files", "activity", "feedback", "approvals",
-              "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows", "memory"):
+              "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows", "memory",
+              "skills", "decisions", "snapshots", "fed_push"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -493,6 +495,125 @@ def add_tags(chat_id, message_id, tags):
         if t and add_tag(chat_id, message_id, t):
             added += 1
     return added
+
+
+# ----------------------------------------------------------------- skills ----
+def add_skill(chat_id, task, kind, next_ts, repeat=0, by=""):
+    with _lock:
+        rows = _STATE.setdefault("skills", [])
+        row = {"id": max([r.get("id", 0) for r in rows] or [0]) + 1,
+               "chat_id": str(chat_id), "task": (task or "")[:300], "kind": kind,
+               "next_ts": int(next_ts), "repeat": int(repeat or 0), "by": str(by),
+               "t": time.time()}
+        rows.append(row)
+        _touch()
+        return dict(row)
+
+
+def list_skills(chat_id=None):
+    with _lock:
+        rows = [dict(r) for r in _STATE.get("skills", [])]
+    if chat_id is None:
+        return rows
+    return [r for r in rows if str(r.get("chat_id")) == str(chat_id)]
+
+
+def due_skills(now):
+    with _lock:
+        return [dict(r) for r in _STATE.get("skills", [])
+                if int(r.get("next_ts") or 0) <= int(now)]
+
+
+def update_skill(skill_id, fields):
+    with _lock:
+        for r in _STATE.get("skills", []):
+            if r.get("id") == skill_id:
+                r.update(fields)
+                _touch()
+                return
+
+
+def delete_skill(skill_id):
+    with _lock:
+        before = len(_STATE.get("skills", []))
+        _STATE["skills"] = [r for r in _STATE.get("skills", [])
+                            if r.get("id") != skill_id]
+        if len(_STATE["skills"]) != before:
+            _touch()
+            return True
+    return False
+
+
+# -------------------------------------------------------------- decisions ----
+def add_decision(chat_id, text, by=""):
+    with _lock:
+        rows = _STATE.setdefault("decisions", [])
+        rows.append({"chat_id": str(chat_id), "text": (text or "")[:800],
+                     "by": str(by), "t": time.time()})
+        if len(rows) > 5000:
+            del rows[:-5000]
+        _touch()
+
+
+def list_decisions(chat_id=None, limit=20):
+    with _lock:
+        rows = [dict(r) for r in _STATE.get("decisions", [])]
+    if chat_id is not None:
+        rows = [r for r in rows if str(r.get("chat_id")) == str(chat_id)]
+    rows.sort(key=lambda r: -(r.get("t") or 0))
+    return rows[:limit]
+
+
+# --------------------------------------------------------------- analytics ----
+def add_snapshot(chat_id, members=None, files=None, size=None):
+    with _lock:
+        rows = _STATE.setdefault("snapshots", [])
+        rows.append({"chat_id": str(chat_id), "t": time.time(),
+                     "members": members, "files": files, "size": size})
+        if len(rows) > 20000:
+            del rows[:-20000]
+        _touch()
+
+
+def list_snapshots(chat_id=None, since=None):
+    with _lock:
+        rows = [dict(r) for r in _STATE.get("snapshots", [])]
+    if chat_id is not None:
+        rows = [r for r in rows if str(r.get("chat_id")) == str(chat_id)]
+    if since:
+        rows = [r for r in rows if (r.get("t") or 0) >= since]
+    rows.sort(key=lambda r: r.get("t") or 0)
+    return rows
+
+
+# ------------------------------------------------------- fed sync queue -----
+def queue_fed_push(fed_id, user, reason):
+    with _lock:
+        q = _STATE.setdefault("fed_push", [])
+        key = (str(fed_id), str(user))
+        if any((str(r.get("fed_id")), str(r.get("user"))) == key for r in q):
+            return
+        q.append({"fed_id": str(fed_id), "user": str(user),
+                  "reason": str(reason or "")[:200], "t": time.time()})
+        _touch()
+
+
+def list_fed_pushes(fed_id=None):
+    with _lock:
+        rows = [dict(r) for r in _STATE.get("fed_push", [])]
+    if fed_id is not None:
+        rows = [r for r in rows if str(r.get("fed_id")) == str(fed_id)]
+    return rows
+
+
+def drop_fed_push(fed_id, user):
+    with _lock:
+        before = len(_STATE.get("fed_push", []))
+        _STATE["fed_push"] = [r for r in _STATE.get("fed_push", [])
+                              if (str(r.get("fed_id")), str(r.get("user")))
+                              != (str(fed_id), str(user))]
+        if len(_STATE["fed_push"]) != before:
+            _touch()
 
 
 def count_files(chat_id=None):

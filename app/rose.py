@@ -24,7 +24,7 @@ import re
 import tempfile
 import time
 
-from . import db, federation, memory, stickers, telegram, telemetr
+from . import analytics, db, federation, memory, ml, skills, stickers, telegram
 
 log = logging.getLogger("rose")
 
@@ -717,67 +717,104 @@ async def cmd_indexstatus(chat, msg, user, args):
 
 
 # ------------------------------------------------- remember / learn / dump ---
-TELEMETR_AUTH = (
-    "🔐 <b>Telemetr.io is not connected yet.</b>\n\n"
-    "1. Sign in at <a href=\"https://tlmtr.io\">tlmtr.io</a> with @telemetr_io_bot "
-    "— that login is theirs, a bot cannot do it for you.\n"
-    "2. Get your API key from @telemetrio_api_bot → <code>/api_key</code>\n"
-    "3. Send it to me: <code>/telemetr YOUR_KEY</code> (owner only)\n\n"
-    "Free plan: 1000 requests/month, 5 channels, 7-day history, verified channels "
-    "only. Paid plans raise every one of those."
-)
-
-
 def _fmt_num(n):
     try:
         n = float(n)
     except (TypeError, ValueError):
-        return str(n) if n not in (None, "") else "—"
+        return "—" if n in (None, "") else str(n)
     neg = n < 0
     n = abs(n)
     for unit, div in (("M", 1e6), ("K", 1e3)):
         if n >= div:
-            s = f"{n / div:.1f}{unit}"
-            return ("-" if neg else "") + s.replace(".0", "")
+            return ("-" if neg else "") + f"{n / div:.1f}{unit}".replace(".0", "")
     return ("-" if neg else "") + f"{int(n)}"
 
 
-async def cmd_channelstat(chat, msg, user, args):
-    """Telemetr.io channel statistics as an image."""
-    target = (args or "").strip() or (chat.get("username") or "")
-    if not target:
-        return await _reply(chat, msg,
-                            "Give me a channel: <code>/channelstat @name</code>")
-    if not telemetr.enabled():
-        return await _reply(chat, msg, TELEMETR_AUTH)
-    await _reply(chat, msg, "📊 Fetching Telemetr.io statistics…")
+def _fmt_size(b):
     try:
-        d = await asyncio.to_thread(telemetr.summarise, target)
+        b = float(b or 0)
+    except (TypeError, ValueError):
+        b = 0.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024 or unit == "TB":
+            return f"{b:.1f} {unit}".replace(".0 ", " ")
+        b /= 1024.0
+    return f"{b:.1f} TB"
+
+
+def _find_chat_row(target):
+    """Resolve @handle / numeric id to a known chat row."""
+    t = (target or "").strip().lstrip("@").lower()
+    if not t:
+        return None
+    for g in db.list_groups():
+        if (g.get("handle") or "").lstrip("@").lower() == t:
+            return g
+        if str(g.get("chat_id")) == t:
+            return g
+    return None
+
+
+async def cmd_channelstat(chat, msg, user, args):
+    """Native channel analytics — computed by Bonki, no third-party API."""
+    cid = chat.get("id")
+    title = chat.get("title") or ""
+    handle = (chat.get("username") or "").lstrip("@")
+    target = (args or "").strip()
+    if target:
+        row = _find_chat_row(target)
+        if not row:
+            return await _reply(chat, msg,
+                                f"I'm not in “{telegram.esc(target)}”. "
+                                f"Use <code>/catalog</code> to see where I am.")
+        cid = row.get("chat_id")
+        title = row.get("title") or ""
+        handle = (row.get("handle") or "").lstrip("@")
+
+    await _reply(chat, msg, "📊 Crunching the numbers…")
+    try:
+        d = await asyncio.to_thread(analytics.compute, cid)
     except Exception as e:
         return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
 
+    growth = d.get("growth")
     metrics = [
-        ("subscribers", _fmt_num(d.get("subscribers"))),
-        ("avg views", _fmt_num(d.get("views"))),
-        ("ER", f"{d['er']}%" if d.get("er") not in (None, "") else "—"),
-        ("growth", _fmt_num(d.get("growth"))),
+        ("members", _fmt_num(d.get("members"))),
+        ("files indexed", _fmt_num(d.get("files"))),
+        ("total size", _fmt_size(d.get("size"))),
+        ("7-day growth", ("+" if (growth or 0) >= 0 else "") + _fmt_num(growth)
+         if growth is not None else "—"),
     ]
-    sub = ("@" + d["username"]) if d.get("username") else ""
+    sub = ("@" + handle) if handle else ("id " + str(cid))
     try:
-        img = await asyncio.to_thread(stickers.render_stats_card,
-                                      d.get("name") or target, sub, metrics,
-                                      d.get("series") or None)
+        img = await asyncio.to_thread(stickers.render_stats_card, title or str(cid),
+                                      sub, metrics, d.get("daily") or None,
+                                      "Bonki analytics",
+                                      "files per day · last 14 days")
         png = await asyncio.to_thread(stickers.to_png, img)
     except Exception as e:
         return await _reply(chat, msg, f"⚠️ Couldn't draw the card: {telegram.esc(e)}")
 
+    # a short text breakdown under the card
+    lines = []
+    if d.get("types"):
+        lines.append("Top types: " + ", ".join(f"{e} {n}" for e, n in d["types"][:4]))
+    if d.get("senders"):
+        lines.append("Top sharers: " + ", ".join(f"{s} {n}" for s, n in d["senders"][:3]))
+    if d.get("last_activity"):
+        lines.append("Last activity: " +
+                     time.strftime("%d %b %Y", time.localtime(d["last_activity"])))
+    lines.append("<i>Views and ER need post view counts, which the Bot API does not "
+                 "expose — so they are not shown rather than guessed.</i>")
+
     path = os.path.join(tempfile.gettempdir(),
-                        f"stat_{chat.get('id')}_{msg.get('message_id')}.png")
+                        f"stat_{cid}_{msg.get('message_id')}.png")
     try:
         with open(path, "wb") as fh:
             fh.write(png)
-        await asyncio.to_thread(telegram.send_photo, path, "stats.png", "",
-                                chat.get("id"), msg.get("message_id"))
+        await asyncio.to_thread(telegram.send_photo, path, "stats.png",
+                                "\n".join(lines)[:900], chat.get("id"),
+                                msg.get("message_id"))
     except Exception as e:
         await _reply(chat, msg, f"⚠️ Couldn't send the card: {telegram.esc(e)}")
     finally:
@@ -787,41 +824,150 @@ async def cmd_channelstat(chat, msg, user, args):
             pass
 
 
-async def cmd_telemetr(chat, msg, user, args):
-    """Owner: connect a Telemetr.io API key (their supported auth path)."""
-    from . import approval
-    if not approval.is_owner((user or {}).get("id")):
-        return await _reply(chat, msg, "🔒 Owner only — it stores an API key.")
-    key = (args or "").strip()
-    if not key:
-        state = ("✅ connected" if telemetr.enabled() else "❌ not connected")
-        return await _reply(chat, msg, f"Telemetr.io: {state}\n\n{TELEMETR_AUTH}")
-    db.set_settings({"telemetr_api_key": key})
-    await asyncio.to_thread(db.flush, True)
+async def cmd_catalog(chat, msg, user, args):
+    """Browse every chat Bonki is in, ranked by how much it has indexed."""
     try:
-        u = await asyncio.to_thread(telemetr.usage)
-        bits = []
-        for k in ("requests_used", "requests_limit", "channels_used",
-                  "channels_limit", "key_type", "plan"):
-            if isinstance(u, dict) and u.get(k) not in (None, ""):
-                bits.append(f"{k}: <b>{telegram.esc(str(u[k]))}</b>")
-        await _reply(chat, msg, "✅ Key saved and accepted.\n" + "\n".join(bits))
-    except Exception as e:
-        await _reply(chat, msg, f"Key saved, but the check failed: {telegram.esc(e)}")
-
-
-async def cmd_usage(chat, msg, user, args):
-    if not telemetr.enabled():
-        return await _reply(chat, msg, TELEMETR_AUTH)
-    try:
-        u = await asyncio.to_thread(telemetr.usage)
+        rows = await asyncio.to_thread(analytics.catalog, args or None)
     except Exception as e:
         return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
-    lines = ["📈 <b>Telemetr.io API usage</b>"]
-    for k, v in (u or {}).items():
-        if isinstance(v, (str, int, float)) and v not in ("", None):
-            lines.append(f"• {telegram.esc(str(k))}: <b>{telegram.esc(str(v))}</b>")
-    await _reply(chat, msg, "\n".join(lines[:20]))
+    if not rows:
+        return await _reply(chat, msg, "Nothing matches — I'm not in any such chat.")
+    lines = [f"🗂 <b>Catalog</b> — {len(rows)} chat(s)"]
+    for r in rows[:20]:
+        bits = [f"{r['files']} files", _fmt_size(r.get("size"))]
+        if r.get("members"):
+            bits.append(_fmt_num(r["members"]) + " members")
+        if r.get("handle"):
+            bits.append("@" + r["handle"])
+        if not r.get("approved"):
+            bits.append("⏳")
+        lines.append(f"• <b>{telegram.esc(r['title'])}</b> — " + " · ".join(bits))
+    lines.append("\n<code>/channelstat @name</code> for the full card.")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+
+# ------------------------------------------------------- skills & decisions ---
+SKILL_HELP = (
+    "⏱ <b>Skills</b> — things I do on a schedule.\n\n"
+    "<code>/skill every day 09:00 summarise this group</code>\n"
+    "<code>/skill every mon 09:00 send the weekly digest</code>\n"
+    "<code>/skill in 2h remind me to check the upload</code>\n"
+    "<code>/skill at 18:30 stats</code>\n\n"
+    "What I can actually run: <b>summarise</b>, <b>stats</b>, <b>digest</b>, "
+    "<b>find &lt;query&gt;</b>, or a plain reminder.\n"
+    "I have no OAuth connections, so I can't pull from GitHub or your inbox — "
+    "that part of Mira needs their integrations, not mine.\n\n"
+    "<code>/skill</code> lists them · <code>/skill del N</code> removes one."
+)
+
+
+async def cmd_skill(chat, msg, user, args):
+    cid = chat.get("id")
+    a = (args or "").strip()
+    if not a or a.lower() in ("list", "ls", "help"):
+        rows = db.list_skills(cid)
+        if not rows:
+            return await _reply(chat, msg, "No skills in this chat yet.\n\n" + SKILL_HELP)
+        lines = [f"⏱ <b>Skills in this chat</b> ({len(rows)})"]
+        for r in rows:
+            lines.append(skills.describe(r))
+        lines.append("\nRemove one with <code>/skill del N</code>")
+        return await _reply(chat, msg, "\n".join(lines))
+
+    low = a.lower()
+    if low.startswith(("del ", "remove ", "stop ")):
+        n = a.split(None, 1)[1].strip().lstrip("#")
+        if n.isdigit() and db.delete_skill(int(n)):
+            return await _reply(chat, msg, f"🗑 Skill #{n} removed.")
+        return await _reply(chat, msg, "No such skill id.")
+
+    row, err = skills.add(cid, a, by=(user or {}).get("id"))
+    if err:
+        return await _reply(chat, msg, err)
+    await _reply(chat, msg, "✅ Skill added.\n" + skills.describe(row))
+
+
+async def cmd_decide(chat, msg, user, args):
+    text = (args or "").strip()
+    if not text:
+        return await _reply(chat, msg, "Usage: <code>/decide we ship on Friday</code>")
+    db.add_decision(chat.get("id"), text, by=(user or {}).get("id"))
+    memory.add("decision", chat.get("id"), text,
+               {"tags": memory.keywords(text, limit=6)})
+    await _reply(chat, msg, "📌 Recorded as a decision.")
+
+
+async def cmd_decisions(chat, msg, user, args):
+    rows = db.list_decisions(chat.get("id"), 15)
+    if not rows:
+        return await _reply(chat, msg, "No decisions recorded yet — use "
+                                       "<code>/decide …</code> and I'll remember.")
+    lines = ["📌 <b>Recent decisions</b>"]
+    for r in rows:
+        when = time.strftime("%d %b", time.localtime(r.get("t") or 0))
+        lines.append(f"• {telegram.esc((r.get('text') or '')[:160])} — <i>{when}</i>")
+    await _reply(chat, msg, "\n".join(lines))
+
+
+# -------------------------------------------------------------------- ML -----
+async def cmd_ml(chat, msg, user, args):
+    """Show the ML layers and, for a query, the real component scores."""
+    cid = chat.get("id")
+    try:
+        st = await asyncio.to_thread(ml.status, cid)
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+
+    ls = st.get("learn") or {}
+    lines = ["🧠 <b>Machine learning — live status</b>", ""]
+    lines.append(f"<b>Brain</b>: {telegram.esc(st.get('brain') or 'off')}")
+    if st.get("embed_on"):
+        lines.append(f"<b>Embeddings (deep learning)</b>: ✅ {telegram.esc(st.get('embed_model'))}"
+                     f" · {st.get('embed_cached')} vectors cached")
+    else:
+        lines.append("<b>Embeddings (deep learning)</b>: ❌ off — add GEMINI_API_KEY or "
+                     "OPENAI_API_KEY to switch it on")
+    if st.get("ranker_trained"):
+        lines.append(f"<b>Learned ranker</b>: ✅ logistic regression trained on "
+                     f"{st.get('ranker_rows')} examples")
+    else:
+        lines.append(f"<b>Learned ranker</b>: ⏳ {st.get('ranker_rows')}/"
+                     f"{st.get('ranker_needs')} examples — tap a result button to feed it")
+    lines.append(f"<b>Feedback learned from</b>: {ls.get('examples', 0)} "
+                 f"({ls.get('positive', 0)} ✅ / {ls.get('negative', 0)} ❌) · "
+                 f"associations {ls.get('associations', 0)} · vocab {ls.get('vocab', 0)}")
+    lines.append(f"<b>Memory records</b>: {st.get('memory', 0)}")
+
+    q = (args or "").strip()
+    if not q:
+        lines.append("")
+        lines.append("Send <code>/ml whatsapp</code> to see the actual score "
+                     "breakdown for a query — that is where the ML shows itself.")
+        return await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+    try:
+        e = await asyncio.to_thread(ml.explain, q, cid)
+    except Exception as ex:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(ex)}")
+    if not e.get("rows"):
+        lines.append(f"\nNo candidate matched “{telegram.esc(q)}” over "
+                     f"{e.get('files', 0)} file(s).")
+        return await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+    lines.append("")
+    lines.append(f"🔎 <b>“{telegram.esc(q)}”</b> — {e['files']} file(s) in this chat")
+    for r in e["rows"]:
+        bits = [f"fuzzy {r['base']}", f"tfidf {r['tfidf']}", f"learned {r['learned']}"]
+        if e.get("embed_on"):
+            bits.append(f"embed {r.get('embed', 0.0)}")
+        if r.get("ranker") is not None:
+            bits.append(f"ranker {r['ranker']}")
+        lines.append(f"• <b>{telegram.esc(r['name'][:36])}</b>\n   "
+                     + " · ".join(bits) + f" → <b>{r['final']}</b>")
+    lines.append("")
+    lines.append("<i>fuzzy = spelling · tfidf = word importance · learned = your "
+                 "past choices · embed = meaning · ranker = trained model</i>")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
 
 
 async def cmd_remember(chat, msg, user, args):
@@ -886,41 +1032,82 @@ async def cmd_spurge(chat, msg, user, args):
 
 
 async def cmd_dump(chat, msg, user, args):
-    """Owner only: copy every indexed message here into another chat."""
+    """Owner only: copy messages from THIS chat into another chat.
+
+    It does not depend on the index. Telegram gives bots no way to *list* history,
+    but a bot that is a member of a chat can copy a message if it knows the id -
+    and message ids are sequential. So we walk the ids backwards from the command
+    message and copy every one that still exists, skipping the gaps (deleted
+    messages, service messages, ids that were never ours to read).
+
+    Usage:
+        /dump @target           last 100 messages
+        /dump @target 500       last 500 (max 500)
+        /dump -1001234567890    by numeric id
+    """
     from . import approval
     if not approval.is_owner((user or {}).get("id")):
         return await _reply(chat, msg, "🔒 <b>Owner only.</b> /dump moves data "
                                        "between chats, so it needs the bot owner.")
-    target = (args or "").strip()
-    if not target:
-        return await _reply(chat, msg,
-                            "Usage: <code>/dump @mychannel</code> or "
-                            "<code>/dump -1001234567890</code>\n"
-                            "Copies every message I have indexed here into that chat.")
-    files = db.list_files(chat_id=chat.get("id"))
-    if not files:
-        return await _reply(chat, msg, "Nothing indexed here to dump.")
-    cap = 200
-    todo = files[:cap]
-    await _reply(chat, msg, f"📦 Dumping <b>{len(todo)}</b> item(s) to "
-                            f"<code>{telegram.esc(target)}</code>…")
-    done, failed = 0, 0
-    for f in todo:
+
+    parts = (args or "").split()
+    if not parts:
+        return await _reply(
+            chat, msg,
+            "Usage: <code>/dump @targetchat [count]</code>\n\n"
+            "Type it in the <b>source</b> chat; the argument is the "
+            "<b>destination</b>. I copy messages from here to there — I don't need "
+            "anything indexed.\n"
+            "Default 100 messages, max 500 per run.")
+
+    target = parts[0]
+    count = 100
+    if len(parts) > 1 and parts[1].isdigit():
+        count = max(1, min(int(parts[1]), 500))
+
+    end_id = int(msg.get("message_id") or 0)
+    if not end_id:
+        return await _reply(chat, msg, "I need a real message to start from — "
+                                       "run this as a normal message in the source chat.")
+    start_id = max(1, end_id - count + 1)
+
+    await _reply(chat, msg,
+                 f"📦 Copying messages <b>{start_id}–{end_id}</b> from here to "
+                 f"<code>{telegram.esc(target)}</code>…\n"
+                 f"This takes about {max(1, round(count * 0.35 / 60))} minute(s).")
+
+    copied = skipped = blocked = 0
+    for mid in range(end_id, start_id - 1, -1):
+        if mid == end_id:                      # don't copy the /dump command itself
+            continue
         try:
             await asyncio.to_thread(telegram.copy_message,
                                     from_chat_id=chat.get("id"),
-                                    message_id=f.get("message_id"),
-                                    chat_id=target)
-            done += 1
+                                    message_id=mid, chat_id=target)
+            copied += 1
         except Exception as e:
-            failed += 1
-            log.warning("dump failed for %s: %s", f.get("message_id"), e)
-        await asyncio.sleep(0.4)
-    note = f"✅ Dumped {done} item(s)"
-    if len(files) > cap:
-        note += f" (first {cap} of {len(files)} — run again for more)"
-    if failed:
-        note += f", {failed} failed (am I admin there?)"
+            text = str(e).lower()
+            # a missing id is normal - deleted or never existed
+            if "not found" in text or "message_id_invalid" in text:
+                skipped += 1
+            else:
+                blocked += 1
+                if blocked <= 3:
+                    log.warning("dump %s failed: %s", mid, e)
+        await asyncio.sleep(0.35)
+
+    note = f"✅ Copied <b>{copied}</b> message(s) to {telegram.esc(target)}"
+    if skipped:
+        note += f"\n• {skipped} id(s) had no message (deleted or empty)"
+    if blocked:
+        note += (f"\n• {blocked} failed — am I an admin in the destination, and "
+                 f"can I read this chat?")
+    if end_id - count + 1 < 1 and start_id == 1:
+        note += "\n<i>Reached the start of the chat.</i>"
+    else:
+        note += (f"\n<i>Older messages? Run again with a higher count, e.g. "
+                 f"<code>/dump {telegram.esc(target)} 500</code> — Telegram caps a "
+                 f"bot at 500 per run.</i>")
     await _reply(chat, msg, note)
 
 
@@ -1017,12 +1204,20 @@ FULL_HELP = (
     "• /indexstatus — what I can and cannot see in a chat"
     "\n• /groups — every chat I'm in, with usernames"
     "\n• /remember — reply to a file; I learn about it in the background"
-    "\n• /channelstat &lt;@channel&gt; — Telemetr.io stats image"
-    "\n• /telemetr &lt;key&gt; — connect your Telemetr.io API key (owner)"
-    "\n• /usage — your Telemetr.io quota"
+    "\n• /channelstat &lt;@chat&gt; — analytics card from my own data"
+    "\n• /catalog — every chat I am in, ranked by activity"
+    "\n• /ml [query] — see the ML layers and the real score breakdown"
+    "\n• /skill — scheduled tasks (daily/weekly/in 2h)"
+    "\n• /decide &lt;text&gt; · /decisions — remember what the group decided"
     "\n• /knowledge &lt;query&gt; — search what I have learned"
     "\n• /spurge — purge with no confirmation message"
-    "\n• /dump &lt;@chat&gt; — copy everything indexed here (owner only)"
+    "\n• /dump &lt;@chat&gt; [count] — copy messages from here to there (owner)"
+    "\n• /joinfed &lt;id&gt; @a @b — attach several chats at once"
+    "\n• /fedauto on|off — auto-attach every new chat to one fed"
+    "\n• /fbanlist csv|json · /importfbans — Rose-compatible export/import"
+    "\n• /rosefed create|join — drive Rose itself via your user account (owner)"
+    "\n• /fedsync on|off|push|pull — mirror this fed with a Rose fed"
+    "\n• /fedbridge — account-free Rose bridge (publish + auto-import)"
 )
 
 PUBLIC_HELP = (
@@ -1095,8 +1290,10 @@ COMMANDS = {
     "groups": cmd_chats, "chats": cmd_chats, "channels": cmd_chats,
     "remember": cmd_remember, "save": cmd_remember, "learn": cmd_remember,
     "channelstat": cmd_channelstat, "chstat": cmd_channelstat,
-    "telemetr": cmd_telemetr, "telemetrio": cmd_telemetr,
-    "usage": cmd_usage,
+    "catalog": cmd_catalog, "channels": cmd_chats,
+    "skill": cmd_skill, "skills": cmd_skill,
+    "decide": cmd_decide, "decisions": cmd_decisions,
+    "ml": cmd_ml, "mlstatus": cmd_ml, "brain": cmd_ml,
     "spurge": cmd_spurge, "silentpurge": cmd_spurge,
     "dump": cmd_dump, "knowledge": cmd_knowledge, "memory": cmd_knowledge,
 }
@@ -1113,6 +1310,12 @@ COMMANDS.update({
     "addfedadmin": federation.cmd_addfedadmin,
     "rmfedadmin": federation.cmd_rmfedadmin,
     "fedbans": federation.cmd_fedbans,
+    "fedauto": federation.cmd_fedauto,
+    "fbanlist": federation.cmd_fbanlist, "fbanexport": federation.cmd_fbanlist,
+    "importfbans": federation.cmd_importfbans, "fedimport": federation.cmd_importfbans,
+    "rosefed": federation.cmd_rosefed, "rose": federation.cmd_rosefed,
+    "fedsync": federation.cmd_fedsync, "fedmirror": federation.cmd_fedsync,
+    "fedbridge": federation.cmd_fedbridge,
     "q": stickers.cmd_quote, "quote": stickers.cmd_quote, "quotly": stickers.cmd_quote,
     "kang": stickers.cmd_kang, "getsticker": stickers.cmd_getsticker,
     "stickerid": stickers.cmd_stickerid, "packs": stickers.cmd_packs,

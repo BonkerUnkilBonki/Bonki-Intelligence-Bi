@@ -163,6 +163,11 @@ def get_chat(chat_id):
     return _post("getChat", {"chat_id": chat_id})
 
 
+def get_chat_member_count(chat_id):
+    """Live member/subscriber count for a chat."""
+    return _post("getChatMemberCount", {"chat_id": chat_id})
+
+
 def get_chat_member(chat_id, user_id):
     return _post("getChatMember", {"chat_id": chat_id, "user_id": user_id})
 

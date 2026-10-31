@@ -108,11 +108,92 @@ touches messages inside that same topic.
 **Federation bans are enforced automatically** — a fedbanned user who posts in any
 attached group is banned there and the message removed.
 
-> **Honest limit — Rose interoperability is not possible.** This is Bonki's own
-> federation system. Rose publishes **no API or export** for its federation data,
-> so there is no supported way for another bot to read, join or share Rose feds.
-> Any tool claiming to "sync with Rose federations" is either scraping private
-> data or guessing. Your own feds work fully; Rose's cannot be imported.
+### Multiple chats, auto-attach, and Rose interop
+
+```
+/joinfed 1 @chana @chanb -100123   attach several chats in one go
+/fedauto on                       every NEW chat joins this fed automatically
+/fbanlist csv|json|minicsv        export the ban list
+/importfbans                      import one (reply to the file)
+```
+
+`/joinfed` always includes the chat you type it in, plus any you name.
+
+**Rose interoperability — three levels, and only two are real.**
+
+1. **Direct, without a user account: impossible.** Not a setting — a platform
+   rule. Telegram rejects any bot-to-bot message with `403: Forbidden: bot can't
+   send messages to bots`, and Rose publishes no API. So Bonki (a bot) cannot send
+   `/newfed` or `/joinfed` to Rose (a bot) by any route. Anyone claiming otherwise
+   has not tested it.
+2. **File exchange (works):** Rose documents `/fbanlist` and `/importfbans`, and
+   Bonki speaks both formats in both directions.
+3. **Driving Rose through your account (works, with caveats):** `/rosefed` sends
+   the command to `@MissRose_bot` from your connected user account and relays her
+   reply — the same thing you'd do by hand.
+
+### `/rosefed` — create and join Rose federations
+
+```
+/rosefed create my_fed        → /newfed my_fed
+/rosefed join 86718661-…      → /joinfed <id>
+/rosefed leave · info · admins · rules
+/rosefed banlist csv          → /fbanlist csv
+/rosefed raw <any command>    → escape hatch
+```
+
+Requirements and caveats, stated plainly:
+
+- **Needs `/userbot`.** Without a connected account there is no way to talk to
+  Rose at all; the command says so instead of failing silently.
+- **Owner only** — it drives *your* account.
+- **20-second cooldown** between commands, because Rose rate-limits aggressively
+  and an account that spams her gets muted.
+- **Automating another bot may breach Rose's terms.** This is your account
+  running your commands, and you carry that risk. Bonki relays her text reply
+  verbatim rather than parsing it, so nothing is invented if she changes wording.
+
+### `/fedbridge` — the account-free bridge (both directions)
+
+```
+/fedbridge channel @mylogchat   where to publish Bonki's ban list
+/fedbridge file                 publish it right now
+/fedbridge off                  stop auto-publishing
+```
+
+- **Bonki → Rose:** every fedban **re-publishes** the ban list as a Rose-importable
+  CSV into your nominated chat. Forward that file to Rose and reply
+  `/importfbans` there.
+- **Rose → Bonki:** forward any `*fban*.csv` or `.json` here and it imports
+  itself — no command needed.
+
+**Why the one manual hop can't be removed:** Telegram rejects bot-to-bot messages
+with `403: Forbidden: bot can't send messages to bots`, and Rose has no API. Two
+bots simply cannot talk to each other. A file carried by a person is the only
+channel that exists. `/fedsync` (push/pull) automates that hop **only** when
+`/userbot` is connected — that is the sole way to remove the tap.
+
+### Hands-free import (no account needed)
+
+Export from Rose once with `/fbanlist csv`, then **forward that file into a chat
+that's in your federation**. Bonki recognises it and imports the bans
+automatically — no command, no user account.
+
+Safety: only the **owner or a fed admin** can trigger it, and the file name must
+look like a ban list (`*fban*.csv`, `*ban*.json`, …). A random member dropping a
+spreadsheet can't fedban anyone. Re-importing the same file is idempotent — it
+updates the reason rather than duplicating the ban.
+
+**File-based exchange (works both ways):
+
+| Direction | How |
+|---|---|
+| **Rose → Bonki** | In Rose run `/fbanlist csv` (or `json`), then reply to that file here with `/importfbans`. Rose's CSV (`id,firstname,lastname,username,reason`) and NDJSON (`{"user_id":…}`) both import directly |
+| **Bonki → Rose** | Run `/fbanlist csv` here, then in Rose reply to that file with `/importfbans` |
+
+So ban lists move between the two in either direction, in Rose's own formats —
+real interoperability via export/import, not live sync. Anything claiming live
+Rose sync without their API is guessing.
 
 **Honest scope.** This is a practical core of Rose's behaviour, not a
 reimplementation of all of it. **Not included:** filters, blacklists, antiflood,
@@ -240,39 +321,77 @@ silently swallowed.
 | `/remember` (also `/save`, `/learn`) | Reply to a file → it's indexed **and** Bonki learns about it in the background: keyword tags, a one-line description from the configured model, and its embedding. Silent — no follow-up spam |
 | `/knowledge <query>` (also `/memory`) | Search what Bonki has learned about your files |
 | `/spurge` (also `/silentpurge`) | Same as `/purge`, but posts **nothing** back — the messages just go |
-| `/dump <@chat or -100…>` | **Owner only.** Copies every message Bonki has indexed here into another chat, in order, at a safe rate |
+| `/dump <@chat or -100…> [count]` | **Owner only.** Copies messages from the chat you type it in into the destination chat. Default 100, max 500 per run |
+
+**`/dump` does not use the index.** You type it in the *source* chat and pass the
+*destination* as the argument:
+
+```
+/dump @paypalagentchat        # copy the last 100 messages from here to there
+/dump @paypalagentchat 500    # the last 500
+```
+
+Telegram gives bots no way to *list* history, but a bot that is a member can copy a
+message when it knows the id — and ids are sequential. So it walks the ids
+backwards from your command and copies every one that still exists, skipping
+deleted ones. Nothing needs to be indexed first.
 
 `/dump` refuses anyone but the owner and says so, because moving data between
 chats is destructive-adjacent: it caps at 200 items per run, reports how many
 succeeded, and tells you when the target refused (usually: the bot isn't admin
 there).
 
-## Telemetr.io channel statistics
+## Skills and decisions (the "agent" part)
 
-`@telemetr_io_bot` is small: it does exactly four things — `/channelstat` (an image
-with channel statistics), authorises you on the Telemetr.io website, `/help` and
-`/lang`. Bonki now implements the useful one, against Telemetr.io's **public REST
-API** (`https://api.tlmtr.io`, `x-api-key`).
+`@mira` is a commercial AI agent (1M+ monthly users) built by The Open Platform.
+Its model is GPT/Claude/Qwen behind their infrastructure, and it ships 1,000+ OAuth
+integrations, a TON wallet, video generation and confidential-compute "private
+mode". **None of that can be cloned** — it is other people's models, credentials
+and datacentres. What *can* be built is the agentic behaviour around a model, and
+that is what this is.
 
 | Command | Does |
 |---|---|
-| `/channelstat <@channel>` (also `/chstat`) | Renders a statistics card: subscribers, average views, ER, growth, and a subscriber sparkline |
-| `/telemetr <key>` | Owner only — stores your Telemetr.io API key and validates it |
-| `/usage` | Your Telemetr.io quota and key type |
+| `/skill every day 09:00 summarise this group` | Runs on schedule, posts the result here |
+| `/skill every mon 09:00 send the weekly digest` | Weekly |
+| `/skill in 2h remind me to check the upload` | One-shot reminder |
+| `/skill at 18:30 stats` | Daily-ish one-off |
+| `/skill` · `/skill del N` | List · remove |
+| `/decide we ship on Friday` | Record a decision |
+| `/decisions` | Recent decisions for this chat |
 
-**Setup:** sign in at tlmtr.io via @telemetr_io_bot, get a key from
-@telemetrio_api_bot (`/api_key`), then send `/telemetr YOUR_KEY`.
+A skill can run: **summarise**, **stats**, **digest** (recent files), **find
+&lt;query&gt;**, or a plain reminder. A background loop checks every 30 seconds and
+reschedules recurring skills.
 
-**Honest limits:**
+**Honest scope.** Bonki has no OAuth connections, so a skill cannot "pull my
+GitHub issues" or "check my inbox" — that needs Mira's integration layer, not
+Bonki's. Skills work over this chat's own indexed data plus reminders, and the bot
+says so instead of pretending. Likewise there is no image/video generation, no
+crypto wallet, and no confidential-compute mode.
 
-- **We cannot perform their website login.** That is Telemetr.io's own server-side
-  flow through their bot. Using your API key is the supported way for a third-party
-  app to act for you.
-- **The free plan is capped**: 1000 requests/month, 5 channels, 7 days of history,
-  verified channels only. `/usage` shows where you stand.
-- Field names in their responses are read defensively with several fallbacks each,
-  since the API evolves. Anything missing is simply left off the card rather than
-  printed as a guess.
+## Native channel analytics (a Telemetr.io-style engine)
+
+Bonki computes channel analytics **itself** — no third-party API, no key. Every
+number comes from what it has actually indexed plus Telegram's own member count.
+
+| Command | Does |
+|---|---|
+| `/channelstat [@chat]` (or `/chstat`) | A stats card: members, files indexed, total size, 7-day growth, and files-per-day for the last 14 days — plus top types, top sharers and last activity |
+| `/catalog [query]` | Every chat Bonki is in, ranked by how much it has indexed |
+
+A background loop samples `getChatMemberCount` every 6 hours, so **growth over
+time is real** rather than a single snapshot.
+
+**What is honestly possible, and what is not:**
+
+| Metric | Status |
+|---|---|
+| Members / subscribers, and their growth | ✅ real, sampled on a schedule |
+| Files, total size, types, top sharers, activity per day | ✅ real, from the index |
+| **Views and ER** | ❌ **impossible** — the Bot API never exposes post view counts. Any bot showing "views" without a third-party service is inventing them, so Bonki shows nothing rather than a guess |
+| Audience demographics (language, premium share) | ❌ needs a user account |
+| A 9-million-channel catalogue | ❌ that is Telemetr.io's own database, not something a bot can have |
 
 ## Brains: auto-hook and auto-switch
 
@@ -291,6 +410,37 @@ so every one of these works with no code change:
 provider config needed. **Auto-switch:** if the active model fails (quota, outage,
 bad key), the next available one answers and the switch is remembered, so an
 exhausted free quota degrades instead of taking the bot down.
+
+## Seeing the ML — `/ml`
+
+The ML is not meant to be taken on faith. **`/ml`** prints the live state of every
+layer, and **`/ml <query>`** prints the real component scores behind a search:
+
+```
+🧠 Machine learning — live status
+Brain: gemini (gemini-2.0-flash)
+Embeddings (deep learning): ✅ text-embedding-004 · 128 vectors cached
+Learned ranker: ⏳ 12/40 examples — tap a result button to feed it
+Feedback learned from: 2 (1 ✅ / 1 ❌) · associations 1 · vocab 11
+Memory records: 7
+
+🔎 "whatsapp" — 4 file(s) in this chat
+• WhatsApp Messenger 2.24.apk
+   fuzzy 1.105 · tfidf 0.577 · learned 0.0 · embed 1.0 → 1.307
+```
+
+| Column | What it is | Where it comes from |
+|---|---|---|
+| `fuzzy` | spelling similarity | rapidfuzz, no learning |
+| `tfidf` | word importance | TF-IDF built from your file names |
+| `learned` | your past choices | feedback buttons you tapped |
+| `embed` | **meaning** | pretrained transformer (deep learning) |
+| `ranker` | **trained model** | logistic regression on your feedback |
+| `→` | final blended score | the number that decides the order |
+
+If a column reads 0.0 it means that layer contributed nothing for that query —
+which is information, not a failure. And if the ranker says `⏳ 12/40`, that is the
+honest state: it needs 40 examples before it switches on.
 
 ## Learning and semantic search — what it actually does
 
@@ -458,6 +608,29 @@ Open `http://localhost:8000/`.
 - Open **User account** (`/userbot`) in the dashboard and log in — Telegram sends
   the code *inside the app* (the “Telegram” service chat). Or run
   `python userbot_login.py` locally and paste the session string into Settings.
+
+#### No login code arriving — the usual causes
+
+1. **Look inside Telegram, not your SMS app.** Telegram sends the login code as a
+   message from the "Telegram" service account. If you are logged in on any device,
+   the SMS usually never comes — by design, not a bug.
+2. **Use "Send by SMS instead"** on `/userbot`. That asks Telegram for an SMS
+   explicitly; it is refused for some numbers, but it is the first thing to try.
+3. **Number format:** international, with country code and no spaces —
+   `+919876543210`.
+4. **Two-step verification:** the code is accepted, then the cloud password is
+   required too. Enter it in the second field.
+5. **Rate limited:** repeated code requests get locked, sometimes for 24 hours.
+   Stop retrying. The error now says exactly how many seconds to wait.
+6. **Cloud host (Render / VPS):** Telegram frequently refuses to deliver a
+   new-login code to a datacenter IP. This is the most common reason it works on
+   your laptop but not on the server.
+
+**The reliable fix for a cloud host:** log in on your own computer and paste the
+session string. Run `python userbot_login.py` from the project, complete the login
+there (the code arrives normally), and copy the long string it prints into
+**Settings → Session string**. The server then never performs a login at all — it
+just uses the session.
 
 ### 4. Set the brain (optional but recommended)
 Settings → **Brain** → pick `gemini` or `openai`, paste a key, **Save**, then

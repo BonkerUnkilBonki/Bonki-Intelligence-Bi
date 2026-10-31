@@ -147,6 +147,22 @@ async def _handle_membership(cm):
         elif is_new:
             await _notify_owner(f"➕ Added to <b>group</b> “{telegram.esc(title)}” "
                                 f"by {telegram.esc(by)}.")
+        # auto-attach every new chat to the federation the owner nominated
+        try:
+            auto = (db.get_settings().get("auto_fed") or "").strip()
+            if auto and is_new:
+                fed = db.get_fed(auto)
+                if fed:
+                    groups = [str(g) for g in (fed.get("groups") or [])]
+                    if str(chat.get("id")) not in groups:
+                        groups.append(str(chat.get("id")))
+                        db.update_fed(fed["id"], {"groups": groups})
+                        await _notify_owner(
+                            f"🔗 Auto-attached “{telegram.esc(title)}” to "
+                            f"<b>{telegram.esc(fed['name'])}</b>.")
+        except Exception as e:
+            log.info("auto-fed attach failed: %s", e)
+
         if approval.gate(chat.get("id"), chat.get("username")):
             await approval.announce(chat, by=by)   # verify button + DM owner
     elif status in ("left", "kicked"):
@@ -361,6 +377,16 @@ async def handle_update(update):
                 return
         except Exception as e:
             log.warning("moderation check failed: %s", e)
+
+        # A Rose ban list dropped into a federated chat imports itself - this is
+        # the hands-free Rose interop that needs no user account.
+        doc = msg.get("document") or {}
+        if doc.get("file_id"):
+            try:
+                if await federation.auto_import_doc(chat, msg, frm, doc):
+                    return
+            except Exception as e:
+                log.info("auto banlist import failed: %s", e)
 
         if str(db.get_settings().get("index_live") or "1") == "1":
             try:

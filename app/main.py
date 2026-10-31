@@ -18,7 +18,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.templating import Jinja2Templates
 
-from . import agent, approval, db, handlers, indexer, learn, llm, telegram, userbot
+from . import (agent, analytics, approval, db, federation, handlers, indexer,
+               learn, llm, skills, telegram, userbot)
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +85,14 @@ async def lifespan(app: FastAPI):
                 log.info("restart notice sent to owner")
     except Exception as e:
         log.info("restart notice skipped: %s", e)
+
+    # background schedulers: /skill tasks and analytics snapshots
+    try:
+        asyncio.create_task(skills.loop())
+        asyncio.create_task(analytics.snapshot_loop())
+        asyncio.create_task(federation.sync_loop())
+    except Exception as e:
+        log.warning("background loops not started: %s", e)
     yield
 
 
@@ -513,11 +522,14 @@ async def userbot_page(request: Request, msg: str = ""):
 
 
 @app.post("/userbot/start")
-async def userbot_start(api_id: str = Form(""), api_hash: str = Form(""), phone: str = Form("")):
+async def userbot_start(api_id: str = Form(""), api_hash: str = Form(""),
+                        phone: str = Form(""), force_sms: str = Form("")):
     db.set_settings({"tg_api_id": api_id.strip(), "tg_api_hash": api_hash.strip()})
     try:
-        await userbot.start_login(api_id.strip(), api_hash.strip(), phone.strip())
-        return _redir("Code sent. Check Telegram and enter it below.", path="/userbot")
+        where = await userbot.start_login(api_id.strip(), api_hash.strip(),
+                                          phone.strip(), force_sms=bool(force_sms))
+        return _redir(f"Code sent {where}. Enter it below. If nothing arrives, "
+                      f"try 'Send by SMS instead'.", path="/userbot")
     except Exception as e:
         return _redir(f"Error: {e}", path="/userbot")
 

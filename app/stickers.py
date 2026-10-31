@@ -301,7 +301,8 @@ async def cmd_quote(chat, msg, user, args):
 
 
 # ------------------------------------------------------- channel stats card ---
-def render_stats_card(title, subtitle, metrics, series=None, footer="via Telemetr.io"):
+def render_stats_card(title, subtitle, metrics, series=None, footer="Bonki analytics",
+                      series_label="series"):
     """Telemetr.io-style statistics card. metrics = [(label, value), ...]."""
     if Image is None:
         raise RuntimeError("image support is missing - add Pillow to requirements")
@@ -359,7 +360,7 @@ def render_stats_card(title, subtitle, metrics, series=None, footer="via Telemet
             d.line(coords, fill=accent, width=5, joint="curve")
             d.ellipse([coords[-1][0] - 8, coords[-1][1] - 8,
                        coords[-1][0] + 8, coords[-1][1] + 8], fill=accent)
-        d.text((x0, y), "subscribers", font=f_foot, fill=DIM)
+        d.text((x0, y), series_label[:40], font=f_foot, fill=DIM)
 
     if footer:
         d.text((PAD, H - PAD - 14), footer, font=f_foot, fill=DIM)

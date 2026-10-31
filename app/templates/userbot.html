@@ -30,9 +30,43 @@
       <div style="flex:1;min-width:200px"><label>API hash</label><input name="api_hash"></div>
     </div>
     <label>Phone (with country code)</label>
-    <input name="phone" placeholder="+91…">
-    <div style="margin-top:12px"><button type="submit">Send code</button></div>
+    <input name="phone" placeholder="+919876543210">
+    <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+      <button type="submit">Send code</button>
+      <button type="submit" name="force_sms" value="1" class="bad">Send by SMS instead</button>
+    </div>
+    <div class="small muted" style="margin-top:8px">
+      The first button asks for the code <b>inside Telegram</b>. The second forces an
+      <b>SMS</b> — use it if the in-app code never appears.
+    </div>
   </form>
+</div>
+
+<div class="card">
+  <h2>No code arriving?</h2>
+  <ol class="small" style="line-height:1.7;padding-left:18px">
+    <li><b>Look inside Telegram, not your SMS app.</b> Telegram sends the login code
+      as a message from the “Telegram” service account (blue tick). If you are logged
+      in on any device, the SMS often never comes — by design.</li>
+    <li><b>Use “Send by SMS instead”</b> above. If Telegram allows it, the code
+      arrives as a text.</li>
+    <li><b>Check the number</b> — it must include the country code, e.g.
+      <code>+919876543210</code>, no spaces.</li>
+    <li><b>Two-step verification?</b> If your account has a cloud password, the code
+      is accepted and you must also enter that password in the second field.</li>
+    <li><b>Rate limited?</b> Telegram blocks repeated code requests, sometimes for
+      24 hours. Stop retrying and wait.</li>
+    <li><b>On a cloud host (Render, a VPS)?</b> Telegram frequently refuses to
+      deliver a new-login code to a datacenter IP. This is the usual reason it works
+      on your laptop and not on the server.</li>
+  </ol>
+  <p class="small muted" style="margin-top:10px">
+    <b>The reliable fix:</b> log in <b>on your own computer</b> and paste the session
+    string here. Run <code>python userbot_login.py</code> (it is in the project), or
+    any Telethon login script, then copy the long string it prints into
+    <a href="/settings">Settings → Session string</a>. The code arrives normally on
+    your machine, and the server never has to log in at all.
+  </p>
 </div>
 
 <div class="card">

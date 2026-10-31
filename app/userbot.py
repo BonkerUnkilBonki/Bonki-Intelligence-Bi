@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 
 from . import db
 
@@ -196,6 +197,62 @@ async def forward(handle, message_id, dest_chat, reply_to=None, caption=None):
     return new
 
 
+async def ask(target, command, wait=8.0):
+    """Send `command` to `target` as the user account and return the reply text.
+
+    This is how Bonki can drive another bot (Rose) - by using the connected user
+    account exactly as a person would. It is automation of your own account, not
+    an API: the other bot's replies are plain text and are relayed as-is.
+    """
+    client = _client
+    if client is None:
+        raise RuntimeError("user account is not connected - use /userbot first")
+    ent = await _entity(target)
+    before = await client.get_messages(ent, limit=1)
+    last_id = before[0].id if before else 0
+    await client.send_message(ent, command)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        await asyncio.sleep(1.2)
+        msgs = await client.get_messages(ent, limit=6)
+        new = [m for m in msgs if m.id > last_id and not m.out]
+        if new:
+            return "\n".join((m.message or "") for m in reversed(new)).strip()
+    return ""
+
+
+async def ask_document(target, command, wait=15.0):
+    """Send a command, then return (text, document_bytes|None) from the reply.
+
+    Rose answers /fbanlist with a FILE, so this also fetches the newest document
+    in the conversation after the command is sent.
+    """
+    client = _client
+    if client is None:
+        raise RuntimeError("user account is not connected - use /userbot first")
+    ent = await _entity(target)
+    before = await client.get_messages(ent, limit=1)
+    last_id = before[0].id if before else 0
+    await client.send_message(ent, command)
+    deadline = time.time() + wait
+    texts, blob = [], None
+    while time.time() < deadline:
+        await asyncio.sleep(1.5)
+        msgs = await client.get_messages(ent, limit=8)
+        new = [m for m in msgs if m.id > last_id and not m.out]
+        if new:
+            texts = [(m.message or "") for m in reversed(new) if m.message]
+            for m in reversed(new):
+                if m.document:
+                    try:
+                        blob = await client.download_media(m, bytes)
+                    except Exception as e:
+                        log.info("document download failed: %s", e)
+            if texts or blob:
+                break
+    return ("\n".join(texts).strip(), blob)
+
+
 async def list_dialogs(limit=200):
     """Groups/channels the account is a member of - for the dashboard picker."""
     if _client is None:
@@ -224,7 +281,27 @@ async def whoami():
 
 
 # ------------------------------------------------------------------ login ---
-async def start_login(api_id, api_hash, phone):
+def _delivery_name(sent_type):
+    """Human name for where Telegram says it sent the code."""
+    n = type(sent_type).__name__ if sent_type is not None else ""
+    return {
+        "SentCodeTypeApp": "inside the Telegram app",
+        "SentCodeTypeSms": "by SMS",
+        "SentCodeTypeCall": "by phone call",
+        "SentCodeTypeFlashCall": "by flash call",
+        "SentCodeTypeMissedCall": "by missed call",
+        "SentCodeTypeEmailCode": "by email",
+        "SentCodeTypeFragmentSms": "by Fragment SMS",
+    }.get(n, n or "unknown")
+
+
+async def start_login(api_id, api_hash, phone, force_sms=False):
+    """Ask Telegram for a login code.
+
+    Returns a human string saying WHERE the code was sent. `force_sms=True` asks
+    for an SMS instead of the in-app message, which is the fix when the in-app
+    code never shows up.
+    """
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
@@ -232,30 +309,77 @@ async def start_login(api_id, api_hash, phone):
         raise RuntimeError("telethon isn't installed on the server")
     if not (api_id and api_hash and phone):
         raise RuntimeError("api_id, api_hash and phone are all required")
+
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        raise RuntimeError("phone must be in international format, e.g. +919876543210")
+
     client = TelegramClient(StringSession(), int(api_id), api_hash)
-    await client.connect()
-    await client.send_code_request(phone)
+    try:
+        await client.connect()
+        sent = await client.send_code_request(phone, force_sms=force_sms)
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise RuntimeError(_friendly(e))
+
     _pending["client"] = client
     _pending["phone"] = phone
-    return True
+    return _delivery_name(getattr(sent, "type", None))
+
+
+def _friendly(e):
+    """Turn Telethon errors into something a person can act on."""
+    name = type(e).__name__
+    msg = str(e)
+    if name == "FloodWaitError" or "FloodWait" in name:
+        secs = getattr(e, "seconds", None)
+        wait = f"{secs} seconds" if secs else "a while"
+        return (f"Telegram is rate-limiting you — wait {wait} before trying again. "
+                f"Repeated code requests can lock this for 24 hours.")
+    if name == "PhoneNumberInvalidError":
+        return "That phone number is not valid — include the country code, e.g. +919876543210."
+    if name == "PhoneNumberBannedError":
+        return "Telegram has banned this phone number."
+    if name == "ApiIdInvalidError":
+        return "api_id / api_hash are wrong — copy them again from my.telegram.org."
+    if name == "PhoneCodeInvalidError":
+        return "That code is wrong. Check the digits, or send a new code."
+    if name == "PhoneCodeExpiredError":
+        return "That code expired — send a new one."
+    if name == "AuthRestartError":
+        return "Telegram wants the login restarted — send a new code."
+    if name == "SessionPasswordNeededError":
+        return "This account has two-step verification — enter the password too."
+    if "database is locked" in msg.lower():
+        return "Session file is locked — try again in a moment."
+    return f"{name}: {msg}"
 
 
 async def verify_login(code, password=None):
     client = _pending.get("client")
     if client is None:
-        raise RuntimeError("no login in progress - send the code again")
+        raise RuntimeError("no login in progress — send the code again")
     try:
         from telethon.errors import SessionPasswordNeededError
     except Exception:
         SessionPasswordNeededError = RuntimeError
+    code = (code or "").strip().replace(" ", "")
     try:
         await client.sign_in(phone=_pending.get("phone"), code=code)
     except SessionPasswordNeededError:
         if not password:
-            raise RuntimeError("two-step password required - enter it too")
-        await client.sign_in(password=password)
+            raise RuntimeError("This account has two-step verification — enter your "
+                               "password in the second field as well.")
+        try:
+            await client.sign_in(password=password)
+        except Exception as e:
+            raise RuntimeError(_friendly(e))
     except Exception as e:
-        raise RuntimeError(f"{type(e).__name__}: {e}")
+        raise RuntimeError(_friendly(e))
+
     session = client.session.save()
     db.set_settings({"tg_session": session})
     db.flush(force=True)
