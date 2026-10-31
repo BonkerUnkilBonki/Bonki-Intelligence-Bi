@@ -48,7 +48,7 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
             "approvals": [], "notes": [], "warns": [], "chatconf": [], "stickerpacks": [],
-            "feds": [], "ranker_rows": []}
+            "feds": [], "ranker_rows": [], "memory": []}
 
 
 def _normalize(state):
@@ -56,7 +56,7 @@ def _normalize(state):
     if not isinstance(state, dict):
         return base
     for k in ("groups", "files", "activity", "feedback", "approvals",
-              "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows"):
+              "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows", "memory"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -458,6 +458,41 @@ def add_tag(chat_id, message_id, tag):
                 _touch()
                 return True
     return False
+
+
+# ----------------------------------------------------------------- memory ----
+def add_memory(kind, chat_id, text, meta=None):
+    """Store one learned record (a file, a note, a chat snippet)."""
+    with _lock:
+        mems = _STATE.setdefault("memory", [])
+        mems.append({"kind": kind, "chat_id": str(chat_id),
+                     "text": (text or "")[:2000], "meta": meta or {},
+                     "t": time.time()})
+        if len(mems) > 20000:               # keep the newest 20k
+            del mems[:-20000]
+        _touch()
+
+
+def list_memory(chat_id=None):
+    with _lock:
+        rows = [dict(m) for m in _STATE.get("memory", [])]
+    if chat_id is None:
+        return rows
+    return [m for m in rows if str(m.get("chat_id")) == str(chat_id)]
+
+
+def count_memory():
+    with _lock:
+        return len(_STATE.get("memory", []))
+
+
+def add_tags(chat_id, message_id, tags):
+    """Attach several keyword tags to a file row at once."""
+    added = 0
+    for t in (tags or []):
+        if t and add_tag(chat_id, message_id, t):
+            added += 1
+    return added
 
 
 def count_files(chat_id=None):

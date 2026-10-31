@@ -134,11 +134,20 @@ modules — tell me which you actually use and I'll add them next.
 requires for a bot-created pack — and resizes any image to 512 px PNG. You can
 rename and reorder it later from @Stickers.
 
-**How a quote is rendered.** The card keeps **paragraph breaks** exactly as the
-original message had them, shows the sender name in colour, and carries a small
-timestamp. Short and medium quotes are sent as a **sticker** (what the quote bots
-send); a long one would be unreadable at 512 px, so it goes out as a full-size
-photo instead.
+**How a quote is rendered — matched to QuotLy.** I read the `LyoSU/quote-bot` v2
+source and copied its real parameters rather than guessing:
+
+- base canvas **512 wide**, **ink-trimmed** to the content height (so a one-line
+  quote gives a small card, not a square with dead space)
+- default background **`#292232`**, the dark purple-grey QuotLy uses
+- the sender's name is tinted with **their own accent colour**, so different
+  people get different colours, the way Telegram does it
+- **no heavy date footer** on the card
+- a **reply-context block** above the text when the quoted message is itself a reply
+- paragraph breaks preserved exactly
+
+Short and medium quotes go out as a **sticker**; a long one would be unreadable at
+512 px, so it goes out as a full-size photo instead.
 
 Two details that matter in practice:
 
@@ -223,6 +232,65 @@ silently swallowed.
 > The owner ID is shown deliberately, as requested. If you'd rather not publish
 > your numeric ID to group members, say so and I'll show nothing or a @username
 > instead.
+
+## Remember, silent purge, dump
+
+| Command | Does |
+|---|---|
+| `/remember` (also `/save`, `/learn`) | Reply to a file → it's indexed **and** Bonki learns about it in the background: keyword tags, a one-line description from the configured model, and its embedding. Silent — no follow-up spam |
+| `/knowledge <query>` (also `/memory`) | Search what Bonki has learned about your files |
+| `/spurge` (also `/silentpurge`) | Same as `/purge`, but posts **nothing** back — the messages just go |
+| `/dump <@chat or -100…>` | **Owner only.** Copies every message Bonki has indexed here into another chat, in order, at a safe rate |
+
+`/dump` refuses anyone but the owner and says so, because moving data between
+chats is destructive-adjacent: it caps at 200 items per run, reports how many
+succeeded, and tells you when the target refused (usually: the bot isn't admin
+there).
+
+## Telemetr.io channel statistics
+
+`@telemetr_io_bot` is small: it does exactly four things — `/channelstat` (an image
+with channel statistics), authorises you on the Telemetr.io website, `/help` and
+`/lang`. Bonki now implements the useful one, against Telemetr.io's **public REST
+API** (`https://api.tlmtr.io`, `x-api-key`).
+
+| Command | Does |
+|---|---|
+| `/channelstat <@channel>` (also `/chstat`) | Renders a statistics card: subscribers, average views, ER, growth, and a subscriber sparkline |
+| `/telemetr <key>` | Owner only — stores your Telemetr.io API key and validates it |
+| `/usage` | Your Telemetr.io quota and key type |
+
+**Setup:** sign in at tlmtr.io via @telemetr_io_bot, get a key from
+@telemetrio_api_bot (`/api_key`), then send `/telemetr YOUR_KEY`.
+
+**Honest limits:**
+
+- **We cannot perform their website login.** That is Telemetr.io's own server-side
+  flow through their bot. Using your API key is the supported way for a third-party
+  app to act for you.
+- **The free plan is capped**: 1000 requests/month, 5 channels, 7 days of history,
+  verified channels only. `/usage` shows where you stand.
+- Field names in their responses are read defensively with several fallbacks each,
+  since the API evolves. Anything missing is simply left off the card rather than
+  printed as a guess.
+
+## Brains: auto-hook and auto-switch
+
+Bonki speaks to Gemini's API directly and to any **OpenAI-compatible** endpoint,
+so every one of these works with no code change:
+
+| Provider | Key | Notes |
+|---|---|---|
+| Gemini | `GEMINI_API_KEY` | native API |
+| OpenAI | `OPENAI_API_KEY` | or any compatible base URL |
+| OpenRouter | `OPENROUTER_API_KEY` | free models, e.g. `meta-llama/llama-3.3-70b-instruct:free` |
+| Groq | `GROQ_API_KEY` | fast free tier |
+| Ollama | `OLLAMA_BASE_URL` | local, no key, fully free and open-source |
+
+**Auto-hook:** any provider whose key is present becomes available at once — no
+provider config needed. **Auto-switch:** if the active model fails (quota, outage,
+bad key), the next available one answers and the switch is remembered, so an
+exhausted free quota degrades instead of taking the bot down.
 
 ## Learning and semantic search — what it actually does
 

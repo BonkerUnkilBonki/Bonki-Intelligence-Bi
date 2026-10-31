@@ -35,6 +35,8 @@ DEFAULT_SETTINGS = {
     # max tags in one /tag command (Telegram allows ~20 messages/min per group,
     # so a big number simply takes proportionally longer)
     "tag_max": "100",
+    # Telemetr.io channel statistics (key from @telemetrio_api_bot)
+    "telemetr_api_key": "",
     "keepalive_last": "",      # informational: "<epoch>:<status>" of the last ping
 
     # ---- the brain ----
@@ -91,4 +93,6 @@ DEFAULT_SETTINGS = {
 }
 
 # Settings safe to show on the dashboard (never echo secrets back in full).
-SECRET_KEYS = ("gemini_api_key", "openai_api_key", "tg_session", "tg_api_hash", "webhook_secret")
+SECRET_KEYS = ("gemini_api_key", "openai_api_key", "openrouter_api_key",
+               "groq_api_key", "ollama_api_key", "telemetr_api_key",
+               "tg_session", "tg_api_hash", "webhook_secret")

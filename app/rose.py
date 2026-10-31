@@ -19,10 +19,12 @@ issuing it to be an admin of the group.
 """
 import asyncio
 import logging
+import os
 import re
+import tempfile
 import time
 
-from . import db, federation, stickers, telegram
+from . import db, federation, memory, stickers, telegram, telemetr
 
 log = logging.getLogger("rose")
 
@@ -714,6 +716,236 @@ async def cmd_indexstatus(chat, msg, user, args):
     await _reply(chat, msg, "\n".join(lines))
 
 
+# ------------------------------------------------- remember / learn / dump ---
+TELEMETR_AUTH = (
+    "🔐 <b>Telemetr.io is not connected yet.</b>\n\n"
+    "1. Sign in at <a href=\"https://tlmtr.io\">tlmtr.io</a> with @telemetr_io_bot "
+    "— that login is theirs, a bot cannot do it for you.\n"
+    "2. Get your API key from @telemetrio_api_bot → <code>/api_key</code>\n"
+    "3. Send it to me: <code>/telemetr YOUR_KEY</code> (owner only)\n\n"
+    "Free plan: 1000 requests/month, 5 channels, 7-day history, verified channels "
+    "only. Paid plans raise every one of those."
+)
+
+
+def _fmt_num(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n) if n not in (None, "") else "—"
+    neg = n < 0
+    n = abs(n)
+    for unit, div in (("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            s = f"{n / div:.1f}{unit}"
+            return ("-" if neg else "") + s.replace(".0", "")
+    return ("-" if neg else "") + f"{int(n)}"
+
+
+async def cmd_channelstat(chat, msg, user, args):
+    """Telemetr.io channel statistics as an image."""
+    target = (args or "").strip() or (chat.get("username") or "")
+    if not target:
+        return await _reply(chat, msg,
+                            "Give me a channel: <code>/channelstat @name</code>")
+    if not telemetr.enabled():
+        return await _reply(chat, msg, TELEMETR_AUTH)
+    await _reply(chat, msg, "📊 Fetching Telemetr.io statistics…")
+    try:
+        d = await asyncio.to_thread(telemetr.summarise, target)
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+
+    metrics = [
+        ("subscribers", _fmt_num(d.get("subscribers"))),
+        ("avg views", _fmt_num(d.get("views"))),
+        ("ER", f"{d['er']}%" if d.get("er") not in (None, "") else "—"),
+        ("growth", _fmt_num(d.get("growth"))),
+    ]
+    sub = ("@" + d["username"]) if d.get("username") else ""
+    try:
+        img = await asyncio.to_thread(stickers.render_stats_card,
+                                      d.get("name") or target, sub, metrics,
+                                      d.get("series") or None)
+        png = await asyncio.to_thread(stickers.to_png, img)
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ Couldn't draw the card: {telegram.esc(e)}")
+
+    path = os.path.join(tempfile.gettempdir(),
+                        f"stat_{chat.get('id')}_{msg.get('message_id')}.png")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(png)
+        await asyncio.to_thread(telegram.send_photo, path, "stats.png", "",
+                                chat.get("id"), msg.get("message_id"))
+    except Exception as e:
+        await _reply(chat, msg, f"⚠️ Couldn't send the card: {telegram.esc(e)}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def cmd_telemetr(chat, msg, user, args):
+    """Owner: connect a Telemetr.io API key (their supported auth path)."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, "🔒 Owner only — it stores an API key.")
+    key = (args or "").strip()
+    if not key:
+        state = ("✅ connected" if telemetr.enabled() else "❌ not connected")
+        return await _reply(chat, msg, f"Telemetr.io: {state}\n\n{TELEMETR_AUTH}")
+    db.set_settings({"telemetr_api_key": key})
+    await asyncio.to_thread(db.flush, True)
+    try:
+        u = await asyncio.to_thread(telemetr.usage)
+        bits = []
+        for k in ("requests_used", "requests_limit", "channels_used",
+                  "channels_limit", "key_type", "plan"):
+            if isinstance(u, dict) and u.get(k) not in (None, ""):
+                bits.append(f"{k}: <b>{telegram.esc(str(u[k]))}</b>")
+        await _reply(chat, msg, "✅ Key saved and accepted.\n" + "\n".join(bits))
+    except Exception as e:
+        await _reply(chat, msg, f"Key saved, but the check failed: {telegram.esc(e)}")
+
+
+async def cmd_usage(chat, msg, user, args):
+    if not telemetr.enabled():
+        return await _reply(chat, msg, TELEMETR_AUTH)
+    try:
+        u = await asyncio.to_thread(telemetr.usage)
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+    lines = ["📈 <b>Telemetr.io API usage</b>"]
+    for k, v in (u or {}).items():
+        if isinstance(v, (str, int, float)) and v not in ("", None):
+            lines.append(f"• {telegram.esc(str(k))}: <b>{telegram.esc(str(v))}</b>")
+    await _reply(chat, msg, "\n".join(lines[:20]))
+
+
+async def cmd_remember(chat, msg, user, args):
+    """Reply to a file (or send text) and Bonki learns about it in the background."""
+    rt = msg.get("reply_to_message") or {}
+    doc = rt.get("document") or {}
+    cid = chat.get("id")
+
+    if doc.get("file_id"):
+        name = doc.get("file_name") or f"file_{rt.get('message_id')}"
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        frm = rt.get("from") or {}
+        db.upsert_file(chat_id=cid, message_id=rt.get("message_id"), name=name, ext=ext,
+                       size=doc.get("file_size") or 0, mime=doc.get("mime_type") or "",
+                       date=rt.get("date") or 0, sender_id=frm.get("id"),
+                       sender_name=frm.get("first_name") or "",
+                       caption=rt.get("caption") or "", source="remember")
+        asyncio.create_task(memory.enrich_bg(cid, rt.get("message_id"), name,
+                                             rt.get("caption") or ""))
+        return await _reply(chat, msg,
+                            f"🧠 Saved <b>{telegram.esc(name)}</b>.\n"
+                            f"I'm learning about it in the background — tags, a short "
+                            f"description and its meaning — so you can find it later by "
+                            f"describing it.")
+
+    text = (rt.get("text") or rt.get("caption") or args or "").strip()
+    if text:
+        memory.learn_from_text(cid, text)
+        return await _reply(chat, msg, "🧠 Noted — I'll remember that.")
+
+    return await _reply(chat, msg,
+                        "Reply to a file or message with <code>/remember</code>, or "
+                        "send <code>/remember something to keep</code>.")
+
+
+async def _purge_targets(msg, args):
+    """(ids, error) - shared by /purge and /spurge."""
+    rt = msg.get("reply_to_message") or {}
+    end = int(msg.get("message_id") or 0)
+    arg = (args or "").strip()
+    if arg.isdigit():
+        n = max(1, min(int(arg), MAX_PURGE))
+        return list(range(max(1, end - n + 1), end + 1)), None
+    if rt.get("message_id"):
+        start = int(rt["message_id"])
+        if start > end:
+            start, end = end, start
+        return list(range(start, end + 1))[-MAX_PURGE:], None
+    return None, ("Reply to the first message to purge from, or use "
+                  "<code>/purge 20</code>.")
+
+
+async def cmd_spurge(chat, msg, user, args):
+    """Silent purge: deletes the same way, but posts nothing back."""
+    if not await _need_admin(chat, msg, user):
+        return
+    ids, err = await _purge_targets(msg, args)
+    if err:
+        return await _reply(chat, msg, err)
+    deleted = await _delete_ids(chat.get("id"), ids)
+    log.info("silent purge: %d/%d in %s", deleted, len(ids), chat.get("id"))
+
+
+async def cmd_dump(chat, msg, user, args):
+    """Owner only: copy every indexed message here into another chat."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, "🔒 <b>Owner only.</b> /dump moves data "
+                                       "between chats, so it needs the bot owner.")
+    target = (args or "").strip()
+    if not target:
+        return await _reply(chat, msg,
+                            "Usage: <code>/dump @mychannel</code> or "
+                            "<code>/dump -1001234567890</code>\n"
+                            "Copies every message I have indexed here into that chat.")
+    files = db.list_files(chat_id=chat.get("id"))
+    if not files:
+        return await _reply(chat, msg, "Nothing indexed here to dump.")
+    cap = 200
+    todo = files[:cap]
+    await _reply(chat, msg, f"📦 Dumping <b>{len(todo)}</b> item(s) to "
+                            f"<code>{telegram.esc(target)}</code>…")
+    done, failed = 0, 0
+    for f in todo:
+        try:
+            await asyncio.to_thread(telegram.copy_message,
+                                    from_chat_id=chat.get("id"),
+                                    message_id=f.get("message_id"),
+                                    chat_id=target)
+            done += 1
+        except Exception as e:
+            failed += 1
+            log.warning("dump failed for %s: %s", f.get("message_id"), e)
+        await asyncio.sleep(0.4)
+    note = f"✅ Dumped {done} item(s)"
+    if len(files) > cap:
+        note += f" (first {cap} of {len(files)} — run again for more)"
+    if failed:
+        note += f", {failed} failed (am I admin there?)"
+    await _reply(chat, msg, note)
+
+
+async def cmd_knowledge(chat, msg, user, args):
+    """Search what Bonki has learned."""
+    q = (args or "").strip()
+    if not q:
+        return await _reply(chat, msg,
+                            f"🧠 I've learned <b>{db.count_memory()}</b> thing(s).\n"
+                            f"Ask me: <code>/knowledge whatsapp</code>")
+    hits = await asyncio.to_thread(memory.search, q, 6)
+    if not hits:
+        return await _reply(chat, msg, f"Nothing learned about “{telegram.esc(q)}” yet.")
+    lines = [f"🧠 <b>{len(hits)} memory match(es)</b> for “{telegram.esc(q)}”"]
+    for m in hits:
+        meta = m.get("meta") or {}
+        name = meta.get("name") or (m.get("text") or "")[:60]
+        tags = " ".join(f"#{t}" for t in (meta.get("tags") or [])[:5])
+        summary = meta.get("summary") or ""
+        lines.append(f"• <b>{telegram.esc(name)}</b> {tags}")
+        if summary:
+            lines.append(f"   <i>{telegram.esc(summary[:120])}</i>")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+
 async def cmd_chats(chat, msg, user, args):
     """Every chat the bot is in, with usernames and links (owner only)."""
     from . import approval
@@ -784,6 +1016,13 @@ FULL_HELP = (
     "• /userbot — connect an account to scan history\n"
     "• /indexstatus — what I can and cannot see in a chat"
     "\n• /groups — every chat I'm in, with usernames"
+    "\n• /remember — reply to a file; I learn about it in the background"
+    "\n• /channelstat &lt;@channel&gt; — Telemetr.io stats image"
+    "\n• /telemetr &lt;key&gt; — connect your Telemetr.io API key (owner)"
+    "\n• /usage — your Telemetr.io quota"
+    "\n• /knowledge &lt;query&gt; — search what I have learned"
+    "\n• /spurge — purge with no confirmation message"
+    "\n• /dump &lt;@chat&gt; — copy everything indexed here (owner only)"
 )
 
 PUBLIC_HELP = (
@@ -854,6 +1093,12 @@ COMMANDS = {
     "tag": cmd_tag, "help": cmd_help, "start": cmd_start,
     "indexstatus": cmd_indexstatus,
     "groups": cmd_chats, "chats": cmd_chats, "channels": cmd_chats,
+    "remember": cmd_remember, "save": cmd_remember, "learn": cmd_remember,
+    "channelstat": cmd_channelstat, "chstat": cmd_channelstat,
+    "telemetr": cmd_telemetr, "telemetrio": cmd_telemetr,
+    "usage": cmd_usage,
+    "spurge": cmd_spurge, "silentpurge": cmd_spurge,
+    "dump": cmd_dump, "knowledge": cmd_knowledge, "memory": cmd_knowledge,
 }
 
 

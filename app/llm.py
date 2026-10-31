@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import requests
 
@@ -35,18 +36,73 @@ def _s(key, env=None, default=""):
     return default
 
 
+# --------------------------------------------------------- model registry ----
+# Each entry is Gemini's native API or an OpenAI-compatible endpoint.
+#   auto-hook   : any provider whose key is present is used with no config
+#   auto-switch : if the active model errors (quota, outage, bad key) the next
+#                 available one is used and remembered, so the bot keeps working
+SPECS = [
+    {"name": "gemini", "kind": "gemini", "key": "gemini_api_key",
+     "env": "GEMINI_API_KEY",
+     "model": ("gemini_model", "GEMINI_MODEL", "gemini-2.0-flash")},
+    {"name": "openai", "kind": "openai", "key": "openai_api_key",
+     "env": "OPENAI_API_KEY",
+     "base": ("openai_base_url", "OPENAI_BASE_URL", "https://api.openai.com/v1"),
+     "model": ("openai_model", "OPENAI_MODEL", "gpt-4o-mini")},
+    {"name": "openrouter", "kind": "openai", "key": "openrouter_api_key",
+     "env": "OPENROUTER_API_KEY",
+     "base": ("openrouter_base_url", "OPENROUTER_BASE_URL",
+              "https://openrouter.ai/api/v1"),
+     "model": ("openrouter_model", "OPENROUTER_MODEL",
+               "meta-llama/llama-3.3-70b-instruct:free")},
+    {"name": "groq", "kind": "openai", "key": "groq_api_key",
+     "env": "GROQ_API_KEY",
+     "base": ("groq_base_url", "GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+     "model": ("groq_model", "GROQ_MODEL", "llama-3.1-8b-instant")},
+    {"name": "ollama", "kind": "openai", "key": "ollama_api_key",
+     "env": "OLLAMA_API_KEY",
+     "base": ("ollama_base_url", "OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+     "model": ("ollama_model", "OLLAMA_MODEL", "llama3.2")},
+]
+
+
+def _spec(name):
+    for sp in SPECS:
+        if sp["name"] == name:
+            return sp
+    return None
+
+
+def _key_for(sp):
+    if not sp:
+        return ""
+    k = _s(sp["key"], sp["env"])
+    if not k and sp["name"] == "ollama":
+        return "ollama"                     # local server needs no real key
+    return k
+
+
+def available():
+    """Auto-hook: providers that have credentials right now, in priority order."""
+    out = []
+    for sp in SPECS:
+        if sp["name"] == "ollama" and not _s(sp["key"], sp["env"]):
+            continue                        # only if explicitly configured
+        if _key_for(sp):
+            out.append(sp["name"])
+    return out
+
+
 def provider():
-    p = (_s("llm_provider", "LLM_PROVIDER", "off") or "off").strip().lower()
-    return p if p in ("gemini", "openai") else "off"
+    want = (_s("llm_provider", "LLM_PROVIDER", "") or "").strip().lower()
+    av = available()
+    if want in av:
+        return want
+    return av[0] if av else "off"
 
 
 def enabled():
-    p = provider()
-    if p == "gemini":
-        return bool(_s("gemini_api_key", "GEMINI_API_KEY"))
-    if p == "openai":
-        return bool(_s("openai_api_key", "OPENAI_API_KEY"))
-    return False
+    return provider() != "off"
 
 
 def describe():
@@ -98,15 +154,35 @@ def _openai_embed(texts):
 
 
 def complete(prompt, system=None, temperature=0.2, max_tokens=900, json_mode=False):
-    """Return the model's text, or None if the brain is off / unreachable."""
-    p = provider()
-    try:
-        if p == "gemini":
-            return _gemini(prompt, system, temperature, max_tokens, json_mode)
-        if p == "openai":
-            return _openai(prompt, system, temperature, max_tokens, json_mode)
-    except Exception as e:
-        log.warning("llm(%s) failed: %s", p, e)
+    """Return the model's text, or None if every model is unreachable.
+
+    Tries the active model first, then the other available ones. A success on a
+    fallback becomes the new active model, so a dead key or an exhausted free
+    quota degrades instead of taking the bot down.
+    """
+    active = provider()
+    order = [active] if active != "off" else []
+    for name in available():
+        if name not in order:
+            order.append(name)
+    for name in order:
+        sp = _spec(name)
+        if not sp:
+            continue
+        try:
+            if sp["kind"] == "gemini":
+                out = _gemini(prompt, system, temperature, max_tokens, json_mode, sp)
+            else:
+                out = _openai(prompt, system, temperature, max_tokens, json_mode, sp)
+            if out:
+                if name != active:
+                    db.set_settings({"llm_provider": name,
+                                     "llm_switched_to": name,
+                                     "llm_switched_at": str(int(time.time()))})
+                    log.warning("llm auto-switched to %s", name)
+                return out
+        except Exception as e:
+            log.warning("llm(%s) failed: %s", name, e)
     return None
 
 
@@ -137,9 +213,10 @@ def _loads(text):
 
 
 # --------------------------------------------------------------- backends ---
-def _gemini(prompt, system, temperature, max_tokens, json_mode):
-    key = _s("gemini_api_key", "GEMINI_API_KEY")
-    model = _s("gemini_model", "GEMINI_MODEL", "gemini-2.0-flash")
+def _gemini(prompt, system, temperature, max_tokens, json_mode, spec=None):
+    sp = spec or _spec("gemini")
+    key = _key_for(sp)
+    model = _s(*sp["model"])
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
@@ -158,10 +235,11 @@ def _gemini(prompt, system, temperature, max_tokens, json_mode):
     return text.strip() or None
 
 
-def _openai(prompt, system, temperature, max_tokens, json_mode):
-    key = _s("openai_api_key", "OPENAI_API_KEY")
-    base = _s("openai_base_url", "OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = _s("openai_model", "OPENAI_MODEL", "gpt-4o-mini")
+def _openai(prompt, system, temperature, max_tokens, json_mode, spec=None):
+    sp = spec or _spec("openai")
+    key = _key_for(sp)
+    base = _s(*sp["base"]).rstrip("/")
+    model = _s(*sp["model"])
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
