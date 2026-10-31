@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 
-from . import db, userbot
+from . import db, userbot, webscan
 
 log = logging.getLogger("indexer")
 
@@ -81,18 +81,51 @@ async def scan(group_row, full=False):
     depth = int(db.get_settings().get("scan_depth") or 500)
     exts = index_exts()
     min_id = 0 if full else _newest_known(chat_id)
-    try:
-        files = await userbot.scan(handle, limit=depth, exts=exts, min_id=min_id)
-    except Exception as e:
-        db.update_group(group_row["id"], {"last_status": f"scan failed: {e}"})
-        await asyncio.to_thread(db.flush, True)
-        return {"group": handle, "error": str(e), "added": 0, "found": 0}
+    source = "history"
+
+    if not userbot.is_running():
+        # No user account. A bot cannot read history - but a PUBLIC channel's
+        # web preview can be read, so try that before giving up.
+        if webscan.is_public_handle(handle):
+            try:
+                files = await asyncio.to_thread(webscan.scan_public, handle, exts)
+                source = "web"
+                log.info("web-scan of %s found %d name(s)", handle, len(files))
+                if not files:
+                    msg = ("The public preview returned no posts. Previews exist for "
+                           "public *channels* — a group has none. For a group's old "
+                           "messages, connect the user account at /userbot (a bot "
+                           "cannot read history), or post files and I'll index them "
+                           "live.")
+                    db.update_group(group_row["id"], {"last_status": "no public preview"})
+                    await asyncio.to_thread(db.flush, True)
+                    return {"group": handle, "error": msg, "added": 0, "found": 0}
+            except Exception as e:
+                msg = (f"public preview unavailable ({e}). Private groups need the "
+                       f"user account at /userbot.")
+                db.update_group(group_row["id"], {"last_status": f"scan failed: {msg}"})
+                await asyncio.to_thread(db.flush, True)
+                return {"group": handle, "error": msg, "added": 0, "found": 0}
+        else:
+            msg = ("This chat has no public preview, and a bot cannot read old "
+                   "messages. Connect a user account at /userbot to scan a private "
+                   "group - or just post files and I'll index them live.")
+            db.update_group(group_row["id"], {"last_status": "scan needs user account"})
+            await asyncio.to_thread(db.flush, True)
+            return {"group": handle, "error": msg, "added": 0, "found": 0}
+    else:
+        try:
+            files = await userbot.scan(handle, limit=depth, exts=exts, min_id=min_id)
+        except Exception as e:
+            db.update_group(group_row["id"], {"last_status": f"scan failed: {e}"})
+            await asyncio.to_thread(db.flush, True)
+            return {"group": handle, "error": str(e), "added": 0, "found": 0}
     added = 0
     for f in files:
         if db.upsert_file(chat_id=chat_id, message_id=f["message_id"], name=f["name"],
                           ext=f["ext"], size=f["size"], mime=f["mime"], date=f["date"],
                           sender_id=f.get("sender_id"), sender_name=f.get("sender_name"),
-                          caption=f.get("caption"), source="history"):
+                          caption=f.get("caption"), source=source):
             added += 1
     db.update_group(group_row["id"], {
         "last_scan": time.time(),

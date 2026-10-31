@@ -69,8 +69,10 @@ Moderation needs the **bot to be an admin** with the relevant rights (ban/mute/p
 and the person issuing it to be a **group admin** (or you, the owner). At 3
 warnings the member is muted for an hour and warnings reset.
 
-**`/tag` guardrails.** Capped at **50 per command** (change it in Settings → Tag
-cap, hard ceiling 100) and limited to one tag command per user per minute. Works
+**`/tag` guardrails.** Capped at **100 per command** (change it in Settings → Tag
+cap; 100 is the hard ceiling) and limited to one tag command per user per minute.
+If you ask for more than the cap, the bot says so instead of silently dropping the
+difference. Works
 as `/tag @user 5`, `Bonki tag @user 5`, or reply to a user with `/tag 5`.
 
 It also understands natural phrasing: `Bonki <anything> @user 5 times`, or reply
@@ -81,8 +83,8 @@ group 3 times" stays a scan.
 
 > **Why a big tag count takes time:** Telegram allows roughly **20 messages per
 > minute per group**. Bonki paces the sends and, when Telegram returns `429`, it
-> obeys the `retry_after` and continues instead of giving up — so `/tag @user 50`
-> genuinely delivers 50 messages, in about 2–3 minutes.
+> obeys the `retry_after` and continues instead of giving up — so `/tag @user 69`
+> genuinely delivers 69 messages, in about 3–4 minutes.
 
 ### Purge, locks and federations
 
@@ -96,6 +98,8 @@ group 3 times" stays a scan.
 | `/joinfed <id>` · `/leavefed` | Attach / detach this group |
 | `/fban <user> [reason]` · `/unfban <user>` | Ban across every group in the federation |
 | `/fedinfo` · `/fedlist` · `/fedadmins` · `/delfed` | Inspect / manage |
+| `/addfedadmin` · `/rmfedadmin` | Owner adds / removes federation admins |
+| `/fedbans` | List the federation's bans |
 
 **Purge works in forum topics.** Message ids are unique across the whole chat, so
 deleting the id range from the replied-to message to your command only ever
@@ -173,7 +177,54 @@ Groups you had before this feature stay approved, and a group you add yourself i
 the dashboard is approved on the spot. Turn the whole gate off with
 **Settings → Require owner approval** if you don't want it.
 
-## Learning — what it actually does
+## Owner notifications and `/help`
+
+The bot tells the owner what's happening, in DMs:
+
+| When | What the owner gets |
+|---|---|
+| Bot (re)starts | `🔄 Bonki-Intelligence restarted` with time, groups, files, brain, user-account status. **Throttled to once per 2 minutes**, so a crash-restart loop can't spam the DM |
+| Added to a group | `➕ Added to group “X” by Y` |
+| Added to a channel | `📢 Added to channel “X” by Y` — and Bonki greets **inside the channel** |
+| Removed / kicked | `➖ Removed from “X”` |
+
+`/start` in a DM gives the owner a control summary (files, groups, brain, user
+account).
+
+### `/help` — two different answers
+
+- **Owner** gets the complete command list: files, moderation, chat settings,
+  stickers & quotes, federations, tag.
+- **Everyone else** gets the group-command set only (moderation, info, notes,
+  search) plus **the real owner ID** and a line asking them to contact the owner
+  for the full feature set. Owner-only commands (`/newfed`, `/fban`, `/kang`,
+  `/tag`, settings) are not listed.
+
+> The owner ID is shown deliberately, as requested. If you'd rather not publish
+> your numeric ID to group members, say so and I'll show nothing or a @username
+> instead.
+
+## Learning and semantic search — what it actually does
+
+Bonki has two genuine layers, and it is worth being precise about them:
+
+**1. Classical ML (trained here, on your data).** TF-IDF over the real file names,
+captions and tags, plus association weights learned from which result you tap. It
+starts empty and improves with use.
+
+**2. Deep learning (pretrained, used at inference).** A transformer embedding model
+from your configured provider (Gemini `text-embedding-004`, or OpenAI
+`text-embedding-3-small`) compares *meaning*, not just spelling. Two-stage
+retrieval keeps it cheap: the text ranking picks ~30 candidates, then only those
+are embedded and re-scored by cosine similarity. Vectors are cached in memory.
+
+> **What this is not:** Bonki does not **train** a neural network. There is no GPU
+> here, no labelled corpus, and training on a few hundred file names would produce
+> something worse than the text matching above. It uses a pretrained model and
+> never claims otherwise. If no API key is set, this layer simply switches off and
+> search falls back to the classical ranking.
+
+### The original learning notes
 
 Bonki learns from real usage. No pretrained weights, no GPU, nothing invented.
 Two things are genuinely learned, both from data that arrives in your group:
@@ -212,6 +263,25 @@ nothing genuinely fits, Bonki says so instead of guessing. It uses `rapidfuzz`
 when available and falls back to a built-in matcher otherwise.
 
 ---
+
+## Scanning without a user account
+
+**A bot cannot read chat history.** That is a Telegram permission boundary, not a
+missing feature: the Bot API has no `getChatHistory` method at all, and a bot only
+receives messages from the moment it is added. No amount of code changes that.
+
+So there are three ways Bonki can index a group, in order of preference:
+
+| Situation | What works |
+|---|---|
+| **Public channel** (has an `@username`) | ✅ **Scanned with no account at all** — Bonki reads the channel's public web preview (`t.me/s/<name>`) and indexes the file names it finds there |
+| Any group, going forward | ✅ **Live indexing** — with privacy mode off, Bonki indexes every file posted from now on |
+| **Any group** (public or private), past messages | ❌ Needs the user account (`/userbot`) — groups have no web preview at all |
+
+**What public-channel scanning can and cannot do:** the preview exposes post text
+and photos but **not downloadable documents**, so Bonki indexes the *file name*
+(from the document title or the caption) and links to the post. It cannot re-send
+that file. It also only sees the recent window the preview exposes.
 
 ## How it works
 

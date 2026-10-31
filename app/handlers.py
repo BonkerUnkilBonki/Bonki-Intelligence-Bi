@@ -81,24 +81,56 @@ def _allowed_dm(user_id):
 
 
 # ------------------------------------------------------------- membership ---
+async def _notify_owner(text):
+    """DM the bot owner (best effort - never raises)."""
+    oid = approval.owner_id()
+    if not oid:
+        return
+    try:
+        await asyncio.to_thread(telegram.send_message, text, chat_id=oid)
+    except Exception as e:
+        log.info("owner DM failed: %s", e)
+
+
 async def _handle_membership(cm):
     """The bot was added to (or removed from) a chat."""
     chat = cm.get("chat") or {}
     if chat.get("type") not in ("group", "supergroup", "channel"):
         return
+    title = chat.get("title") or str(chat.get("id"))
     status = ((cm.get("new_chat_member") or {}).get("status") or "")
+    who = cm.get("from") or {}
+    by = who.get("first_name") or who.get("username") or str(who.get("id") or "")
+
     if status in ("member", "administrator", "creator"):
-        if not db.get_group_by_chat(chat.get("id"), chat.get("username")):
-            db.add_group(chat.get("id"), chat.get("title") or "", chat.get("username") or "")
-        who = cm.get("from") or {}
-        by = who.get("first_name") or who.get("username") or str(who.get("id") or "")
+        is_new = not db.get_group_by_chat(chat.get("id"), chat.get("username"))
+        if is_new:
+            db.add_group(chat.get("id"), chat.get("title") or "",
+                         chat.get("username") or "")
+        if chat.get("type") == "channel":
+            # greet in the channel itself
+            try:
+                await asyncio.to_thread(
+                    telegram.send_message,
+                    "✅ <b>Bonki-Intelligence</b> is now in this channel.\n"
+                    "Post files here and I'll index them automatically.",
+                    chat_id=chat.get("id"))
+            except Exception as e:
+                log.info("channel greeting failed: %s", e)
+            if is_new:
+                await _notify_owner(f"📢 Added to <b>channel</b> “{telegram.esc(title)}” "
+                                    f"by {telegram.esc(by)}.")
+        elif is_new:
+            await _notify_owner(f"➕ Added to <b>group</b> “{telegram.esc(title)}” "
+                                f"by {telegram.esc(by)}.")
         if approval.gate(chat.get("id"), chat.get("username")):
-            await approval.announce(chat, by=by)   # post the verify button + DM owner
+            await approval.announce(chat, by=by)   # verify button + DM owner
     elif status in ("left", "kicked"):
         g = db.get_group_by_chat(chat.get("id"), chat.get("username"))
         if g:
             db.update_group(g["id"], {"enabled": 0})
             await asyncio.to_thread(db.flush, True)
+        await _notify_owner(f"➖ Removed from “{telegram.esc(title)}” ({status}).")
 
 
 # ------------------------------------------------------------- callbacks ----
@@ -253,6 +285,27 @@ async def handle_update(update):
 
     if frm.get("is_bot"):
         return                              # never react to bots (incl. itself)
+
+    if ctype == "private":
+        # DMs: /start, /help and the owner commands work here too
+        if text.startswith("/"):
+            parts = text.split(None, 1)
+            cmd = parts[0].lstrip("/").split("@")[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            if await rose.handle_command(chat, msg, frm, cmd, args):
+                return
+        if approval.is_owner(frm.get("id")):
+            await _send("Use /help for the full command list, or /start for a summary.",
+                        chat.get("id"), reply_to=msg.get("message_id"))
+        else:
+            oid = approval.owner_id()
+            tail = (f"👑 Owner ID: <code>{oid}</code> — contact the owner for the "
+                    f"full feature set." if oid
+                    else "👑 No owner is configured for this bot yet.")
+            await _send("🤖 <b>Bonki-Intelligence</b>\n" + tail + "\n\nUse /help to "
+                        "see what I can do in your groups.", chat.get("id"),
+                        reply_to=msg.get("message_id"))
+        return
 
     if ctype in ("group", "supergroup", "channel"):
         if not db.get_group_by_chat(chat.get("id"), chat.get("username")):

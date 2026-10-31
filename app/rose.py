@@ -27,7 +27,7 @@ from . import db, federation, stickers, telegram
 log = logging.getLogger("rose")
 
 MAX_WARNS = 3
-TAG_MAX = 50                 # ceiling; the actual cap comes from settings tag_max
+TAG_MAX = 100                # ceiling; the actual cap comes from settings tag_max
 TAG_COOLDOWN = 60            # seconds between tag commands, per user
 MAX_PURGE = 200              # messages per purge
 LOCK_TYPES = ("media", "sticker", "gif", "link", "forward", "bots", "commands")
@@ -607,9 +607,13 @@ async def cmd_tag(chat, msg, user, args):
     mention = _mention(uid, un)
     if count > 5:
         try:                        # the notice must never abort the command
-            await _reply(chat, msg, f"⏳ Sending {count} tags. Telegram allows about "
-                                    f"20 messages a minute per group, so this takes "
-                                    f"a couple of minutes — please wait.")
+            note = (f"⏳ Sending {count} tags. Telegram allows about 20 messages a "
+                    f"minute per group, so this takes about "
+                    f"{max(1, round(count / 20))} minute(s) — please wait.")
+            if wanted > count:
+                note = (f"⚠️ You asked for {wanted}, but the cap is {count} per "
+                        f"command (Settings → Tag cap).\n" + note)
+            await _reply(chat, msg, note)
         except Exception:
             pass
 
@@ -633,8 +637,6 @@ async def cmd_tag(chat, msg, user, args):
         await asyncio.sleep(0.9)               # gentle pacing, under the per-group cap
 
     note = f"⚠️ Only {sent} of {count} tags went through (Telegram flood limit)."
-    if wanted > cap:
-        note += f" The cap is {cap} per command — raise it in Settings → Tag cap."
     if sent < count:
         try:
             await _reply(chat, msg, note)
@@ -663,8 +665,83 @@ HELP = (
 )
 
 
+FULL_HELP = (
+    "👑 <b>Bonki-Intelligence — owner help</b>\n\n"
+    "<b>Files</b>\n"
+    "• <i>Bonki, find &lt;file&gt;</i> · <i>Bonki scan this group</i>\n"
+    "• <i>Bonki list apks</i> · <i>how many zips</i> · <i>group stats</i> · "
+    "<i>summarise</i>\n\n"
+    "<b>Moderation</b>\n"
+    "• /ban · /unban · /kick · /mute · /unmute\n"
+    "• /warn · /warns · /resetwarns\n"
+    "• /del · /purge [n] · /pin · /unpin · /report\n"
+    "• /lock · /unlock · /locks\n\n"
+    "<b>Chat settings</b>\n"
+    "• /save · /get · /clear · /notes\n"
+    "• /setrules · /rules · /setwelcome · /welcome · /setgoodbye · /goodbye\n"
+    "• /id · /info · /admins\n\n"
+    "<b>Stickers &amp; quotes</b>\n"
+    "• /q · /kang · /packs · /getsticker · /stickerid · /delsticker\n\n"
+    "<b>Federations</b>\n"
+    "• /newfed · /joinfed · /leavefed · /fedinfo · /fedlist · /fedadmins\n"
+    "• /fban · /unfban · /fedbans · /addfedadmin · /rmfedadmin · /delfed\n\n"
+    "<b>Special</b>\n"
+    "• /tag @user N — N separate messages\n"
+    "• /userbot — connect an account to scan history"
+)
+
+PUBLIC_HELP = (
+    "🤖 <b>Bonki-Intelligence</b> — group commands\n\n"
+    "<b>Moderation</b> (admins only)\n"
+    "• /ban · /unban · /kick · /mute · /unmute\n"
+    "• /warn · /warns · /resetwarns\n"
+    "• /del · /purge [n] · /pin · /unpin · /report\n\n"
+    "<b>Info</b>\n"
+    "• /id · /info · /admins · /rules\n\n"
+    "<b>Notes</b>\n"
+    "• /get · /notes\n\n"
+    "<b>Search</b>\n"
+    "• <i>Bonki, find &lt;file name&gt;</i> · <i>Bonki list files</i>\n\n"
+    "🔒 Quotes, sticker packs, federations, tagging, history scanning and "
+    "settings are reserved for the bot owner."
+)
+
+
 async def cmd_help(chat, msg, user, args):
-    await _reply(chat, msg, HELP)
+    """Owner sees every command; everyone else sees the group command set and
+    who to ask for the rest."""
+    from . import approval
+    if approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, FULL_HELP)
+    body = PUBLIC_HELP
+    oid = approval.owner_id()
+    if oid:
+        body += (f"\n\n👑 <b>Owner ID</b>: <code>{oid}</code>\n"
+                 f"Contact the owner to enable the full feature set.")
+    else:
+        body += "\n\n👑 No owner is configured for this bot yet."
+    await _reply(chat, msg, body)
+
+
+async def cmd_start(chat, msg, user, args):
+    """Private welcome. Owner gets the control-panel greeting."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await cmd_help(chat, msg, user, args)
+    try:
+        from . import llm, userbot
+        brain = llm.describe()
+        ub = "on" if userbot.configured() else "off"
+    except Exception:
+        brain, ub = "?", "?"
+    body = ("👋 <b>Welcome back, owner.</b>\n\n"
+            f"📦 <b>{db.count_files()}</b> file(s) indexed\n"
+            f"👥 <b>{len(db.list_groups())}</b> group(s)\n"
+            f"🧠 brain: {telegram.esc(brain)}\n"
+            f"👤 user account: {ub}\n\n"
+            "Use /help for every command.\n"
+            "Connect an account with /userbot to scan old messages.")
+    await _reply(chat, msg, body)
 
 
 COMMANDS = {
@@ -678,7 +755,7 @@ COMMANDS = {
     "setwelcome": cmd_setwelcome, "welcome": cmd_welcome,
     "setgoodbye": cmd_setgoodbye, "goodbye": cmd_goodbye,
     "id": cmd_id, "info": cmd_info, "admins": cmd_admins,
-    "tag": cmd_tag, "help": cmd_help,
+    "tag": cmd_tag, "help": cmd_help, "start": cmd_start,
 }
 
 
@@ -690,6 +767,9 @@ COMMANDS.update({
     "fedlist": federation.cmd_fedlist, "fedadmins": federation.cmd_fedadmins,
     "fban": federation.cmd_fban, "unfban": federation.cmd_unfban,
     "delfed": federation.cmd_delfed,
+    "addfedadmin": federation.cmd_addfedadmin,
+    "rmfedadmin": federation.cmd_rmfedadmin,
+    "fedbans": federation.cmd_fedbans,
     "q": stickers.cmd_quote, "quote": stickers.cmd_quote, "quotly": stickers.cmd_quote,
     "kang": stickers.cmd_kang, "getsticker": stickers.cmd_getsticker,
     "stickerid": stickers.cmd_stickerid, "packs": stickers.cmd_packs,

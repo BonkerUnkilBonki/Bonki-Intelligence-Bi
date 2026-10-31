@@ -58,6 +58,45 @@ def describe():
     return "off (keyword mode)"
 
 
+# ------------------------------------------------------------- embeddings ---
+def embed(texts):
+    """Embed texts with a pretrained model. Returns list[list[float]] or None."""
+    if not texts:
+        return []
+    p = provider()
+    try:
+        if p == "gemini":
+            return _gemini_embed(texts)
+        if p == "openai":
+            return _openai_embed(texts)
+    except Exception as e:
+        log.info("embedding request failed: %s", e)
+    return None
+
+
+def _gemini_embed(texts):
+    key = _s("gemini_api_key", "GEMINI_API_KEY")
+    model = _s("gemini_embed_model", "GEMINI_EMBED_MODEL", "text-embedding-004")
+    body = {"requests": [{"model": f"models/{model}",
+                          "content": {"parts": [{"text": (t or "")[:2000]}]}}
+                         for t in texts]}
+    r = requests.post(f"{GEMINI_API}/{model}:batchEmbedContents",
+                      params={"key": key}, json=body, timeout=20)
+    r.raise_for_status()
+    return [e.get("values") for e in r.json().get("embeddings", [])]
+
+
+def _openai_embed(texts):
+    key = _s("openai_api_key", "OPENAI_API_KEY")
+    base = _s("openai_base_url", "OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = _s("openai_embed_model", "OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    r = requests.post(f"{base}/embeddings", timeout=20,
+                      headers={"Authorization": f"Bearer {key}"},
+                      json={"model": model, "input": [(t or "")[:2000] for t in texts]})
+    r.raise_for_status()
+    return [d.get("embedding") for d in r.json().get("data", [])]
+
+
 def complete(prompt, system=None, temperature=0.2, max_tokens=900, json_mode=False):
     """Return the model's text, or None if the brain is off / unreachable."""
     p = provider()

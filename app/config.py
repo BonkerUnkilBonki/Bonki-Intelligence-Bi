@@ -34,7 +34,7 @@ DEFAULT_SETTINGS = {
     "keepalive_minutes": "10",
     # max tags in one /tag command (Telegram allows ~20 messages/min per group,
     # so a big number simply takes proportionally longer)
-    "tag_max": "50",
+    "tag_max": "100",
     "keepalive_last": "",      # informational: "<epoch>:<status>" of the last ping
 
     # ---- the brain ----

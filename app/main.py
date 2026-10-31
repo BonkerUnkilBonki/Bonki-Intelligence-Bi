@@ -61,6 +61,29 @@ async def lifespan(app: FastAPI):
                         "restarts and redeploys on Render's ephemeral disk")
     except Exception as e:
         log.warning("startup summary failed: %s", e)
+
+    # Tell the owner we're back. Skipped if we booted less than 2 minutes ago,
+    # so a crash-restart loop can't spam their DM.
+    try:
+        oid = approval.owner_id()
+        if oid:
+            last = float(db.get_settings().get("last_boot_ts") or 0)
+            now = time.time()
+            if now - last > 120:
+                db.set_settings({"last_boot_ts": str(int(now))})
+                await asyncio.to_thread(
+                    telegram.send_message,
+                    "🔄 <b>Bonki-Intelligence restarted</b>\n"
+                    f"🕒 {time.strftime('%d %b %Y, %H:%M:%S')}\n"
+                    f"👥 {len(db.list_groups())} group(s) · "
+                    f"📦 {db.count_files()} file(s)\n"
+                    f"🧠 {telegram.esc(llm.describe())}\n"
+                    f"👤 user account: {'on' if userbot.configured() else 'off'}\n\n"
+                    "Use /help for commands, /start for a summary.",
+                    chat_id=oid)
+                log.info("restart notice sent to owner")
+    except Exception as e:
+        log.info("restart notice skipped: %s", e)
     yield
 
 

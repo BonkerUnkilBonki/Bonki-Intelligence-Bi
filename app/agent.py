@@ -27,7 +27,7 @@ import re
 import tempfile
 import time
 
-from . import approval, db, indexer, learn, llm, rose, telegram, userbot
+from . import approval, db, embed, indexer, learn, llm, rose, telegram, userbot, webscan
 
 log = logging.getLogger("agent")
 
@@ -284,6 +284,12 @@ async def find_best(query, chat_id):
                 ranked = ranked2
     # blend in what the bot has learned: TF-IDF similarity + feedback associations
     ranked = learn.rerank(ranked, files, query, chat_id)
+    # deep-learning stage: re-score the shortlist with pretrained embeddings
+    if embed.enabled() and ranked:
+        try:
+            ranked = await asyncio.to_thread(embed.rerank, query, ranked)
+        except Exception as e:
+            log.info("embedding rerank skipped: %s", e)
     if not ranked or ranked[0][0] < MIN_SCORE:
         return None, []
     best_score, best = ranked[0]
@@ -373,7 +379,16 @@ def _heuristic_parse(text):
     elif scan:
         intent = "scan"
     else:
-        intent = "find" if tokens(text) else "unknown"
+        # Only treat it as a file search when it actually looks like one. Any
+        # find keyword was already caught above, so here we require either a
+        # file extension or at least two content words. Without this, EVERY
+        # message to the bot became a search - so "@someone admin" answered
+        # with "I haven't indexed any files".
+        content = [w for w in re.split(r"\s+", (text or "").strip())
+                   if w and norm(w) not in _STOP
+                   and not w.startswith("#") and not w.startswith("@")]
+        looks_like_file = bool(re.search(r"\.[A-Za-z0-9]{2,5}\b", text or ""))
+        intent = "find" if (looks_like_file or len(content) >= 2) else "unknown"
 
     words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
     qwords = [w for w in words if norm(w) not in _STOP and not w.startswith("#")
@@ -581,8 +596,22 @@ async def handle(chat, msg, user, text):
         return await _summarise(chat, msg)
     if intent in ("list", "count", "stats"):
         return await _list_like(intent, chat, msg, query)
-    if intent == "find" or (intent == "unknown" and query):
+    if intent == "find":
         return await _do_find(chat, msg, user, query, hashtag, scan)
+    if intent == "unknown":
+        # Not a search - don't pretend it was one.
+        if db.count_files(chat_id) == 0:
+            body = ("🤔 Not sure what you want there.\n\n"
+                    "Nothing is indexed from this group yet. Say "
+                    "<i>Bonki scan this group</i> (public channels work without a "
+                    "user account), or just post files and I'll index them live.\n"
+                    "To search: <i>Bonki find &lt;file name&gt;</i>")
+        else:
+            body = ("🤔 Not sure what you want there.\n"
+                    "To search: <i>Bonki find &lt;file name&gt;</i>\n"
+                    "Or: <i>Bonki list files</i> · <i>Bonki scan this group</i> · "
+                    "<i>Bonki help</i>")
+        return await _send(body, chat_id, reply_to=msg.get("message_id"))
     return await _help(chat, msg)
 
 
@@ -598,14 +627,21 @@ async def _do_scan(chat, msg):
     if not row:
         row = db.get_group(db.add_group(chat.get("id"), chat.get("title") or "",
                                         chat.get("username") or ""))
-    if not userbot.is_running():
-        await _send("I can't read the group's history without the user account "
-                    "connected (a bot has no access to old messages). Log in at "
-                    "/userbot, or post the files here and I'll index them as they arrive.",
+    # No user account? A public channel can still be read through its web
+    # preview - indexer.scan handles that and tells us if it can't.
+    public = webscan.is_public_handle(row.get("handle"))
+    if userbot.is_running():
+        await _send("🔎 Scanning this group's history…", chat.get("id"),
+                    reply_to=msg.get("message_id"))
+    elif public and chat.get("type") == "channel":
+        await _send("🔎 No user account needed here — reading this channel's public "
+                    "preview…", chat.get("id"), reply_to=msg.get("message_id"))
+    else:
+        await _send("I can't read a private group's old messages without the user "
+                    "account (a bot has no history access at all). Log in at "
+                    "/userbot — or just post files here and I'll index them live.",
                     chat.get("id"), reply_to=msg.get("message_id"))
         return
-    await _send("🔎 Scanning this group's history…", chat.get("id"),
-                reply_to=msg.get("message_id"))
     db.log_approval(chat.get("id"), chat.get("title"), chat.get("username") or "",
                     "scan", by="telegram")
     res = await indexer.scan(row)

@@ -219,6 +219,52 @@ async def cmd_delfed(chat, msg, user, args):
     await _reply(chat, msg, f"🗑 Federation <b>{fed['name']}</b> deleted.")
 
 
+async def cmd_addfedadmin(chat, msg, user, args):
+    fed = db.get_fed_for_chat(chat.get("id"))
+    if not fed:
+        return await _reply(chat, msg, "This group isn't in a federation.")
+    if str(fed.get("owner")) != str(user.get("id")):
+        return await _reply(chat, msg, "Only the federation owner can add admins.")
+    uid, _ = _target(msg, args)
+    if not uid:
+        return await _reply(chat, msg, "Reply to a user or give @username.")
+    admins = [str(a) for a in (fed.get("admins") or [])]
+    if str(uid) not in admins:
+        admins.append(str(uid))
+        db.update_fed(fed["id"], {"admins": admins})
+    await _reply(chat, msg, f"👑 {_mention(uid, _chat_username(msg))} is now a fed admin.")
+
+
+async def cmd_rmfedadmin(chat, msg, user, args):
+    fed = db.get_fed_for_chat(chat.get("id"))
+    if not fed:
+        return await _reply(chat, msg, "This group isn't in a federation.")
+    if str(fed.get("owner")) != str(user.get("id")):
+        return await _reply(chat, msg, "Only the federation owner can remove admins.")
+    uid, _ = _target(msg, args)
+    if not uid:
+        return await _reply(chat, msg, "Reply to a user or give @username.")
+    if str(uid) == str(fed.get("owner")):
+        return await _reply(chat, msg, "The owner can't be removed.")
+    admins = [str(a) for a in (fed.get("admins") or []) if str(a) != str(uid)]
+    db.update_fed(fed["id"], {"admins": admins})
+    await _reply(chat, msg, "✅ Fed admin removed.")
+
+
+async def cmd_fedbans(chat, msg, user, args):
+    fed = db.get_fed_for_chat(chat.get("id"))
+    if not fed:
+        return await _reply(chat, msg, "This group isn't in a federation.")
+    bans = fed.get("bans") or []
+    if not bans:
+        return await _reply(chat, msg, f"<b>{fed['name']}</b> has no bans.")
+    lines = [f"🔨 <b>{fed['name']}</b> — {len(bans)} ban(s)"]
+    for b in bans[:30]:
+        lines.append(f"• <code>{telegram.esc(str(b.get('user')))}</code> — "
+                     f"{telegram.esc(str(b.get('reason') or 'no reason'))[:60]}")
+    await _reply(chat, msg, "\n".join(lines))
+
+
 # ------------------------------------------------------------- enforcement ---
 async def enforce(chat, msg, user):
     """Ban a federation-banned user in this group. True if they were removed."""
