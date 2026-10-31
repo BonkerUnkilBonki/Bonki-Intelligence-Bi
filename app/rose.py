@@ -65,11 +65,13 @@ def _mention(uid, uname=None, fallback="user"):
 
 
 def _split_target(msg, args):
-    """(user_id, username, reason) - from a reply, or an @username / numeric id."""
-    rt = msg.get("reply_to_message") or {}
-    frm = rt.get("from") or {}
-    if frm.get("id"):
-        return frm.get("id"), frm.get("username"), (args or "").strip()
+    """(user_id, username, reason) for a moderation/tag command.
+
+    An explicit @username or numeric id in the command ALWAYS wins. Only when no
+    target is typed does it fall back to the message being replied to - otherwise
+    replying to any message (e.g. one of the bot's own results) hijacked the
+    target, and "Bonki tag @someone 10" ended up tagging the bot itself.
+    """
     parts = (args or "").split(None, 1)
     if parts:
         a = parts[0]
@@ -77,6 +79,10 @@ def _split_target(msg, args):
             uid = int(a) if a.lstrip("-").isdigit() else a
             uname = a.lstrip("@") if a.startswith("@") else None
             return uid, uname, (parts[1] if len(parts) > 1 else "").strip()
+    rt = msg.get("reply_to_message") or {}
+    frm = rt.get("from") or {}
+    if frm.get("id"):
+        return frm.get("id"), frm.get("username"), (args or "").strip()
     return None, None, ""
 
 
@@ -453,12 +459,33 @@ async def cmd_admins(chat, msg, user, args):
 
 # --------------------------------------------------------- special: /tag ----
 async def cmd_tag(chat, msg, user, args):
-    """Tag a user as many times as asked. Capped and rate-limited to prevent abuse."""
+    """Tag a user N times as N separate messages. Capped and rate-limited.
+
+    Target resolution here is deliberately different from /ban & co: a bare
+    number in a tag command is the COUNT ("tag 5"), not a user id. So the target
+    comes from an explicit @username, else from the replied-to *user*.
+    """
     cid = chat.get("id")
-    uid, un, rest = _split_target(msg, args)
-    if not uid:
-        return await _reply(chat, msg, "Usage: <code>/tag @user 5</code> "
-                                       "(reply also works).")
+    args = (args or "").strip()
+    rfrom = ((msg.get("reply_to_message") or {}).get("from") or {})
+    if args.startswith("@"):
+        head, _, tail = args.partition(" ")
+        uid, un, rest = head, head.lstrip("@"), tail.strip()
+    elif rfrom.get("id"):
+        uid, un, rest = rfrom.get("id"), rfrom.get("username"), args
+    else:
+        return await _reply(chat, msg, "Usage: <code>/tag @user 5</code> — or reply "
+                                       "to their message with <code>/tag 5</code>.")
+
+    # never let it tag the bot itself (e.g. when the command replies to a result)
+    try:
+        from . import handlers
+        if str(uid) == str(handlers._bot_identity.get("id")):
+            return await _reply(chat, msg, "That's me — give a user's @username, or "
+                                           "reply to *their* message.")
+    except Exception:
+        pass
+
     m = re.search(r"\b(\d{1,3})\b", rest or "")
     count = int(m.group(1)) if m else 1
     count = max(1, min(count, TAG_MAX))
@@ -471,8 +498,19 @@ async def cmd_tag(chat, msg, user, args):
     _tag_last[key] = now
 
     mention = _mention(uid, un)
-    body = " ".join([mention] * count)
-    await _reply(chat, msg, f"{body}\n<i>tagged {count}×</i>")
+    sent = 0
+    for _ in range(count):
+        try:
+            await _reply(chat, msg, mention)
+            sent += 1
+        except Exception as e:                 # rate limited or blocked - stop
+            log.warning("tag send failed after %d: %s", sent, e)
+            break
+        await asyncio.sleep(0.4)               # stay under Telegram's per-group limit
+
+    if sent < count:
+        await _reply(chat, msg, f"⚠️ Only {sent} of {count} tags went through "
+                                f"(Telegram rate limit).")
 
 
 # ------------------------------------------------------------------ help ----
@@ -486,7 +524,7 @@ HELP = (
     "<b>Rules</b>: /setrules text · /rules\n"
     "<b>Welcome</b>: /setwelcome text ({name}) · /welcome on|off · /setgoodbye · /goodbye\n"
     "<b>Info</b>: /id · /info · /admins\n"
-    "<b>Special</b>: /tag @user 5 — tags them 5 times (max 20)\n\n"
+    "<b>Special</b>: /tag @user 5 — tags them 5 times, in 5 separate messages (max 20)\n\n"
     "Files: <i>Bonki, find apple music apk</i> · <i>Bonki, scan this group</i>"
 )
 
