@@ -80,6 +80,26 @@ def _allowed_dm(user_id):
     return user_id is not None and str(user_id) in ids
 
 
+async def _send_public_dm(chat, msg):
+    """Answer a non-owner DM. Tries a threaded reply, then a plain send."""
+    oid = approval.owner_id()
+    tail = (f"\U0001F451 <b>Owner ID</b>: <code>{oid}</code> - contact the owner to "
+            f"unlock the full feature set." if oid
+            else "\U0001F451 No owner is configured for this bot yet.")
+    body = ("\U0001F916 <b>Bonki-Intelligence</b>\n" + tail + "\n\n"
+            "In a group I can:\n"
+            "- find files: <i>Bonki, find app apk</i>\n"
+            "- moderate: /ban /mute /warn /purge /pin\n"
+            "- notes, rules, info: /get /notes /rules /id\n\n"
+            "Use /help to see everything available to you.")
+    for extra in ({"reply_to": msg.get("message_id")}, {}):
+        try:
+            await _send(body, chat.get("id"), **extra)
+            return
+        except Exception as e:
+            log.info("public DM send failed (%s), retrying", e)
+
+
 # ------------------------------------------------------------- membership ---
 async def _notify_owner(text):
     """DM the bot owner (best effort - never raises)."""
@@ -105,8 +125,12 @@ async def _handle_membership(cm):
     if status in ("member", "administrator", "creator"):
         is_new = not db.get_group_by_chat(chat.get("id"), chat.get("username"))
         if is_new:
-            db.add_group(chat.get("id"), chat.get("title") or "",
-                         chat.get("username") or "")
+            row = db.add_group(chat.get("id"), chat.get("title") or "",
+                               chat.get("username") or "")
+            try:
+                db.update_group(row, {"chat_type": chat.get("type") or ""})
+            except Exception:
+                pass
         if chat.get("type") == "channel":
             # greet in the channel itself
             try:
@@ -287,24 +311,32 @@ async def handle_update(update):
         return                              # never react to bots (incl. itself)
 
     if ctype == "private":
-        # DMs: /start, /help and the owner commands work here too
-        if text.startswith("/"):
-            parts = text.split(None, 1)
-            cmd = parts[0].lstrip("/").split("@")[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
-            if await rose.handle_command(chat, msg, frm, cmd, args):
+        # A DM must NEVER be silent: a non-owner messaging the bot and getting
+        # nothing at all reads as a broken bot - which is exactly what happened.
+        try:
+            if text.startswith("/"):
+                parts = text.split(None, 1)
+                cmd = parts[0].lstrip("/").split("@")[0].lower()
+                args = parts[1] if len(parts) > 1 else ""
+                if await rose.handle_command(chat, msg, frm, cmd, args):
+                    return
+                if approval.is_owner(frm.get("id")):
+                    await _owner_command(text, chat, msg)      # /pending, /verify
+                    return
+                await _send_public_dm(chat, msg)
                 return
-        if approval.is_owner(frm.get("id")):
-            await _send("Use /help for the full command list, or /start for a summary.",
-                        chat.get("id"), reply_to=msg.get("message_id"))
-        else:
-            oid = approval.owner_id()
-            tail = (f"👑 Owner ID: <code>{oid}</code> — contact the owner for the "
-                    f"full feature set." if oid
-                    else "👑 No owner is configured for this bot yet.")
-            await _send("🤖 <b>Bonki-Intelligence</b>\n" + tail + "\n\nUse /help to "
-                        "see what I can do in your groups.", chat.get("id"),
-                        reply_to=msg.get("message_id"))
+            if approval.is_owner(frm.get("id")):
+                await _send("Use /help for every command, /groups for the chats I'm "
+                            "in, or /start for a summary.", chat.get("id"),
+                            reply_to=msg.get("message_id"))
+            else:
+                await _send_public_dm(chat, msg)
+        except Exception as e:
+            log.warning("private handler failed: %s", e)
+            try:
+                await _send("Sorry - something went wrong. Try /start.", chat.get("id"))
+            except Exception:
+                pass
         return
 
     if ctype in ("group", "supergroup", "channel"):
@@ -368,20 +400,3 @@ async def handle_update(update):
                 await _send(f"Sorry, something went wrong: {telegram.esc(e)}",
                             chat.get("id"), reply_to=msg.get("message_id"))
         return
-
-    if ctype == "private":
-        if approval.is_owner(frm.get("id")):
-            await _owner_command(text, chat, msg)
-            return
-        if not _allowed_dm(frm.get("id")):
-            await _send("Hi! Add your Telegram user id under Settings → Allowed DM "
-                        "ids, or use me inside a group. (Get your id from @userinfobot.)",
-                        chat.get("id"), reply_to=msg.get("message_id"))
-            return
-        if text:
-            try:
-                await agent.handle(chat, msg, frm, strip_address(text) or text)
-            except Exception as e:
-                log.warning("agent(DM) failed: %s", e)
-                await _send(f"Sorry, something went wrong: {telegram.esc(e)}",
-                            chat.get("id"), reply_to=msg.get("message_id"))

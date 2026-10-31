@@ -665,6 +665,100 @@ HELP = (
 )
 
 
+async def cmd_indexstatus(chat, msg, user, args):
+    """Show exactly what the bot can and cannot see here - answers
+    "why hasn't it indexed anything?" without guesswork."""
+    cid = chat.get("id")
+    files = db.list_files(chat_id=cid)
+    live = str(db.get_settings().get("index_live") or "1") == "1"
+
+    bot_id, privacy = None, None
+    try:
+        from . import handlers
+        bot_id = handlers._bot_identity.get("id")
+    except Exception:
+        pass
+    try:
+        r = (await asyncio.to_thread(telegram.get_me)).get("result") or {}
+        privacy = r.get("can_read_all_group_messages")
+        bot_id = bot_id or r.get("id")
+    except Exception:
+        pass
+
+    status = "unknown"
+    if bot_id:
+        try:
+            status = ((await asyncio.to_thread(telegram.get_chat_member, cid, bot_id))
+                      .get("result") or {}).get("status") or "unknown"
+        except Exception:
+            status = "not a member?"
+
+    last = max([f.get("date") or 0 for f in files], default=0)
+    last_txt = time.strftime("%d %b %Y %H:%M", time.localtime(last)) if last else "—"
+    is_admin = status in ("administrator", "creator")
+    lines = [
+        "🔎 <b>Indexing status for this chat</b>",
+        f"• my role here: <b>{status}</b> " + ("✅" if is_admin else
+                                              "— make me admin so I get every message"),
+        "• receives all messages: " + ("✅ yes" if privacy else
+                                       "❌ no — turn off privacy in @BotFather "
+                                       "(/setprivacy → Disable), or make me admin"),
+        "• live indexing: " + ("✅ on" if live else "❌ off (Settings → Live indexing)"),
+        f"• files indexed here: <b>{len(files)}</b> · newest: {last_txt}",
+        "",
+        "<b>Old messages:</b> a bot cannot read them. Telegram gives bots no access "
+        "to messages sent before they joined — admin rights do not change that. "
+        "Only the user account at /userbot can backfill.",
+        "<b>From now on:</b> anything posted here is indexed automatically.",
+    ]
+    await _reply(chat, msg, "\n".join(lines))
+
+
+async def cmd_chats(chat, msg, user, args):
+    """Every chat the bot is in, with usernames and links (owner only)."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await cmd_help(chat, msg, user, args)
+    groups = db.list_groups()
+    if not groups:
+        return await _reply(chat, msg, "I'm not in any chat yet — add me to a "
+                                       "group or channel.")
+
+    def _handle(g):
+        h = (g.get("handle") or "").lstrip("@").strip()
+        return h if h and not h.lstrip("-").isdigit() else ""
+
+    def block(title, rows, icon):
+        if not rows:
+            return
+        lines.append("")
+        lines.append(f"{icon} <b>{title}</b> ({len(rows)})")
+        for g in rows:
+            n = db.count_files(g.get("chat_id"))
+            bits = []
+            h = _handle(g)
+            if h:
+                bits.append(f"@{h}")
+                bits.append(f'<a href="https://t.me/{h}">open</a>')
+            else:
+                bits.append(f"<code>{g.get('chat_id')}</code>")
+            bits.append("✅" if g.get("approved") else "⏳ pending")
+            bits.append(f"{n} files")
+            if g.get("enabled") == 0:
+                bits.append("⏸ off")
+            lines.append(f"• <b>{telegram.esc(g.get('title') or g.get('chat_id'))}</b>"
+                         f" — " + " · ".join(bits))
+
+    lines = [f"📋 <b>Chats I'm in</b> — {len(groups)} total"]
+    chans = [g for g in groups if (g.get("chat_type") == "channel")]
+    grps = [g for g in groups if (g.get("chat_type") != "channel")]
+    block("Channels", chans, "📢")
+    block("Groups", grps, "👥")
+    lines.append("")
+    lines.append("<i>Pending chats need your approval before I index them.</i>")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+
 FULL_HELP = (
     "👑 <b>Bonki-Intelligence — owner help</b>\n\n"
     "<b>Files</b>\n"
@@ -687,7 +781,9 @@ FULL_HELP = (
     "• /fban · /unfban · /fedbans · /addfedadmin · /rmfedadmin · /delfed\n\n"
     "<b>Special</b>\n"
     "• /tag @user N — N separate messages\n"
-    "• /userbot — connect an account to scan history"
+    "• /userbot — connect an account to scan history\n"
+    "• /indexstatus — what I can and cannot see in a chat"
+    "\n• /groups — every chat I'm in, with usernames"
 )
 
 PUBLIC_HELP = (
@@ -756,6 +852,8 @@ COMMANDS = {
     "setgoodbye": cmd_setgoodbye, "goodbye": cmd_goodbye,
     "id": cmd_id, "info": cmd_info, "admins": cmd_admins,
     "tag": cmd_tag, "help": cmd_help, "start": cmd_start,
+    "indexstatus": cmd_indexstatus,
+    "groups": cmd_chats, "chats": cmd_chats, "channels": cmd_chats,
 }
 
 

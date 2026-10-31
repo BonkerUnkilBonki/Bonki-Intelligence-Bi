@@ -48,7 +48,7 @@ _last_save = {"ok": None, "at": 0.0, "error": ""}
 def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
             "approvals": [], "notes": [], "warns": [], "chatconf": [], "stickerpacks": [],
-            "feds": []}
+            "feds": [], "ranker_rows": []}
 
 
 def _normalize(state):
@@ -56,7 +56,7 @@ def _normalize(state):
     if not isinstance(state, dict):
         return base
     for k in ("groups", "files", "activity", "feedback", "approvals",
-              "notes", "warns", "chatconf", "stickerpacks", "feds"):
+              "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -375,7 +375,7 @@ def is_approved(chat_id, username=None):
 
 def update_group(gid, fields):
     allowed = {"chat_id", "handle", "title", "enabled", "approved",
-               "approval_notified", "last_scan", "last_status"}
+               "approval_notified", "last_scan", "last_status", "chat_type"}
     with _lock:
         for g in _STATE["groups"]:
             if g.get("id") == gid:
@@ -706,6 +706,30 @@ def fed_is_banned(fed_id, user):
             return any(str(b.get("user") or "").lower() == key
                        for b in (f.get("bans") or []))
     return False
+
+
+
+# ---------------------------------------------------------------- ranker ----
+def add_ranker_row(features, label):
+    """One training example for the learned re-ranker."""
+    with _lock:
+        rows = _STATE.setdefault("ranker_rows", [])
+        rows.append({"f": [float(x) for x in features], "y": 1 if label else 0,
+                     "t": time.time()})
+        if len(rows) > 5000:                 # keep the newest
+            del rows[:-5000]
+        _touch()
+
+
+def list_ranker_rows():
+    with _lock:
+        return [dict(r) for r in _STATE.get("ranker_rows", [])]
+
+
+def clear_ranker_rows():
+    with _lock:
+        _STATE["ranker_rows"] = []
+        _touch()
 
 
 # ------------------------------------------------------------ stickerpacks --

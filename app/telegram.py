@@ -228,6 +228,19 @@ def send_photo(file_path, filename="quote.png", caption="", chat_id=None, reply_
     return r.json()
 
 
+def send_sticker(file_path, chat_id=None, reply_to=None, filename="quote.png"):
+    data = {"chat_id": chat_id}
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+        data["allow_sending_without_reply"] = True
+    with open(file_path, "rb") as fh:
+        r = requests.post(_url("sendSticker"), data=data,
+                          files={"sticker": (filename, fh, "image/png")}, timeout=120)
+    if not r.ok:
+        raise RuntimeError(f"sendSticker failed: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
 # ---------------------------------------------------------------- stickers ---
 def get_sticker_set(name):
     return _post("getStickerSet", {"name": name})

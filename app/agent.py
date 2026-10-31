@@ -27,7 +27,8 @@ import re
 import tempfile
 import time
 
-from . import approval, db, embed, indexer, learn, llm, rose, telegram, userbot, webscan
+from . import (approval, db, embed, indexer, learn, llm, ranker, rose, telegram,
+               userbot, webscan)
 
 log = logging.getLogger("agent")
 
@@ -290,6 +291,15 @@ async def find_best(query, chat_id):
             ranked = await asyncio.to_thread(embed.rerank, query, ranked)
         except Exception as e:
             log.info("embedding rerank skipped: %s", e)
+    # learned re-ranker: attach a feature vector to each candidate and blend in
+    # the trained model's probability (no-op until there is enough feedback)
+    try:
+        if ranked:
+            for _score, _f in ranked:
+                _f["_feat"] = ranker.features(query, _f, _score)
+            ranked = ranker.rerank(ranked)
+    except Exception as e:
+        log.info("ranker skipped: %s", e)
     if not ranked or ranked[0][0] < MIN_SCORE:
         return None, []
     best_score, best = ranked[0]
@@ -671,10 +681,17 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     best, others = await find_best(query, chat_id)
     if not best:
         if db.count_files(chat_id) == 0:
-            await _send("I haven't indexed any files from this group yet. Say "
-                        "<i>“Bonki, scan this group”</i> (with the user account "
-                        "connected) or just post the files here.", chat_id,
-                        reply_to=msg.get("message_id"))
+            await _send(
+                "Nothing indexed from this chat yet.\n\n"
+                "<b>Two ways in:</b>\n"
+                "• <b>From now on</b> — post a file here and I index it "
+                "automatically. Make me an admin and I receive every message "
+                "(privacy mode is off for admins), so nothing gets missed.\n"
+                "• <b>Old messages</b> — a bot genuinely cannot read history; "
+                "Telegram gives bots no access to messages sent before they "
+                "joined. That needs the user account at /userbot.\n\n"
+                "Check what I can see with <code>/indexstatus</code>.", chat_id,
+                reply_to=msg.get("message_id"))
         else:
             await _send(f"Couldn't find anything matching “{telegram.esc(query)}”. "
                         f"I have {db.count_files(chat_id)} file(s) indexed — try "
@@ -746,9 +763,11 @@ async def handle_feedback(token, idx, positive, chat):
     if positive and 0 <= idx < len(files):
         chosen = files[idx]
         learn.record(ctx["chat_id"], ctx["query"], chosen, True, source="button")
+        ranker.observe(chosen, True)                  # one training example
         for i, f in enumerate(files):                 # the rest were not it
             if i != idx:
                 learn.record(ctx["chat_id"], ctx["query"], f, False, source="button")
+                ranker.observe(f, False)
         await _reply_with_file(chat, {"message_id": ctx.get("reply_to")},
                                ctx.get("user"), chosen, ctx.get("hashtag"))
         learn.drop_pending(token)
@@ -756,6 +775,7 @@ async def handle_feedback(token, idx, positive, chat):
         return "shared"
     for f in files:                                   # "None" - none of them
         learn.record(ctx["chat_id"], ctx["query"], f, False, source="button")
+        ranker.observe(f, False)
     learn.drop_pending(token)
     await _flush()
     return "noted"

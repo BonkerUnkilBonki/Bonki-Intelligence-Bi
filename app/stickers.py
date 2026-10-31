@@ -39,8 +39,12 @@ _FONT_PATHS = [
 ]
 
 
+_ASSET_FONT = os.path.join(os.path.dirname(__file__), "assets", "DejaVuSans.ttf")
+
+
 def _font(size):
-    for p in _FONT_PATHS:
+    # bundled font first, so the card looks the same on every host
+    for p in [_ASSET_FONT] + _FONT_PATHS:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
@@ -62,56 +66,136 @@ def _bot_username():
 
 
 # ------------------------------------------------------------------ quote ---
-def _wrap(draw, text, font, max_w):
-    lines, cur = [], ""
-    for word in (text or "").split():
-        trial = (cur + " " + word).strip()
+# Telegram's own clients keep paragraph breaks. Collapsing them into one blob was
+# the single biggest visual difference from the quote bots people compare us to.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF"      # emoji / pictographs
+    "\U00002600-\U000027BF"       # misc symbols, dingbats
+    "\U0001F1E6-\U0001F1FF"       # flags
+    "\U00002B00-\U00002BFF"
+    "\U00002300-\U000023FF"
+    "\U0000FE00-\U0000FE0F"       # variation selectors
+    "\U0000200D"                  # zero-width joiner
+    "\U000020E3"                  # combining keycap
+    "\U00002190-\U000021FF"       # arrows
+    "\U0000FFFD]+")
+
+
+_NOTDEF = {}
+
+
+def _notdef_sig(font):
+    """Bitmap FreeType returns for a glyph the font does not have (.notdef)."""
+    key = id(font)
+    if key not in _NOTDEF:
         try:
-            width = draw.textlength(trial, font=font)
+            _NOTDEF[key] = bytes(font.getmask("\uffff"))
         except Exception:
-            width = len(trial) * 14
-        if width <= max_w or not cur:
-            cur = trial
-        else:
+            _NOTDEF[key] = None
+    return _NOTDEF[key]
+
+
+def _can_draw(font, ch):
+    try:
+        mask = bytes(font.getmask(ch))
+    except Exception:
+        return False
+    sig = _notdef_sig(font)
+    return sig is None or mask != sig
+
+
+def _clean_text(t, font=None):
+    """Drop glyphs this font cannot draw.
+
+    Emoji AND scripts outside the font's coverage (e.g. CJK) otherwise render as
+    empty boxes. Comparing each glyph's bitmap against the font's .notdef bitmap
+    detects both without needing a 16 MB CJK font bundled in.
+    """
+    t = _EMOJI_RE.sub("", (t or "").replace("\r", ""))
+    if font is None:
+        return t
+    return "".join(ch if (ch in "\n\t " or _can_draw(font, ch)) else "" for ch in t)
+
+
+def _wrap(draw, text, font, max_w):
+    """Wrap text but KEEP blank lines and paragraph breaks."""
+    lines = []
+    for para in (text or "").split("\n"):
+        if not para.strip():
+            lines.append("")
+            continue
+        cur = ""
+        for word in para.split():
+            trial = (cur + " " + word).strip()
+            try:
+                width = draw.textlength(trial, font=font)
+            except Exception:
+                width = len(trial) * 14
+            if width <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        if cur:
             lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
     return lines or [""]
 
 
-def render_quote(sender, text, footer=""):
-    """Render a quote card as PNG bytes."""
+RENDER_W = 1024          # draw at 2x, then fit into a 512x512 sticker square
+PAD = 48
+
+
+def render_quote_card(sender, text, footer=""):
+    """The full-resolution card (RGBA)."""
     if Image is None:
         raise RuntimeError("image support is missing - add Pillow to requirements")
-    W, pad = 900, 36
-    f_name, f_text, f_foot = _font(34), _font(30), _font(22)
+    f_name, f_text, f_foot = _font(42), _font(36), _font(26)
+    text = _clean_text(text, f_text)
+    sender = _clean_text(sender, f_name).strip() or "Unknown"
     probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    lines = _wrap(probe, text, f_text, W - 2 * pad - 20)[:40]
-    line_h = 40
-    H = pad * 2 + 56 + line_h * len(lines) + 48
+    lines = _wrap(probe, text, f_text, RENDER_W - 2 * PAD - 40)[:60]
+    line_h = 50
+    H = PAD * 2 + 60 + line_h * len(lines) + (38 if footer else 0)
 
-    img = Image.new("RGB", (W, H), "#0f172a")
+    img = Image.new("RGBA", (RENDER_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([8, 8, W - 8, H - 8], radius=26, fill="#1f2937",
-                        outline="#334155", width=2)
-    d.rounded_rectangle([8, 12, 18, H - 12], radius=6, fill="#7c5cff")
+    d.rounded_rectangle([4, 4, RENDER_W - 4, H - 4], radius=30,
+                        fill="#1c1c26", outline="#34343f", width=3)
+    d.rounded_rectangle([4, 14, 18, H - 14], radius=7, fill="#8b5cf6")
+    d.text((PAD + 14, PAD - 6), (sender or "Unknown")[:40], font=f_name, fill="#5eead4")
 
-    cx, cy, r = pad + 28, pad + 26, 26
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill="#7c5cff")
-    d.text((cx, cy), (sender or "?")[:1].upper(), font=f_name, fill="#ffffff", anchor="mm")
-    d.text((pad + 68, pad + 6), (sender or "Unknown")[:38], font=f_name, fill="#a78bfa")
-
-    y = pad + 58
+    y = PAD + 58
     for ln in lines:
-        d.text((pad, y), ln, font=f_text, fill="#e5e7eb")
+        if ln:
+            d.text((PAD + 14, y), ln, font=f_text, fill="#e9e9f0")
         y += line_h
     if footer:
-        d.text((pad, H - pad - 24), footer, font=f_foot, fill="#94a3b8")
+        d.text((PAD + 14, H - PAD - 24), footer, font=f_foot, fill="#8b8b9e")
+    return img
 
+
+def to_sticker(img, size=512):
+    """Centre the card in a transparent 512x512 square. Returns (png, scale)."""
+    scale = min(size / img.width, size / img.height)
+    w = max(1, int(img.width * scale))
+    h = max(1, int(img.height * scale))
+    small = img.resize((w, h), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(small, ((size - w) // 2, (size - h) // 2), small)
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG", optimize=True)
+    return buf.getvalue(), scale
+
+
+def to_png(img):
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     return buf.getvalue()
+
+
+def render_quote(sender, text, footer=""):
+    """Backwards-compatible: PNG bytes of the card."""
+    return to_png(render_quote_card(sender, text, footer))
 
 
 async def cmd_quote(chat, msg, user, args):
@@ -125,24 +209,48 @@ async def cmd_quote(chat, msg, user, args):
         text = "[media]"
     ts = rt.get("date")
     footer = time.strftime("%d %b %Y · %H:%M", time.localtime(ts)) if ts else ""
+
     try:
-        png = await asyncio.to_thread(render_quote, sender, text, footer)
+        img = await asyncio.to_thread(render_quote_card, sender, text, footer)
+        sticker_png, scale = await asyncio.to_thread(to_sticker, img)
+        photo_png = await asyncio.to_thread(to_png, img)
     except Exception as e:
         return await _reply(chat, msg, f"⚠️ Couldn't render the quote: {telegram.esc(e)}")
 
-    path = os.path.join(tempfile.gettempdir(), f"q_{chat.get('id')}_{msg.get('message_id')}.png")
+    base = os.path.join(tempfile.gettempdir(),
+                        f"q_{chat.get('id')}_{msg.get('message_id')}")
     try:
+        # Short and medium quotes go out as a STICKER, which is what the quote
+        # bots people compare us to send. A long one would be unreadable at
+        # 512px, so it goes out as a full-size photo instead.
+        if scale >= 0.45:
+            path = base + ".png"
+            with open(path, "wb") as fh:
+                fh.write(sticker_png)
+            try:
+                await asyncio.to_thread(telegram.send_sticker, path,
+                                        chat.get("id"), msg.get("message_id"))
+                return
+            except Exception as e:
+                log.info("sticker send failed, falling back to photo: %s", e)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        path = base + "_full.png"
         with open(path, "wb") as fh:
-            fh.write(png)
+            fh.write(photo_png)
         await asyncio.to_thread(telegram.send_photo, path, "quote.png", "",
                                 chat.get("id"), msg.get("message_id"))
     except Exception as e:
         await _reply(chat, msg, f"⚠️ Couldn't send the quote: {telegram.esc(e)}")
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        for p in (base + ".png", base + "_full.png"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------- stickers ---

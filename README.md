@@ -134,11 +134,24 @@ modules — tell me which you actually use and I'll add them next.
 requires for a bot-created pack — and resizes any image to 512 px PNG. You can
 rename and reorder it later from @Stickers.
 
+**How a quote is rendered.** The card keeps **paragraph breaks** exactly as the
+original message had them, shows the sender name in colour, and carries a small
+timestamp. Short and medium quotes are sent as a **sticker** (what the quote bots
+send); a long one would be unreadable at 512 px, so it goes out as a full-size
+photo instead.
+
+Two details that matter in practice:
+
+- **A font is bundled** (`app/assets/DejaVuSans.ttf`), so the card looks identical
+  on Render, a panel host or your own machine — no dependency on system fonts.
+- **Glyphs the font can't draw are dropped.** Emoji and scripts outside the
+  font's coverage (CJK, for example) used to render as empty boxes; each glyph's
+  bitmap is now compared against the font's `.notdef` bitmap and removed.
+
 **Honest scope.** Static stickers only. **Animated (`.tgs`) and video (`.webm`)
 stickers are rejected** with a clear message — converting those needs extra
-tooling. The quote card is a clean custom design (coloured initial instead of an
-avatar image), not QuotLy's exact layout, and it has no background/emoji/rating
-options.
+tooling. The quote card is a clean custom design, not QuotLy's exact layout, and
+it has no background/emoji/rating options.
 
 ## Verification — the bot only works in *your* groups
 
@@ -189,7 +202,14 @@ The bot tells the owner what's happening, in DMs:
 | Removed / kicked | `➖ Removed from “X”` |
 
 `/start` in a DM gives the owner a control summary (files, groups, brain, user
-account).
+account). **`/groups`** (or `/chats`, `/channels`) lists every chat the bot is in
+— split into channels and groups, each with its `@username`, a t.me link, its
+file count and whether it's approved.
+
+**DMs always get an answer.** A non-owner who messages the bot receives the
+group command list plus the owner's ID; an owner gets the control panel. If a
+send fails the bot retries without the threaded reply, so a DM is never
+silently swallowed.
 
 ### `/help` — two different answers
 
@@ -212,7 +232,19 @@ Bonki has two genuine layers, and it is worth being precise about them:
 captions and tags, plus association weights learned from which result you tap. It
 starts empty and improves with use.
 
-**2. Deep learning (pretrained, used at inference).** A transformer embedding model
+**2. A learned re-ranker (trained here, on your feedback).** Every time someone
+taps the file they actually wanted, the candidate set becomes a labelled example:
+feature vector with label 1 for the choice, 0 for the rejections. After 40 rows
+Bonki fits a **logistic regression** by gradient descent (numpy) and blends its
+probability into ranking, refitting every 10 new rows. Features: base text score,
+recency, name length, caption hit, query length, times shared. Until there is
+enough data it is a no-op, so a fresh install never ranks worse.
+
+Why logistic regression rather than a neural net: sample size. With tens to
+thousands of rows and six features a small linear model generalises; a net would
+memorise them. The *deep* part is below.
+
+**3. Deep learning (pretrained, used at inference).** A transformer embedding model
 from your configured provider (Gemini `text-embedding-004`, or OpenAI
 `text-embedding-3-small`) compares *meaning*, not just spelling. Two-stage
 retrieval keeps it cheap: the text ranking picks ~30 candidates, then only those
@@ -277,6 +309,22 @@ So there are three ways Bonki can index a group, in order of preference:
 | **Public channel** (has an `@username`) | ✅ **Scanned with no account at all** — Bonki reads the channel's public web preview (`t.me/s/<name>`) and indexes the file names it finds there |
 | Any group, going forward | ✅ **Live indexing** — with privacy mode off, Bonki indexes every file posted from now on |
 | **Any group** (public or private), past messages | ❌ Needs the user account (`/userbot`) — groups have no web preview at all |
+
+**Being an admin does not unlock history.** This is the part that surprises
+people: admin rights change *which new messages the bot receives*, not what it can
+read backwards. A bot admin gets every message from the moment it is added —
+Telegram is explicit that "bot admins and bots with privacy mode disabled will
+receive all messages" — but `messages.getHistory` remains user-only. No setting,
+permission or workaround changes that.
+
+**Public groups have no web preview either.** Telegram redirects `t.me/s/<group>`
+to the group's info card — name, photo, member count, **not one message**. Only
+public *channels* have a readable feed. Any tool claiming to show a group's full
+chat without an account is not using an official Telegram feature.
+
+Run **`/indexstatus`** in any chat to see exactly what the bot can see there: its
+role, whether it receives all messages, whether live indexing is on, and how many
+files it has indexed.
 
 **What public-channel scanning can and cannot do:** the preview exposes post text
 and photos but **not downloadable documents**, so Bonki indexes the *file name*
