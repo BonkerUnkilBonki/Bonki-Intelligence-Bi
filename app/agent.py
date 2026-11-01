@@ -203,12 +203,37 @@ def _score(q, f):
         score = 0.60 * cov + 0.30 * fr + 0.10 * (1.0 if cov >= 0.999 else 0.0)
     else:
         score = 0.60 * fr
-    # a near-exact filename match should always win
+    # An exact filename match must dominate. The bonus is bigger than anything the
+    # rerankers (learned / embedding / ranker) can add, so a correct name can no
+    # longer be overtaken by a "learned" favourite.
     if len(q_core) >= 3 and (q_core in ncore or ncore in q_core):
-        score += 0.25
+        score += 0.60
+    elif name_toks and all(t in ncore for t in name_toks):
+        score += 0.35
     if type_toks:
         score += 0.08 if f.get("ext") in type_toks else -0.20
     return score
+
+
+def _exact_rank(query, f):
+    """2 = the query is contained in the file name, 1 = every word is, 0 = no.
+
+    Deliberately name-only: a caption mentioning "netflix" must never beat a file
+    actually called Netflix.apk.
+    """
+    q = norm(query or "")
+    if not q:
+        return 0
+    n = norm(_name_core(f.get("name", "")))
+    if not n:
+        return 0
+    q_core = re.sub(r"\.[a-z0-9]{1,6}$", "", q).strip()
+    if len(q_core) >= 3 and q_core in n:
+        return 2
+    qt = [t for t in tokens(q_core) if t not in _EXT_WORDS]
+    if qt and all(t in n for t in qt):
+        return 1
+    return 0
 
 
 def rank(query, files, exts=None, variants=None):
@@ -300,6 +325,15 @@ async def find_best(query, chat_id):
             ranked = ranker.rerank(ranked)
     except Exception as e:
         log.info("ranker skipped: %s", e)
+    # ---- pin exact matches -------------------------------------------------
+    # Learned weights, embeddings and the ranker all blend into the score, and any
+    # of them could push a different file above the one whose name the user typed.
+    # If the query actually matches a file name, that file wins - full stop.
+    if ranked:
+        ranked = sorted(ranked, key=lambda x: (-_exact_rank(query, x[1]), -x[0]))
+        if _exact_rank(query, ranked[0][1]) >= 1:
+            log.info("pinned exact match %r -> %s", query, ranked[0][1].get("name"))
+
     if not ranked or ranked[0][0] < MIN_SCORE:
         return None, []
     best_score, best = ranked[0]

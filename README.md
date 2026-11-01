@@ -131,6 +131,49 @@ owner approvals.
 — I left them out to keep this change reviewable rather than dumping 60 commands
 in at once.
 
+### `/config` — per-chat module switches (inside Telegram)
+
+When two bots sit in the same group they duplicate each other: two bans, two
+welcomes, two captchas. `/config` (admins only) opens an inline panel and lets you
+switch Bonki's modules off for that chat alone.
+
+```
+⚙️ Bonki modules for this chat
+✅ Moderation      ✅ Welcome / goodbye
+✅ CAPTCHA         ✅ Antiflood
+✅ Blocklist       ✅ Locks
+✅ Filters         ✅ Notes / rules
+✅ File search     ✅ Tagging
+✅ Federation      ✅ Chat replies
+✅ Dump / mirror   ✅ Scheduled skills
+[🔄 Turn all ON] [⛔ Turn all OFF] [🩺 Check permissions]
+```
+
+Tap any module to toggle it. Turning **Moderation** off stops `/ban`, `/kick`,
+`/mute`, `/warn`, `/purge` and `/pin` in that chat — while search, notes and
+everything else keep working. Nothing else in the bot is affected, and no other
+chat is touched.
+
+Every automatic behaviour respects these switches too: welcome, CAPTCHA,
+antiflood, blocklist, locks, filters, federation enforcement, live indexing,
+mirroring and chat replies.
+
+### `/permissions` — what the bot is missing
+
+Reports the bot's role in the chat and every admin right it lacks, with what each
+one enables:
+
+```
+🩺 Admin ✅ but these rights are missing:
+• can_restrict_members — mute/kick (mute, warn escalation, antiflood, CAPTCHA)
+• can_change_info — set title/description
+```
+
+**A bot cannot grant itself admin rights** — Telegram requires a human admin to
+promote it. What Bonki does instead: it says exactly what's missing, and when it is
+added to a channel it posts a setup note telling you to promote it and run
+`/permissions`.
+
 ### Anti-spam: CAPTCHA, blocklist, antiflood
 
 The three protections every serious group bot ships — all local, no external
@@ -626,6 +669,32 @@ Two rules make that work:
 greetings, thanks, identity and rudeness well, and gives a short honest line for
 anything else. For real conversation, connect an LLM — Bonki then prefers it and
 falls back to these rules offline.
+
+## Why a search can return the wrong file (and how it is fixed)
+
+Ranking blends four signals: fuzzy spelling, TF-IDF, learned associations and
+embeddings. That blending is useful for vague queries, but it had a real flaw — a
+**learned favourite or an embedding preference could outrank the file whose name
+you actually typed**. One wrong confirmation, or one uncorrected result, was enough
+to make the bot keep returning that file.
+
+Two fixes:
+
+1. **Exact matches now score far higher.** A query contained in the file name gets
+   `+0.60`; all words present in the name gets `+0.35`. That is more than any
+   reranker can add.
+2. **Exact matches are pinned after every rerank.** If the query matches a file
+   name, that file is forced to the top regardless of learned weights, embeddings
+   or the ranker.
+
+Verified against a deliberately hostile index — files whose *captions* mention
+"netflix" while the real `Netflix 8.1.apk` sits beside them, plus **eight wrong
+learned confirmations** pointing at Spotify. Netflix still won, and a 22-query
+regression suite passed with zero mismatches.
+
+If a search still looks wrong, run **`/ml <query>`** — it prints the real
+component scores for the top candidates, so you can see which signal is
+misbehaving instead of guessing.
 
 ## Seeing the ML — `/ml`
 

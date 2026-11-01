@@ -87,6 +87,15 @@ def leave_chat(chat_id):
     return _post("leaveChat", {"chat_id": chat_id})
 
 
+def edit_message_text(chat_id, message_id, text, reply_markup=None):
+    """Rewrite a message's text (and optionally its buttons)."""
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text[:MAX_MESSAGE],
+            "parse_mode": "HTML", "disable_web_page_preview": True}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    return _post("editMessageText", data)
+
+
 def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
     data = {"chat_id": chat_id, "message_id": message_id,
             "reply_markup": json.dumps(reply_markup or {"inline_keyboard": []})}

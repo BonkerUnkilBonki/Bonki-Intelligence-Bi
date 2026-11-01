@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 
-from . import (agent, approval, db, extras, federation, indexer, rose,
+from . import (agent, approval, db, extras, federation, indexer, modules, rose,
                security, telegram)
 
 log = logging.getLogger("handlers")
@@ -137,8 +137,13 @@ async def _handle_membership(cm):
             try:
                 await asyncio.to_thread(
                     telegram.send_message,
-                    "✅ <b>Bonki-Intelligence</b> is now in this channel.\n"
-                    "Post files here and I'll index them automatically.",
+                    "✅ <b>Bonki-Intelligence</b> is now in this channel.\n\n"
+                    "Post files and I'll index them automatically.\n"
+                    "To do more, make me an <b>admin</b> (delete, restrict, ban), "
+                    "then run <code>/permissions</code> to see what's still missing.\n\n"
+                    "If another bot already handles moderation here, run "
+                    "<code>/config</code> and switch off what you don't want me doing "
+                    "— that stops double bans and double welcomes.",
                     chat_id=chat.get("id"))
             except Exception as e:
                 log.info("channel greeting failed: %s", e)
@@ -255,6 +260,44 @@ async def _handle_callback(cq):
                                         chat.get("id"), m.get("message_id"))
             except Exception:
                 pass
+        return
+
+    if data.startswith("mod:"):
+        name = data[4:]
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        cid = chat.get("id")
+        presser = (cq.get("from") or {}).get("id")
+        if not await rose._is_admin(cid, presser):
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Admins only.", True)
+            return
+        if name == "__all_on":
+            for n in modules.MODULES:
+                modules.set_module(cid, n, True)
+            note = "All modules on."
+        elif name == "__all_off":
+            for n in modules.MODULES:
+                modules.set_module(cid, n, False)
+            note = "All modules off."
+        elif name == "__perms":
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Run /permissions for the full check.")
+            return
+        elif name in modules.MODULES:
+            on = modules.toggle(cid, name)
+            note = f"{modules.MODULES[name][0]} {'on' if on else 'off'}."
+        else:
+            return
+        await asyncio.to_thread(db.flush, True)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), note)
+        if m.get("message_id"):
+            try:
+                await asyncio.to_thread(
+                    telegram.edit_message_text, cid, m.get("message_id"),
+                    modules.summary_text(cid), modules.keyboard(cid))
+            except Exception as e:
+                log.info("config redraw failed: %s", e)
         return
 
     if data.startswith("ap|"):
@@ -387,7 +430,8 @@ async def handle_update(update):
 
         if approval.gate(chat.get("id"), chat.get("username")):   # not verified -> do nothing
             await approval.announce(chat)
-            if ctype in ("group", "supergroup") and text and is_addressed(msg, text):
+            if (ctype in ("group", "supergroup") and text and is_addressed(msg, text)
+                and modules.enabled(chat.get("id"), "ai")):
                 await _send("🛡️ This group isn't verified yet — the bot's owner has "
                             "to approve it before I can index or answer here.",
                             chat.get("id"), reply_to=msg.get("message_id"))
@@ -396,9 +440,9 @@ async def handle_update(update):
         # moderation first: federation bans and active locks can remove the
         # message before we index or answer it.
         try:
-            if await federation.enforce(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "fedbans") and await federation.enforce(chat, msg, frm):
                 return
-            if await rose.enforce_locks(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "locks") and await rose.enforce_locks(chat, msg, frm):
                 return
         except Exception as e:
             log.warning("moderation check failed: %s", e)
@@ -415,16 +459,19 @@ async def handle_update(update):
 
         # anti-spam: blocked words and message floods
         try:
-            if await security.check_blocklist(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "blocklist") and \
+                    await security.check_blocklist(chat, msg, frm):
                 return
-            if await security.check_flood(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "antiflood") and \
+                    await security.check_flood(chat, msg, frm):
                 return
         except Exception as e:
             log.info("antispam check failed: %s", e)
 
         # live mirror: copy every new message to the configured destination
         try:
-            mir = db.get_mirror_for_chat(chat.get("id"))
+            mir = (db.get_mirror_for_chat(chat.get("id"))
+                   if modules.enabled(chat.get("id"), "mirror") else None)
             if mir and str(mir.get("dst")) != str(chat.get("id")):
                 if not (text or "").lower().startswith("/dump"):
                     try:
@@ -442,7 +489,8 @@ async def handle_update(update):
         except Exception as e:
             log.info("live mirror copy failed: %s", e)
 
-        if str(db.get_settings().get("index_live") or "1") == "1":
+        if modules.enabled(chat.get("id"), "search") and \
+                str(db.get_settings().get("index_live") or "1") == "1":
             try:
                 indexer.capture_from_message(chat, msg)
                 asyncio.create_task(asyncio.to_thread(db.flush))   # don't block the reply
@@ -451,12 +499,14 @@ async def handle_update(update):
 
         # ported features: global bans, member tracking, AFK, filters
         try:
-            if await extras.enforce_gban(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "fedbans") and \
+                    await extras.enforce_gban(chat, msg, frm):
                 return
             extras.track_member(chat.get("id"), frm)
             if await extras.afk_watch(chat, msg, frm):
                 return
-            if not text.startswith("/") and await extras.run_filters(chat, msg, frm):
+            if modules.enabled(chat.get("id"), "filters") and not text.startswith("/") \
+                    and await extras.run_filters(chat, msg, frm):
                 return
         except Exception as e:
             log.info("extras watch failed: %s", e)
@@ -489,12 +539,14 @@ async def handle_update(update):
                 if mbr.get("is_bot"):
                     continue
                 try:
-                    if await security.start_captcha(chat, msg, mbr):
+                    if modules.enabled(chat.get("id"), "captcha") and \
+                            await security.start_captcha(chat, msg, mbr):
                         security.mark_pending(chat.get("id"), mbr.get("id"), True)
                 except Exception as e:
                     log.warning("captcha failed: %s", e)
 
-        if ctype in ("group", "supergroup") and text and is_addressed(msg, text):
+        if (ctype in ("group", "supergroup") and text and is_addressed(msg, text)
+                and modules.enabled(chat.get("id"), "ai")):
             clean = strip_address(text) or text
             try:
                 await agent.handle(chat, msg, frm, clean)

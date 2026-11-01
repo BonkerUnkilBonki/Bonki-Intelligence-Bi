@@ -25,7 +25,7 @@ import tempfile
 import time
 
 from . import (analytics, ask, categorize, db, embed, extras, federation, memory,
-               ml, security, skills, stickers, telegram)
+               ml, modules, security, skills, stickers, telegram)
 
 log = logging.getLogger("rose")
 
@@ -912,6 +912,56 @@ async def cmd_decisions(chat, msg, user, args):
 
 # -------------------------------------------------------------------- ML -----
 # ------------------------------------------------------ anti-spam commands ---
+# ------------------------------------------------------------------ config ---
+async def cmd_config(chat, msg, user, args):
+    """In-Telegram switches for every module, so Bonki can coexist with Rose."""
+    cid = chat.get("id")
+    if not await _is_admin(cid, (user or {}).get("id")):
+        return await _reply(chat, msg, "Admins only.")
+    try:
+        await asyncio.to_thread(
+            telegram.send_message, modules.summary_text(cid), chat_id=cid,
+            reply_to=msg.get("message_id"),
+            reply_markup=modules.keyboard(cid))
+    except Exception as e:
+        await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+
+
+async def cmd_permissions(chat, msg, user, args):
+    """Which admin rights Bonki is missing here - and what they enable."""
+    from . import handlers
+    cid = chat.get("id")
+    bot_id = handlers._bot_identity.get("id")
+    if not bot_id:
+        return await _reply(chat, msg, "I don't know my own id yet — try again shortly.")
+    try:
+        res = await asyncio.to_thread(telegram.get_chat_member, cid, bot_id)
+        m = res.get("result") or {}
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+    status = m.get("status") or "unknown"
+    if status not in ("administrator", "creator"):
+        return await _reply(chat, msg,
+                            f"🩺 My role here: <b>{telegram.esc(status)}</b>\n\n"
+                            "I need to be an <b>admin</b> for moderation, CAPTCHA, "
+                            "antiflood, locks and welcome to work.\n"
+                            "Promote me, then run /permissions again.")
+    need = {
+        "can_delete_messages": "delete messages (purge, locks, blocklist, CAPTCHA)",
+        "can_restrict_members": "mute/kick (mute, warn escalation, antiflood, CAPTCHA)",
+        "can_ban_users": "ban (ban, fedban, gban)",
+        "can_invite_users": "invite links",
+        "can_pin_messages": "pin",
+        "can_change_info": "set title/description",
+    }
+    missing = [f"• <b>{k}</b> — {v}" for k, v in need.items() if not m.get(k)]
+    if not missing:
+        return await _reply(chat, msg, "🩺 Admin ✅ and every right I need is granted.")
+    await _reply(chat, msg,
+                 "🩺 Admin ✅ but these rights are missing:\n" + "\n".join(missing) +
+                 "\n\nGrant them in the group's admin settings.")
+
+
 async def cmd_captcha(chat, msg, user, args):
     """Mute new joiners until they tap a verify button."""
     if not await _need_admin(chat, msg, user):
@@ -1536,6 +1586,8 @@ COMMANDS = {
     "dupes": cmd_dupes, "duplicates": cmd_dupes,
     "ask": cmd_ask, "q": cmd_ask, "qa": cmd_ask,
     "captcha": cmd_captcha,
+    "config": cmd_config, "modules": cmd_config, "features": cmd_config,
+    "permissions": cmd_permissions, "perms": cmd_permissions,
     "filter": extras.cmd_filter, "stop": extras.cmd_stop,
     "stopall": extras.cmd_stop, "filters": extras.cmd_filters,
     "afk": extras.cmd_afk,
@@ -1585,6 +1637,13 @@ async def handle_command(chat, msg, user, cmd, args):
     handler = COMMANDS.get((cmd or "").lower())
     if not handler:
         return False
+    if not modules.command_allowed(chat.get("id"), cmd):
+        try:
+            await _reply(chat, msg, f"⚙️ <code>/{cmd}</code> is switched off in this "
+                                    f"chat. Admins can change it with /config.")
+        except Exception:
+            pass
+        return True
     try:
         await handler(chat, msg, user or {}, args or "")
     except Exception as e:
