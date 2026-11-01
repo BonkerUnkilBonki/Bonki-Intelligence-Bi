@@ -498,6 +498,7 @@ def settings_save(
         if val and "…" not in val and "•••" not in val:
             items[key] = val
     db.set_settings(items)
+    db.flush(force=True)          # don't wait for the debounce on a restart-prone host
     return _redir("Settings saved.", path="/settings")
 
 
@@ -524,7 +525,11 @@ async def userbot_page(request: Request, msg: str = ""):
 @app.post("/userbot/start")
 async def userbot_start(api_id: str = Form(""), api_hash: str = Form(""),
                         phone: str = Form(""), force_sms: str = Form("")):
-    db.set_settings({"tg_api_id": api_id.strip(), "tg_api_hash": api_hash.strip()})
+    # keep everything needed for a retry - phone included, or the next attempt
+    # starts from scratch and looks like nothing was saved
+    db.set_settings({"tg_api_id": api_id.strip(), "tg_api_hash": api_hash.strip(),
+                     "tg_phone": phone.strip()})
+    db.flush(force=True)
     try:
         where = await userbot.start_login(api_id.strip(), api_hash.strip(),
                                           phone.strip(), force_sms=bool(force_sms))
@@ -541,6 +546,16 @@ async def userbot_verify(code: str = Form(""), password: str = Form("")):
         return _redir("Logged in — session saved. Restart the app if it doesn't connect.", path="/userbot")
     except Exception as e:
         return _redir(f"Error: {e}", path="/userbot")
+
+
+@app.post("/userbot/session")
+def userbot_session(tg_session: str = Form("")):
+    val = (tg_session or "").strip()
+    if not val:
+        return _redir("Paste a session string first.", path="/userbot")
+    db.set_settings({"tg_session": val})
+    db.flush(force=True)
+    return _redir("Session saved — restart the app and it will connect.", path="/userbot")
 
 
 @app.post("/userbot/clear")

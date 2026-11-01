@@ -86,6 +86,52 @@ group 3 times" stays a scan.
 > obeys the `retry_after` and continues instead of giving up — so `/tag @user 69`
 > genuinely delivers 69 messages, in about 3–4 minutes.
 
+### Ported from BonkBot
+
+Bonki absorbed the features from the earlier BonkBot project that it did **not**
+already have. Everything below is new here; nothing was duplicated.
+
+| Command | Does |
+|---|---|
+| `/filter hi Hello` · `/stop hi` · `/stopall` · `/filters` | Auto-replies on a trigger word. Supports `prefix:` and `exact:` modifiers, or reply to a message to use it as the reply |
+| `/afk eating` | Auto-replies when someone pings or replies to you, and clears itself when you return |
+| `/tagall hello` · `/utagall` | Mentions everyone who has spoken here (bots can't list members, so it can only tag people it has seen) |
+| `/disable purge` · `/enable purge` · `/disabled` | Per-chat command toggles |
+| `/gban` · `/ungban` · `/gbanlist` | **Owner only** — ban across every chat Bonki is in, enforced on sight |
+| `/export` · `/import` | Move a chat's settings, notes and rules to another group as JSON |
+| `/promote` · `/demote` · `/settitle` · `/setdesc` · `/ping` | Admin conveniences |
+
+**Already present, so not ported:** moderation (ban/kick/mute/warn/purge/pin),
+locks, notes, rules, welcome, federations, captcha, blocklist, antiflood,
+stickers/kang, quotes, tag, scheduled skills, analytics, `/ask`, dump/mirror and
+owner approvals.
+
+**Not ported (deliberately):** `memefi` (image meme generator), `rewriter`
+(AI-rewrites channel posts), anti-raid thresholds, captcha modes, and the
+`connect`/`disconnect` chat-linking commands. Say which you want and I'll add them
+— I left them out to keep this change reviewable rather than dumping 60 commands
+in at once.
+
+### Anti-spam: CAPTCHA, blocklist, antiflood
+
+The three protections every serious group bot ships — all local, no external
+service.
+
+| Command | Does |
+|---|---|
+| `/captcha on\|off` | New members are **muted on join** and must tap a verify button. Unverified members are kicked after 5 minutes |
+| `/addblocklist <word>` · `/rmblocklist <word>` · `/blocklist` | Case-insensitive word filters. Admins are exempt |
+| `/blocklist mode mute 60` | Delete only (default), or also mute for N minutes |
+| `/setflood 5 10` · `/setflood off` · `/flood` | Mute after **5 messages in 10 seconds** |
+
+**CAPTCHA is the one that matters.** Every other protection reacts to messages
+that have already been posted; CAPTCHA acts at the join, so a bot never gets to
+post at all. It needs *restrict members* and *ban users* rights — without them the
+mute silently fails and Bonki logs it.
+
+The button is tied to the joiner's own account: anyone else tapping it is told
+"That button isn't for you", so it can't be used to verify someone else in.
+
 ### Purge, locks and federations
 
 | Command | Does |
@@ -329,7 +375,26 @@ silently swallowed.
 ```
 /dump @paypalagentchat        # copy the last 100 messages from here to there
 /dump @paypalagentchat 500    # the last 500
+/dump @paypalagentchat live   # mirror every NEW message, continuously
+/dump off                     # stop the live mirror
+/dump                         # show whether a mirror is running
 ```
+
+**Live mode** keeps copying as messages arrive, so the destination becomes a real
+mirror of the source. Backfill the past with a one-off dump, then switch to live:
+
+```
+/dump @paypalagentchat 500    # history
+/dump @paypalagentchat live   # and everything after
+```
+
+**Messages are forwarded, not re-authored.** The destination shows
+*"Forwarded from …"* with the original sender, instead of every message appearing
+to come from Bonki. If a message can't be forwarded (channels with restricted
+saving), Bonki falls back to copying that one message so the mirror doesn't stall.
+
+The bot must be able to read the source and post in the destination. A message it
+cannot send either way is logged and skipped.
 
 Telegram gives bots no way to *list* history, but a bot that is a member can copy a
 message when it knows the id — and ids are sequential. So it walks the ids
@@ -410,6 +475,101 @@ so every one of these works with no code change:
 provider config needed. **Auto-switch:** if the active model fails (quota, outage,
 bad key), the next available one answers and the switch is remembered, so an
 exhausted free quota degrades instead of taking the bot down.
+
+## ML and deep learning — on by default, no API needed
+
+Bonki's learning layers work **out of the box with no key and no download**:
+
+| Layer | Runs without a key? | What it is |
+|---|---|---|
+| TF-IDF ranking | ✅ | classical ML over your file names and captions |
+| **Local embeddings** | ✅ | hashed word + **character 3-gram** vectors, IDF-weighted, with **LSA (truncated SVD)** once the corpus passes ~25 files |
+| **Intent net** | ✅ | a **numpy MLP** (512→48→9) with real backprop, trained at startup on ~90 labelled phrasings — reads *what you're asking* when no LLM key is set |
+| **Category net** | ✅ | a second numpy MLP (512→40→10) that sorts file names into app / game / mod / ebook / movie / music / archive / document / image — powers `list games`, `how many ebooks` |
+| **Duplicate finder** | ✅ | cosine similarity over the local vectors — `/dupes` groups the same app at different versions |
+| **Implicit learning** | ✅ | if nobody rejects a result within 3 minutes, it counts as a weak positive, so the ranker learns from normal use, not just taps |
+| Learned ranker | ✅ | logistic regression — starts from **hand-set prior weights** so it is on from the first search, then replaces them with real training after **12 feedback taps** |
+| Pretrained transformer | ⬆️ optional | if you add `GEMINI_API_KEY` / `OPENAI_API_KEY`, embeddings switch to a real transformer; everything else stays the same |
+
+**What the local embeddings actually are, plainly:** unsupervised learning on your
+own corpus, in numpy. Character 3-grams mean it still matches `whatsap` to
+`WhatsApp`, `spotfy` to `Spotify`, and glued names like `whatsappmod`. LSA then
+compresses those vectors so words that appear together end up near each other.
+
+**The intent net is a real neural network** — forward pass, backprop, SGD and
+cross-entropy, all hand-written in numpy, no PyTorch or TensorFlow. It is trained
+from scratch on your machine at first use (under a second, ~40k parameters) and
+classifies phrasing that keyword matching misses:
+
+```
+"can you pull the spotify one"  -> find     1.00
+"what did i miss"               -> summarise 0.99
+"who shares the most"           -> stats    1.00
+"hello there"                   -> unknown  1.00
+```
+
+Its train accuracy is 100% on those templates, which also tells you the honest
+limit: it generalises to *similar phrasings*, not to arbitrary language, and it
+cannot write a sentence. Anything generative still needs an LLM or the built-in
+templates.
+
+**What they are not:** a neural network. There are no pretrained transformer
+weights here, because shipping one means either a ~100 MB download or an API call.
+If you want true transformer semantics, add a key and it upgrades itself — the
+local path stays as the fallback.
+
+## Answering questions from the group (`/ask`)
+
+`/ask` — or just asking a question in chat — answers from **this group's own stored
+facts**: files, sizes, dates, top sharers, decisions and learned notes.
+
+```
+/ask who shares the most   -> Most active sharers: Alice (3)
+/ask how many files        -> 3 file(s) indexed, 102 MB in total
+/ask latest file           -> The newest file is WhatsApp 2.24.apk, shared 31 Oct
+/ask biggest file          -> The biggest file is GTA San Andreas.apk (85.8 MB)
+/ask what did we decide    -> • we ship on Friday — 31 Oct 2026
+```
+
+**Two modes, and it tells you which one answered:**
+
+- **With an LLM key** — retrieval-augmented generation. The retrieved facts go into
+  the prompt and the model writes the answer. This is the good path.
+- **Without a key** — pattern-matched answers computed directly from the stored
+  data, labelled *"answered from what I have stored — no model, no guessing"*.
+
+**About "cloning Mira's database": that isn't possible and Bonki doesn't try.** It
+is 1M+ users' private data held by a company; there is no public export, and
+replicating it would be a privacy violation. What Mira actually does *inside your
+group* is remember that group — which is exactly what `/ask`, `/decide`,
+`/knowledge` and the memory store do here, from your data only.
+
+## Talking to it like a person
+
+Ordinary chat no longer gets answered with a menu about indexing:
+
+```
+Bonki hello         -> Hey 👋 Ask me for a file any time
+Bonki how are you   -> Running fine — indexing and ready. What do you need?
+Bonki thanks        -> Any time 👍
+Bonki who are you   -> I'm Bonki — a bot that indexes files here. Not a person.
+Bonki <anything rude> -> I'll pass on that one. If you want something from the
+                         index, say Bonki find <name>
+```
+
+Two rules make that work:
+
+- **Only real file shapes become a search.** Previously any two content words did,
+  so "how are you" and worse were treated as file lookups and answered with the
+  "nothing indexed" wall of text. Now it needs an extension, a search verb, or a
+  confident classifier verdict.
+- **Short messages get a human reply first**, before the intent dispatch, so a
+  greeting never lands on the help menu.
+
+**Honest limit:** this is a set of rules, not a language model. It handles
+greetings, thanks, identity and rudeness well, and gives a short honest line for
+anything else. For real conversation, connect an LLM — Bonki then prefers it and
+falls back to these rules offline.
 
 ## Seeing the ML — `/ml`
 
@@ -608,6 +768,19 @@ Open `http://localhost:8000/`.
 - Open **User account** (`/userbot`) in the dashboard and log in — Telegram sends
   the code *inside the app* (the “Telegram” service chat). Or run
   `python userbot_login.py` locally and paste the session string into Settings.
+
+#### api_id / api_hash / phone are saved
+
+All three persist now (phone was never stored before, so every retry started from
+scratch). The `/userbot` page shows exactly what the server holds:
+
+```
+Saved on this server: api_id ✅ 12345678 · api_hash ✅ saved · phone ✅ +91…
+```
+
+`api_hash` is shown as "saved" rather than printed, because it is a secret — but it
+is stored, and leaving the field blank keeps the existing value instead of wiping
+it.
 
 #### No login code arriving — the usual causes
 

@@ -49,7 +49,8 @@ def _default_state():
     return {"settings": {}, "groups": [], "files": [], "activity": [], "feedback": [],
             "approvals": [], "notes": [], "warns": [], "chatconf": [], "stickerpacks": [],
             "feds": [], "ranker_rows": [], "memory": [], "skills": [],
-            "decisions": [], "snapshots": [], "fed_push": []}
+            "decisions": [], "snapshots": [], "fed_push": [], "mirrors": [],
+            "afk": [], "members": [], "gbans": []}
 
 
 def _normalize(state):
@@ -58,7 +59,7 @@ def _normalize(state):
         return base
     for k in ("groups", "files", "activity", "feedback", "approvals",
               "notes", "warns", "chatconf", "stickerpacks", "feds", "ranker_rows", "memory",
-              "skills", "decisions", "snapshots", "fed_push"):
+              "skills", "decisions", "snapshots", "fed_push", "mirrors", "afk", "members", "gbans"):
         if not isinstance(state.get(k), list):
             state[k] = []
     stored = state.get("settings")
@@ -614,6 +615,135 @@ def drop_fed_push(fed_id, user):
                               != (str(fed_id), str(user))]
         if len(_STATE["fed_push"]) != before:
             _touch()
+
+
+# --------------------------------------------------------------- mirrors ----
+def set_mirror(src_chat_id, dst, by=""):
+    with _lock:
+        rows = _STATE.setdefault("mirrors", [])
+        for r in rows:
+            if str(r.get("src")) == str(src_chat_id):
+                r.update({"dst": str(dst), "by": str(by), "t": time.time()})
+                _touch()
+                return
+        rows.append({"src": str(src_chat_id), "dst": str(dst), "by": str(by),
+                     "t": time.time(), "sent": 0})
+        _touch()
+
+
+def get_mirror_for_chat(chat_id):
+    with _lock:
+        for r in _STATE.get("mirrors", []):
+            if str(r.get("src")) == str(chat_id):
+                return dict(r)
+    return None
+
+
+def remove_mirror(src_chat_id):
+    with _lock:
+        before = len(_STATE.get("mirrors", []))
+        _STATE["mirrors"] = [r for r in _STATE.get("mirrors", [])
+                             if str(r.get("src")) != str(src_chat_id)]
+        if len(_STATE["mirrors"]) != before:
+            _touch()
+            return True
+    return False
+
+
+def bump_mirror(src_chat_id):
+    with _lock:
+        for r in _STATE.get("mirrors", []):
+            if str(r.get("src")) == str(src_chat_id):
+                r["sent"] = int(r.get("sent") or 0) + 1
+                return
+
+
+# ------------------------------------------------------------ afk/members ---
+def set_afk(user_id, reason):
+    with _lock:
+        rows = _STATE.setdefault("afk", [])
+        for r in rows:
+            if str(r.get("id")) == str(user_id):
+                r.update({"reason": str(reason)[:200], "t": time.time()})
+                _touch()
+                return
+        rows.append({"id": str(user_id), "reason": str(reason)[:200], "t": time.time()})
+        _touch()
+
+
+def get_afk(user_id):
+    with _lock:
+        for r in _STATE.get("afk", []):
+            if str(r.get("id")) == str(user_id):
+                return r.get("reason") or "no reason given"
+    return None
+
+
+def clear_afk(user_id):
+    with _lock:
+        before = len(_STATE.get("afk", []))
+        _STATE["afk"] = [r for r in _STATE.get("afk", [])
+                         if str(r.get("id")) != str(user_id)]
+        if len(_STATE["afk"]) != before:
+            _touch()
+            return True
+    return False
+
+
+def track_member(chat_id, user_id, name):
+    with _lock:
+        rows = _STATE.setdefault("members", [])
+        key = (str(chat_id), str(user_id))
+        for r in rows:
+            if (str(r.get("chat")), str(r.get("id"))) == key:
+                r["name"] = str(name)[:40]
+                r["t"] = time.time()
+                return
+        rows.append({"chat": str(chat_id), "id": str(user_id),
+                     "name": str(name)[:40], "t": time.time()})
+        if len(rows) > 5000:
+            del rows[:-5000]
+        _touch()
+
+
+def list_members(chat_id):
+    with _lock:
+        rows = [dict(r) for r in _STATE.get("members", [])
+                if str(r.get("chat")) == str(chat_id)]
+    rows.sort(key=lambda r: -(r.get("t") or 0))
+    return rows
+
+
+# ------------------------------------------------------------------ gbans ----
+def add_gban(user, reason, by):
+    with _lock:
+        rows = _STATE.setdefault("gbans", [])
+        if any(str(r.get("user")) == str(user) for r in rows):
+            return
+        rows.append({"user": str(user), "reason": str(reason)[:200],
+                     "by": str(by), "t": time.time()})
+        _touch()
+
+
+def remove_gban(user):
+    with _lock:
+        before = len(_STATE.get("gbans", []))
+        _STATE["gbans"] = [r for r in _STATE.get("gbans", [])
+                           if str(r.get("user")) != str(user)]
+        if len(_STATE["gbans"]) != before:
+            _touch()
+            return True
+    return False
+
+
+def list_gbans():
+    with _lock:
+        return [dict(r) for r in _STATE.get("gbans", [])]
+
+
+def is_gban(user):
+    with _lock:
+        return any(str(r.get("user")) == str(user) for r in _STATE.get("gbans", []))
 
 
 def count_files(chat_id=None):

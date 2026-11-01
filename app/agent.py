@@ -27,8 +27,8 @@ import re
 import tempfile
 import time
 
-from . import (approval, db, embed, indexer, learn, llm, ranker, rose, telegram,
-               userbot, webscan)
+from . import (approval, categorize, db, embed, indexer, learn, llm, nn,
+               ranker, rose, telegram, userbot, webscan)
 
 log = logging.getLogger("agent")
 
@@ -321,6 +321,18 @@ async def parse(text):
         smart = await _llm_parse(text)
         if smart:
             return smart
+    elif nn.available():
+        # No API key: a locally-trained neural net reads the intent. It wins when
+        # it is confident, EXCEPT where the text carries explicit file evidence
+        # (an extension), which is a stronger signal than any classifier.
+        try:
+            intent, conf, _ = await asyncio.to_thread(nn.classify, text)
+            has_ext = bool(re.search(r"\.[A-Za-z0-9]{2,5}\b", text or ""))
+            if intent and not has_ext and conf >= 0.55:
+                hint = dict(hint, intent=intent,
+                            scan=hint.get("scan") or intent == "scan")
+        except Exception as e:
+            log.info("intent net skipped: %s", e)
     return hint
 
 
@@ -394,11 +406,11 @@ def _heuristic_parse(text):
         # file extension or at least two content words. Without this, EVERY
         # message to the bot became a search - so "@someone admin" answered
         # with "I haven't indexed any files".
-        content = [w for w in re.split(r"\s+", (text or "").strip())
-                   if w and norm(w) not in _STOP
-                   and not w.startswith("#") and not w.startswith("@")]
+        # Only a real file shape counts here: an extension, or a name the user
+        # clearly typed as one. The old "two content words = search" rule made
+        # ordinary chat ("fuck him", "how are you") a file lookup.
         looks_like_file = bool(re.search(r"\.[A-Za-z0-9]{2,5}\b", text or ""))
-        intent = "find" if (looks_like_file or len(content) >= 2) else "unknown"
+        intent = "find" if looks_like_file else "unknown"
 
     words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
     qwords = [w for w in words if norm(w) not in _STOP and not w.startswith("#")
@@ -598,6 +610,30 @@ async def handle(chat, msg, user, text):
 
     await _typing(chat_id)
 
+    # A real question is answered from this group's stored facts, before the
+    # intent dispatch - otherwise "who shares the most?" lands on the stats table.
+    if ((text or "").strip().endswith("?")
+            and intent in ("unknown", "stats", "count", "list", "help")):
+        try:
+            from . import ask as _ask
+            ans, src = await _ask.answer(text, chat_id)
+            if src in ("llm", "local"):
+                return await _send(ans[:3800], chat_id,
+                                   reply_to=msg.get("message_id"))
+        except Exception as e:
+            log.info("ask failed: %s", e)
+
+    # Short everyday messages get a human reply, whatever the classifier says.
+    # ("how are you" was landing on the help text, which reads like a machine.)
+    if len((text or "").split()) <= 6 and intent in ("unknown", "help"):
+        try:
+            from . import chat as _chat
+            quick = _chat.reply_for(text)
+            if quick:
+                return await _send(quick, chat_id, reply_to=msg.get("message_id"))
+        except Exception as e:
+            log.info("chat reply skipped: %s", e)
+
     if intent == "help":
         return await _help(chat, msg)
     if intent == "scan":
@@ -609,18 +645,18 @@ async def handle(chat, msg, user, text):
     if intent == "find":
         return await _do_find(chat, msg, user, query, hashtag, scan)
     if intent == "unknown":
-        # Not a search - don't pretend it was one.
+        # Ordinary chat. Answer briefly and in kind, instead of dumping a menu
+        # about indexing at someone who just said hello.
+        from . import chat
+        quick = chat.reply_for(text)
+        if quick:
+            return await _send(quick, chat_id, reply_to=msg.get("message_id"))
         if db.count_files(chat_id) == 0:
-            body = ("🤔 Not sure what you want there.\n\n"
-                    "Nothing is indexed from this group yet. Say "
-                    "<i>Bonki scan this group</i> (public channels work without a "
-                    "user account), or just post files and I'll index them live.\n"
-                    "To search: <i>Bonki find &lt;file name&gt;</i>")
+            body = ("I'm here when you need a file — post one and I'll index it, "
+                    "or ask <i>Bonki find &lt;name&gt;</i>.")
         else:
-            body = ("🤔 Not sure what you want there.\n"
-                    "To search: <i>Bonki find &lt;file name&gt;</i>\n"
-                    "Or: <i>Bonki list files</i> · <i>Bonki scan this group</i> · "
-                    "<i>Bonki help</i>")
+            body = ("Not sure what you need. Try <i>Bonki find &lt;file name&gt;</i>, "
+                    "<i>Bonki list files</i>, or <i>Bonki help</i>.")
         return await _send(body, chat_id, reply_to=msg.get("message_id"))
     return await _help(chat, msg)
 
@@ -682,16 +718,9 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     if not best:
         if db.count_files(chat_id) == 0:
             await _send(
-                "Nothing indexed from this chat yet.\n\n"
-                "<b>Two ways in:</b>\n"
-                "• <b>From now on</b> — post a file here and I index it "
-                "automatically. Make me an admin and I receive every message "
-                "(privacy mode is off for admins), so nothing gets missed.\n"
-                "• <b>Old messages</b> — a bot genuinely cannot read history; "
-                "Telegram gives bots no access to messages sent before they "
-                "joined. That needs the user account at /userbot.\n\n"
-                "Check what I can see with <code>/indexstatus</code>.", chat_id,
-                reply_to=msg.get("message_id"))
+                "Nothing indexed here yet — post a file and I'll index it as it "
+                "arrives. (Old messages need /userbot; a bot can't read history.)",
+                chat_id, reply_to=msg.get("message_id"))
         else:
             await _send(f"Couldn't find anything matching “{telegram.esc(query)}”. "
                         f"I have {db.count_files(chat_id)} file(s) indexed — try "
@@ -728,6 +757,30 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     sent_id = ((resp or {}).get("result") or {}).get("message_id")
     if sent_id:
         asyncio.create_task(_autodelete_close_matches(chat_id, sent_id, token))
+    asyncio.create_task(_learn_implicit(chat_id, query, best, token))
+
+
+async def _learn_implicit(chat_id, query, best, token):
+    """If nobody rejects the top result within 3 minutes, treat it as accepted.
+
+    This is implicit feedback - the same idea as a search engine treating a click
+    as a signal. It lets the ranker learn from normal use instead of requiring a
+    button tap every time.
+    """
+    try:
+        await asyncio.sleep(180)
+        ctx = learn.get_pending(token)
+        if not ctx or ctx.get("implicit"):
+            return
+        learn.record(chat_id, query, best, True, source="implicit")
+        ranker.observe(best, True)
+        try:
+            ctx["implicit"] = True
+        except Exception:
+            pass
+        await _flush()
+    except Exception as e:
+        log.info("implicit learning skipped: %s", e)
 
 
 async def _autodelete_close_matches(chat_id, message_id, token):
@@ -789,6 +842,9 @@ async def _list_like(intent, chat, msg, query):
     chat_id = chat.get("id")
     files = db.list_files(chat_id=chat_id)
     ext = _ext_filter(query)
+    cat = _category_filter(query)
+    if cat:
+        files = [f for f in files if categorize.classify(f.get("name") or "")[0] == cat]
     if intent == "count":
         n = len([f for f in files if not ext or f.get("ext") in ext])
         label = f" matching {', '.join(sorted(ext))}" if ext else ""
@@ -811,6 +867,27 @@ async def _list_like(intent, chat, msg, query):
         lines.append(f"…and {len(sel) - 30} more.")
     await _send("\n".join(lines)[:telegram.MAX_MESSAGE], chat_id,
                 reply_to=msg.get("message_id"))
+
+
+_CAT_WORDS = {"app": "app", "apps": "app", "apks": "app", "application": "app",
+              "game": "game", "games": "game", "gaming": "game",
+              "mod": "mod", "mods": "mod", "modded": "mod",
+              "ebook": "ebook", "ebooks": "ebook", "book": "ebook", "books": "ebook",
+              "movie": "movie", "movies": "movie", "film": "movie", "films": "movie",
+              "music": "music", "song": "music", "songs": "music", "audio": "music",
+              "archive": "archive", "archives": "archive",
+              "document": "document", "documents": "document", "docs": "document",
+              "image": "image", "images": "image", "photo": "image", "photos": "image"}
+
+
+def _category_filter(query):
+    # NOTE: not tokens() - that drops file-type words on purpose, which would
+    # throw away exactly the words we are looking for here.
+    for w in re.findall(r"[a-z]+", (query or "").lower()):
+        cat = _CAT_WORDS.get(w)
+        if cat:
+            return cat
+    return None
 
 
 def _ext_filter(query):

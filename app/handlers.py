@@ -15,7 +15,8 @@ import asyncio
 import logging
 import re
 
-from . import agent, approval, db, federation, indexer, rose, telegram
+from . import (agent, approval, db, extras, federation, indexer, rose,
+               security, telegram)
 
 log = logging.getLogger("handlers")
 
@@ -233,9 +234,33 @@ async def _handle_approval(cq):
 
 async def _handle_callback(cq):
     data = cq.get("data") or ""
+
+    # CAPTCHA button - pressed by the JOINER, not the owner, so it must be handled
+    # before anything owner-gated.
+    if data.startswith("cap:"):
+        uid = data[4:]
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        presser = (cq.get("from") or {}).get("id")
+        if str(presser) != str(uid):
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "That button isn't for you.", True)
+            return
+        ok = await security.verify_captcha(chat.get("id"), uid)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                "Verified ✅ welcome!" if ok else "Already verified.")
+        if ok and m.get("message_id"):
+            try:
+                await asyncio.to_thread(telegram.delete_message,
+                                        chat.get("id"), m.get("message_id"))
+            except Exception:
+                pass
+        return
+
     if data.startswith("ap|"):
         await _handle_approval(cq)
         return
+
     if not data.startswith("fb|"):
         return
     parts = data.split("|")
@@ -388,6 +413,35 @@ async def handle_update(update):
             except Exception as e:
                 log.info("auto banlist import failed: %s", e)
 
+        # anti-spam: blocked words and message floods
+        try:
+            if await security.check_blocklist(chat, msg, frm):
+                return
+            if await security.check_flood(chat, msg, frm):
+                return
+        except Exception as e:
+            log.info("antispam check failed: %s", e)
+
+        # live mirror: copy every new message to the configured destination
+        try:
+            mir = db.get_mirror_for_chat(chat.get("id"))
+            if mir and str(mir.get("dst")) != str(chat.get("id")):
+                if not (text or "").lower().startswith("/dump"):
+                    try:
+                        # forward, so the destination keeps the original author
+                        await asyncio.to_thread(telegram.forward_message,
+                                                from_chat_id=chat.get("id"),
+                                                message_id=msg.get("message_id"),
+                                                chat_id=mir.get("dst"))
+                    except Exception:
+                        await asyncio.to_thread(telegram.copy_message,
+                                                from_chat_id=chat.get("id"),
+                                                message_id=msg.get("message_id"),
+                                                chat_id=mir.get("dst"))
+                    db.bump_mirror(chat.get("id"))
+        except Exception as e:
+            log.info("live mirror copy failed: %s", e)
+
         if str(db.get_settings().get("index_live") or "1") == "1":
             try:
                 indexer.capture_from_message(chat, msg)
@@ -395,12 +449,26 @@ async def handle_update(update):
             except Exception as e:
                 log.warning("live index failed: %s", e)
 
+        # ported features: global bans, member tracking, AFK, filters
+        try:
+            if await extras.enforce_gban(chat, msg, frm):
+                return
+            extras.track_member(chat.get("id"), frm)
+            if await extras.afk_watch(chat, msg, frm):
+                return
+            if not text.startswith("/") and await extras.run_filters(chat, msg, frm):
+                return
+        except Exception as e:
+            log.info("extras watch failed: %s", e)
+
         # Rose-style commands need NO wake word - that's what makes it behave
         # like a normal group-management bot in every approved chat.
         if ctype in ("group", "supergroup") and text.startswith("/"):
             parts = text.split(None, 1)
             cmd = parts[0].lstrip("/").split("@")[0].lower()
             args = parts[1] if len(parts) > 1 else ""
+            if extras.is_disabled(chat.get("id"), cmd):
+                return                      # /disable'd by an admin
             if await rose.handle_command(chat, msg, frm, cmd, args):
                 return
             try:                       # /scan, /find, /list, /stats still work
@@ -416,6 +484,15 @@ async def handle_update(update):
                 await rose.welcome_new(chat, msg, members)
             except Exception as e:
                 log.warning("welcome failed: %s", e)
+            # CAPTCHA: mute the joiner and ask them to tap a button
+            for mbr in members:
+                if mbr.get("is_bot"):
+                    continue
+                try:
+                    if await security.start_captcha(chat, msg, mbr):
+                        security.mark_pending(chat.get("id"), mbr.get("id"), True)
+                except Exception as e:
+                    log.warning("captcha failed: %s", e)
 
         if ctype in ("group", "supergroup") and text and is_addressed(msg, text):
             clean = strip_address(text) or text

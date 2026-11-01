@@ -7,7 +7,7 @@ the real state of each layer.
 import logging
 import math
 
-from . import db, embed, learn, llm, ranker
+from . import categorize, db, embed, learn, llm, nn, ranker
 
 log = logging.getLogger("ml")
 
@@ -33,17 +33,24 @@ def status(chat_id=None):
     model = ranker._model()
     return {
         "embed_on": embed.enabled(),
+        "embed_source": embed.source(),
+        "embed_desc": embed.describe(),
         "embed_model": (db.get_settings().get("gemini_embed_model")
                         or db.get_settings().get("openai_embed_model")
                         or "text-embedding-004"),
         "embed_cached": len(getattr(embed, "_cache", {}) or {}),
-        "ranker_trained": bool(model),
+        "ranker_trained": bool(model) and not ranker.is_prior(),
+        "ranker_prior": ranker.is_prior(),
         "ranker_rows": len(rows),
         "ranker_needs": ranker.MIN_ROWS,
         "ranker_weights": (model or {}).get("w"),
         "learn": st if isinstance(st, dict) else {},
         "memory": db.count_memory(),
         "brain": llm.describe(),
+        "intent_net": nn.describe(),
+        "intent_net_on": nn.available(),
+        "category_net": categorize.describe(),
+        "category_net_on": categorize.available(),
     }
 
 

@@ -24,13 +24,19 @@
   <p class="small muted">Get <code>api_id</code> / <code>api_hash</code> from
   <a href="https://my.telegram.org" target="_blank">my.telegram.org → API development tools</a>.
   Telegram sends the login code <b>inside the app</b> (the “Telegram” service chat), not by SMS.</p>
+  <div class="small" style="margin:10px 0 14px;line-height:1.8">
+    Saved on this server:
+    <b>api_id</b> {{ "✅ " ~ s.tg_api_id if s.tg_api_id else "❌ missing" }} ·
+    <b>api_hash</b> {{ "✅ saved" if s.tg_api_hash else "❌ missing" }} ·
+    <b>phone</b> {{ "✅ " ~ s.tg_phone if s.tg_phone else "❌ missing" }}
+  </div>
   <form method="post" action="/userbot/start">
     <div class="row" style="gap:16px">
-      <div style="flex:1;min-width:160px"><label>API ID</label><input name="api_id" value="{{ s.tg_api_id }}"></div>
-      <div style="flex:1;min-width:200px"><label>API hash</label><input name="api_hash"></div>
+      <div style="flex:1;min-width:160px"><label>API ID</label><input name="api_id" value="{{ s.tg_api_id }}" placeholder="12345678"></div>
+      <div style="flex:1;min-width:200px"><label>API hash</label><input name="api_hash" placeholder="{{ 'saved - leave blank to keep' if s.tg_api_hash else '32 characters from my.telegram.org' }}"></div>
     </div>
     <label>Phone (with country code)</label>
-    <input name="phone" placeholder="+919876543210">
+    <input name="phone" value="{{ s.tg_phone }}" placeholder="+919876543210">
     <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
       <button type="submit">Send code</button>
       <button type="submit" name="force_sms" value="1" class="bad">Send by SMS instead</button>
@@ -40,6 +46,29 @@
       <b>SMS</b> — use it if the in-app code never appears.
     </div>
   </form>
+</div>
+
+<div class="card">
+  <h2>Fastest fix: paste a session string</h2>
+  <p class="small muted">
+    If Telegram won't send a code to this server (common on Render and other
+    datacenters), log in <b>once on your own computer</b> and paste the result here.
+    The server then never performs a login at all.
+  </p>
+  <ol class="small" style="line-height:1.7;padding-left:18px">
+    <li>Download the project and run <code>pip install telethon</code></li>
+    <li>Run <code>python userbot_login.py</code></li>
+    <li>Enter your api_id, api_hash, phone and the code — it arrives normally there</li>
+    <li>Copy the long string it prints and paste it below</li>
+  </ol>
+  <form method="post" action="/userbot/session">
+    <label>Session string</label>
+    <input name="tg_session" placeholder="1BVtsOK4..." style="font-family:monospace">
+    <div style="margin-top:12px"><button type="submit">Save session</button></div>
+  </form>
+  <p class="small muted" style="margin-top:8px">
+    Treat it like your password — it is a full login to your account.
+  </p>
 </div>
 
 <div class="card">

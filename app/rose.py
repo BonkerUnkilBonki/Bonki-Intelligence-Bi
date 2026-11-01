@@ -24,7 +24,8 @@ import re
 import tempfile
 import time
 
-from . import analytics, db, federation, memory, ml, skills, stickers, telegram
+from . import (analytics, ask, categorize, db, embed, extras, federation, memory,
+               ml, security, skills, stickers, telegram)
 
 log = logging.getLogger("rose")
 
@@ -910,6 +911,202 @@ async def cmd_decisions(chat, msg, user, args):
 
 
 # -------------------------------------------------------------------- ML -----
+# ------------------------------------------------------ anti-spam commands ---
+async def cmd_captcha(chat, msg, user, args):
+    """Mute new joiners until they tap a verify button."""
+    if not await _need_admin(chat, msg, user):
+        return
+    arg = (args or "").strip().lower()
+    if arg not in ("on", "off", ""):
+        return await _reply(chat, msg, "Usage: <code>/captcha on</code> or <code>off</code>")
+    if arg in ("on", "off"):
+        db.set_chatconf(chat.get("id"), {"captcha": arg == "on"})
+        await asyncio.to_thread(db.flush, True)
+        if arg == "on":
+            return await _reply(chat, msg,
+                                "🛡 <b>CAPTCHA on.</b> New members are muted until they "
+                                "tap the verify button, and kicked if they never do "
+                                f"({security.CAPTCHA_TIMEOUT // 60} min).\n"
+                                "<i>I need 'restrict members' + 'ban users' rights.</i>")
+        return await _reply(chat, msg, "🛡 CAPTCHA off.")
+    on = bool((db.get_chatconf(chat.get("id")) or {}).get("captcha"))
+    await _reply(chat, msg, f"🛡 CAPTCHA is {'<b>on</b>' if on else 'off'} here.")
+
+
+async def cmd_addblocklist(chat, msg, user, args):
+    return await _blocklist_do(chat, msg, user, "add", args)
+
+
+async def cmd_rmblocklist(chat, msg, user, args):
+    return await _blocklist_do(chat, msg, user, "rm", args)
+
+
+async def cmd_blocklist(chat, msg, user, args):
+    return await _blocklist_do(chat, msg, user, "", args)
+
+
+async def _blocklist_do(chat, msg, user, forced, args):
+    """Blocked words. Admins are exempt."""
+    if not await _need_admin(chat, msg, user):
+        return
+    cid = chat.get("id")
+    words = list((db.get_chatconf(cid) or {}).get("blocklist") or [])
+    arg = (args or "").strip()
+    low = arg.lower()
+
+    if forced:                      # /addblocklist <word>  /rmblocklist <word>
+        action, rest = forced, arg
+    elif low.startswith(("add ", "rm ", "remove ", "del ")):
+        action, _, rest = low.partition(" ")
+    else:
+        action, rest = "", ""
+    rest = rest.strip().strip('"')
+    if action:
+        word = rest.lower()
+        if not word:
+            return await _reply(chat, msg, "Which word? <code>/addblocklist badword</code>")
+        if action == "add":
+            if word in words:
+                return await _reply(chat, msg, "Already blocked.")
+            words.append(word)
+            db.set_chatconf(cid, {"blocklist": words})
+            await asyncio.to_thread(db.flush, True)
+            return await _reply(chat, msg, f"🚫 Blocked <code>{telegram.esc(word)}</code>.")
+        if word not in words:
+            return await _reply(chat, msg, "That word isn't blocked.")
+        words.remove(word)
+        db.set_chatconf(cid, {"blocklist": words})
+        await asyncio.to_thread(db.flush, True)
+        return await _reply(chat, msg, f"✅ Unblocked <code>{telegram.esc(word)}</code>.")
+
+    if low.startswith("mode"):
+        mode = arg[4:].strip() or "delete"
+        db.set_chatconf(cid, {"blocklist_mode": mode})
+        return await _reply(chat, msg, f"Action on a blocked word: <b>{telegram.esc(mode)}</b>")
+
+    if not words:
+        return await _reply(chat, msg,
+                            "No blocked words.\n"
+                            "<code>/addblocklist badword</code> · "
+                            "<code>/rmblocklist badword</code>")
+    await _reply(chat, msg, "🚫 <b>Blocked words</b>\n" +
+                 "\n".join(f"• <code>{telegram.esc(w)}</code>" for w in words[:40]))
+
+
+async def cmd_flood(chat, msg, user, args):
+    """Mute someone sending N messages inside T seconds."""
+    if not await _need_admin(chat, msg, user):
+        return
+    cid = chat.get("id")
+    conf = db.get_chatconf(cid) or {}
+    arg = (args or "").strip().lower()
+
+    if arg.startswith("off"):
+        db.set_chatconf(cid, {"flood_limit": 0})
+        return await _reply(chat, msg, "🌊 Antiflood off.")
+
+    parts = arg.split()
+    if parts and parts[0].isdigit():
+        limit = max(2, min(int(parts[0]), 50))
+        window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+        window = max(1, min(window, 120))
+        db.set_chatconf(cid, {"flood_limit": limit, "flood_window": window})
+        await asyncio.to_thread(db.flush, True)
+        return await _reply(chat, msg,
+                            f"🌊 Antiflood on: <b>{limit}</b> messages in "
+                            f"<b>{window}s</b> → mute for "
+                            f"{conf.get('flood_mute_minutes') or 10}m.")
+
+    limit = int(conf.get("flood_limit") or 0)
+    if not limit:
+        return await _reply(chat, msg,
+                            "🌊 Antiflood is off.\n"
+                            "<code>/setflood 5 10</code> — 5 messages in 10s.\n"
+                            "<code>/setflood off</code>")
+    await _reply(chat, msg,
+                 f"🌊 Antiflood: <b>{limit}</b> messages in "
+                 f"<b>{conf.get('flood_window') or 10}s</b> → mute "
+                 f"{conf.get('flood_mute_minutes') or 10}m.")
+
+
+async def cmd_ask(chat, msg, user, args):
+    """Answer a question from this group's own stored facts."""
+    q = (args or "").strip()
+    if not q:
+        return await _reply(chat, msg,
+                            "Ask me something about this group:\n"
+                            "<code>/ask who shares the most</code>\n"
+                            "<code>/ask how many files</code>\n"
+                            "<code>/ask what did we decide</code>\n"
+                            "<code>/ask latest file</code>")
+    try:
+        text, src = await ask.answer(q, chat.get("id"))
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+    note = ""
+    if src == "local":
+        note = "\n\n<i>answered from what I have stored — no model, no guessing</i>"
+    elif src == "empty":
+        note = ""
+    await _reply(chat, msg, (text + note)[:telegram.MAX_MESSAGE])
+
+
+async def cmd_dupes(chat, msg, user, args):
+    """Find near-duplicate files using local embeddings (no API)."""
+    cid = chat.get("id")
+    files = db.list_files(chat_id=cid)
+    if len(files) < 2:
+        return await _reply(chat, msg, "I need at least two files here to compare.")
+    texts = [f"{f.get('name') or ''} {f.get('caption') or ''}".strip() for f in files]
+    try:
+        vecs = await asyncio.to_thread(embed.embed_many, texts)
+    except Exception as e:
+        return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+    if not vecs:
+        return await _reply(chat, msg, "Embeddings unavailable.")
+
+    def cos(a, b):
+        n = min(len(a), len(b))
+        if not n:
+            return 0.0
+        dot = sum(a[i] * b[i] for i in range(n))
+        na = sum(x * x for x in a[:n]) ** 0.5
+        nb = sum(x * x for x in b[:n]) ** 0.5
+        return dot / (na * nb) if na and nb else 0.0
+
+    used, groups = set(), []
+    for i, f in enumerate(files):
+        if i in used:
+            continue
+        vi = vecs.get(texts[i])
+        if not vi:
+            continue
+        group = [f]
+        for j in range(i + 1, len(files)):
+            if j in used:
+                continue
+            vj = vecs.get(texts[j])
+            # 0.85 separates real duplicates (same app, different version ~0.93)
+            # from merely related apps (~0.43), measured on real names
+            if vj and cos(vi, vj) >= 0.85:
+                group.append(files[j])
+                used.add(j)
+        if len(group) > 1:
+            used.add(i)
+            groups.append(group)
+    if not groups:
+        return await _reply(chat, msg, "✅ No near-duplicates found.")
+    lines = [f"🧬 <b>{len(groups)} duplicate group(s)</b>"]
+    for g in groups[:10]:
+        lines.append("")
+        lines.append(" · ".join(f"<b>{telegram.esc((x.get('name') or '')[:34])}</b>"
+                                for x in g[:4]))
+    lines.append("")
+    lines.append("<i>Matched on meaning with local embeddings — same app, different "
+                 "versions usually cluster together.</i>")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+
 async def cmd_ml(chat, msg, user, args):
     """Show the ML layers and, for a query, the real component scores."""
     cid = chat.get("id")
@@ -920,19 +1117,32 @@ async def cmd_ml(chat, msg, user, args):
 
     ls = st.get("learn") or {}
     lines = ["🧠 <b>Machine learning — live status</b>", ""]
-    lines.append(f"<b>Brain</b>: {telegram.esc(st.get('brain') or 'off')}")
-    if st.get("embed_on"):
-        lines.append(f"<b>Embeddings (deep learning)</b>: ✅ {telegram.esc(st.get('embed_model'))}"
-                     f" · {st.get('embed_cached')} vectors cached")
+    lines.append(f"<b>Brain (LLM)</b>: {telegram.esc(st.get('brain') or 'off')}")
+    if st.get("intent_net_on"):
+        lines.append(f"<b>Intent net</b>: ✅ {telegram.esc(st.get('intent_net') or '')}"
+                     f" · no API needed")
     else:
-        lines.append("<b>Embeddings (deep learning)</b>: ❌ off — add GEMINI_API_KEY or "
-                     "OPENAI_API_KEY to switch it on")
+        lines.append("<b>Intent net</b>: ❌ numpy missing")
+    if st.get("category_net_on"):
+        lines.append(f"<b>Category net</b>: ✅ {telegram.esc(st.get('category_net') or '')}"
+                     f" · no API needed")
+    if st.get("embed_source") == "api":
+        lines.append(f"<b>Embeddings</b>: ✅ pretrained transformer (API) · "
+                     f"{st.get('embed_cached')} vectors cached")
+    elif st.get("embed_on"):
+        lines.append(f"<b>Embeddings</b>: ✅ <b>local</b> — {telegram.esc(st.get('embed_desc') or '')}"
+                     f" · no API needed")
+    else:
+        lines.append("<b>Embeddings</b>: ❌ numpy missing")
     if st.get("ranker_trained"):
-        lines.append(f"<b>Learned ranker</b>: ✅ logistic regression trained on "
-                     f"{st.get('ranker_rows')} examples")
+        lines.append(f"<b>Learned ranker</b>: ✅ trained on {st.get('ranker_rows')} examples")
+    elif st.get("ranker_prior"):
+        lines.append(f"<b>Learned ranker</b>: ✅ on with default weights — "
+                     f"learns after {st.get('ranker_needs')} taps "
+                     f"({st.get('ranker_rows')} so far)")
     else:
         lines.append(f"<b>Learned ranker</b>: ⏳ {st.get('ranker_rows')}/"
-                     f"{st.get('ranker_needs')} examples — tap a result button to feed it")
+                     f"{st.get('ranker_needs')} examples")
     lines.append(f"<b>Feedback learned from</b>: {ls.get('examples', 0)} "
                  f"({ls.get('positive', 0)} ✅ / {ls.get('negative', 0)} ❌) · "
                  f"associations {ls.get('associations', 0)} · vocab {ls.get('vocab', 0)}")
@@ -1032,18 +1242,17 @@ async def cmd_spurge(chat, msg, user, args):
 
 
 async def cmd_dump(chat, msg, user, args):
-    """Owner only: copy messages from THIS chat into another chat.
+    """Copy messages from THIS chat to another - once, or live forever.
 
-    It does not depend on the index. Telegram gives bots no way to *list* history,
-    but a bot that is a member of a chat can copy a message if it knows the id -
-    and message ids are sequential. So we walk the ids backwards from the command
-    message and copy every one that still exists, skipping the gaps (deleted
-    messages, service messages, ids that were never ours to read).
+    Telegram gives bots no way to *list* history, but a bot that is a member can
+    copy a message when it knows the id, and ids are sequential. So a one-off dump
+    walks the ids backwards; a live mirror instead copies every new message as it
+    arrives.
 
-    Usage:
-        /dump @target           last 100 messages
-        /dump @target 500       last 500 (max 500)
-        /dump -1001234567890    by numeric id
+        /dump @target          copy the last 100 messages
+        /dump @target 500      the last 500 (max 500 per run)
+        /dump @target live     mirror every new message from now on
+        /dump off              stop mirroring
     """
     from . import approval
     if not approval.is_owner((user or {}).get("id")):
@@ -1051,19 +1260,43 @@ async def cmd_dump(chat, msg, user, args):
                                        "between chats, so it needs the bot owner.")
 
     parts = (args or "").split()
-    if not parts:
+    src = chat.get("id")
+
+    if not parts or parts[0].lower() in ("off", "stop", "status"):
+        mir = db.get_mirror_for_chat(src)
+        if parts and parts[0].lower() in ("off", "stop"):
+            if mir and db.remove_mirror(src):
+                return await _reply(chat, msg, "⏹ Live mirror stopped.")
+            return await _reply(chat, msg, "No live mirror is running here.")
+        state = (f"running → <code>{telegram.esc(mir['dst'])}</code> "
+                 f"({mir.get('sent', 0)} copied)" if mir else "off")
         return await _reply(
             chat, msg,
-            "Usage: <code>/dump @targetchat [count]</code>\n\n"
-            "Type it in the <b>source</b> chat; the argument is the "
-            "<b>destination</b>. I copy messages from here to there — I don't need "
-            "anything indexed.\n"
-            "Default 100 messages, max 500 per run.")
+            f"📦 <b>Dump</b>\n• live mirror: {state}\n\n"
+            "Usage:\n"
+            "<code>/dump @target</code> — copy the last 100 messages\n"
+            "<code>/dump @target 500</code> — last 500\n"
+            "<code>/dump @target live</code> — keep copying every new message\n"
+            "<code>/dump off</code> — stop the live mirror")
 
     target = parts[0]
+    mode = parts[1].lower() if len(parts) > 1 else ""
+
+    if mode in ("live", "on", "watch", "auto"):
+        db.set_mirror(src, target, by=str((user or {}).get("id")))
+        await asyncio.to_thread(db.flush, True)
+        return await _reply(
+            chat, msg,
+            f"🔁 <b>Live mirror on</b>\n"
+            f"Every new message here is copied to "
+            f"<code>{telegram.esc(target)}</code>.\n\n"
+            f"Stop it with <code>/dump off</code>.\n"
+            f"<i>Messages posted before now are not included — run "
+            f"<code>/dump {telegram.esc(target)} 500</code> to backfill.</i>")
+
     count = 100
-    if len(parts) > 1 and parts[1].isdigit():
-        count = max(1, min(int(parts[1]), 500))
+    if mode.isdigit():
+        count = max(1, min(int(mode), 500))
 
     end_id = int(msg.get("message_id") or 0)
     if not end_id:
@@ -1081,33 +1314,36 @@ async def cmd_dump(chat, msg, user, args):
         if mid == end_id:                      # don't copy the /dump command itself
             continue
         try:
-            await asyncio.to_thread(telegram.copy_message,
-                                    from_chat_id=chat.get("id"),
-                                    message_id=mid, chat_id=target)
+            # forward keeps "Forwarded from <original>", so the archive shows who
+            # really posted it instead of re-authoring everything as the bot
+            await asyncio.to_thread(telegram.forward_message,
+                                    from_chat_id=src, message_id=mid, chat_id=target)
             copied += 1
         except Exception as e:
             text = str(e).lower()
-            # a missing id is normal - deleted or never existed
             if "not found" in text or "message_id_invalid" in text:
                 skipped += 1
             else:
-                blocked += 1
-                if blocked <= 3:
-                    log.warning("dump %s failed: %s", mid, e)
+                # protected content can't be forwarded - copy it instead
+                try:
+                    await asyncio.to_thread(telegram.copy_message,
+                                            from_chat_id=src, message_id=mid,
+                                            chat_id=target)
+                    copied += 1
+                except Exception as e2:
+                    blocked += 1
+                    if blocked <= 3:
+                        log.warning("dump %s failed: %s / %s", mid, e, e2)
         await asyncio.sleep(0.35)
 
-    note = f"✅ Copied <b>{copied}</b> message(s) to {telegram.esc(target)}"
+    note = f"✅ Forwarded <b>{copied}</b> message(s) to {telegram.esc(target)}"
     if skipped:
         note += f"\n• {skipped} id(s) had no message (deleted or empty)"
     if blocked:
         note += (f"\n• {blocked} failed — am I an admin in the destination, and "
                  f"can I read this chat?")
-    if end_id - count + 1 < 1 and start_id == 1:
-        note += "\n<i>Reached the start of the chat.</i>"
-    else:
-        note += (f"\n<i>Older messages? Run again with a higher count, e.g. "
-                 f"<code>/dump {telegram.esc(target)} 500</code> — Telegram caps a "
-                 f"bot at 500 per run.</i>")
+    note += (f"\n\n<i>Want the rest, and everything new? "
+             f"<code>/dump {telegram.esc(target)} live</code> keeps going.</i>")
     await _reply(chat, msg, note)
 
 
@@ -1207,11 +1443,12 @@ FULL_HELP = (
     "\n• /channelstat &lt;@chat&gt; — analytics card from my own data"
     "\n• /catalog — every chat I am in, ranked by activity"
     "\n• /ml [query] — see the ML layers and the real score breakdown"
+    "\n• /dupes — near-duplicate files, found with local embeddings"
     "\n• /skill — scheduled tasks (daily/weekly/in 2h)"
     "\n• /decide &lt;text&gt; · /decisions — remember what the group decided"
     "\n• /knowledge &lt;query&gt; — search what I have learned"
     "\n• /spurge — purge with no confirmation message"
-    "\n• /dump &lt;@chat&gt; [count] — copy messages from here to there (owner)"
+    "\n• /dump &lt;@chat&gt; [count|live] — copy messages, or mirror live (owner)"
     "\n• /joinfed &lt;id&gt; @a @b — attach several chats at once"
     "\n• /fedauto on|off — auto-attach every new chat to one fed"
     "\n• /fbanlist csv|json · /importfbans — Rose-compatible export/import"
@@ -1294,6 +1531,24 @@ COMMANDS = {
     "skill": cmd_skill, "skills": cmd_skill,
     "decide": cmd_decide, "decisions": cmd_decisions,
     "ml": cmd_ml, "mlstatus": cmd_ml, "brain": cmd_ml,
+    "dupes": cmd_dupes, "duplicates": cmd_dupes,
+    "ask": cmd_ask, "q": cmd_ask, "qa": cmd_ask,
+    "captcha": cmd_captcha,
+    "filter": extras.cmd_filter, "stop": extras.cmd_stop,
+    "stopall": extras.cmd_stop, "filters": extras.cmd_filters,
+    "afk": extras.cmd_afk,
+    "tagall": extras.cmd_tagall, "utagall": extras.cmd_utagall,
+    "disable": extras.cmd_disable, "enable": extras.cmd_enable,
+    "disabled": extras.cmd_disabled,
+    "ping": extras.cmd_ping,
+    "promote": extras.cmd_promote, "demote": extras.cmd_demote,
+    "settitle": extras.cmd_settitle, "setdesc": extras.cmd_setdesc,
+    "gban": extras.cmd_gban, "ungban": extras.cmd_ungban,
+    "gbanlist": extras.cmd_gbanlist,
+    "export": extras.cmd_export, "import": extras.cmd_import,
+    "addblocklist": cmd_addblocklist, "rmblocklist": cmd_rmblocklist,
+    "blocklist": cmd_blocklist, "blocklists": cmd_blocklist,
+    "setflood": cmd_flood, "flood": cmd_flood,
     "spurge": cmd_spurge, "silentpurge": cmd_spurge,
     "dump": cmd_dump, "knowledge": cmd_knowledge, "memory": cmd_knowledge,
 }

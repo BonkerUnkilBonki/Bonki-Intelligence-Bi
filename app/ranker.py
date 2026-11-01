@@ -30,7 +30,7 @@ except Exception:                                    # pragma: no cover
     np = None
 
 FEATURES = ("base", "recency", "name_len", "caption_hit", "query_len", "shared_before")
-MIN_ROWS = 40
+MIN_ROWS = 12
 _EXT_WEIGHT = 0.45
 
 
@@ -54,17 +54,32 @@ def features(query, f, base_score=0.0, share_count=0):
     ]
 
 
+# A sensible starting model so the ranker is ON from the first search. These are
+# hand-set priors, not learned - real training replaces them after MIN_ROWS taps.
+PRIOR = {"w": [2.2, 0.25, 0.10, 1.10, 0.05, 0.10], "b": 0.0,
+         "mu": [0.55, 0.50, 0.45, 0.30, 0.40, 0.10],
+         "sd": [0.30, 0.28, 0.22, 0.45, 0.20, 0.18],
+         "n": 0, "prior": True}
+
+
 def _model():
     raw = db.get_settings().get("ranker_model") or ""
     if not raw:
-        return None
+        return dict(PRIOR)
     try:
-        return json.loads(raw)
+        m = json.loads(raw)
+        m.setdefault("prior", False)
+        return m
     except Exception:
-        return None
+        return dict(PRIOR)
+
+
+def is_prior():
+    return bool((_model() or {}).get("prior"))
 
 
 def trained():
+    """True once the model can score - the prior counts, so this is on by default."""
     return np is not None and _model() is not None
 
 
@@ -122,14 +137,15 @@ def rerank(ranked):
     """Blend the learned probability into an already-ranked candidate list."""
     if not trained() or not ranked:
         return ranked
+    # the hand-set prior nudges gently; a trained model is trusted more
+    weight = 0.20 if is_prior() else _EXT_WEIGHT
     out = []
     for base, f in ranked:
         p = score(f.get("_feat") or features("", f, base))
         if p is None:
             out.append((base, f))
         else:
-            # keep the text score dominant until the model has real evidence
-            out.append((base * (1 - _EXT_WEIGHT) + p * _EXT_WEIGHT, f))
+            out.append((base * (1 - weight) + p * weight, f))
     out.sort(key=lambda x: (-x[0], -(x[1].get("date") or 0)))
     return out
 

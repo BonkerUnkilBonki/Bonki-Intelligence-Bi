@@ -115,6 +115,20 @@ def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
     return r.json()
 
 
+def forward_message(from_chat_id, message_id, chat_id, thread_id=None, silent=False):
+    """Forward a message, KEEPING the original sender's "Forwarded from" header.
+
+    copyMessage re-authors the message as the bot; forwardMessage preserves who
+    actually posted it. For an archive/mirror you want the attribution, so this is
+    the right call - with copy as the fallback for protected content.
+    """
+    data = {"chat_id": chat_id, "from_chat_id": from_chat_id,
+            "message_id": message_id, "disable_notification": bool(silent)}
+    if thread_id:
+        data["message_thread_id"] = thread_id
+    return _post("forwardMessage", data)
+
+
 def copy_message(from_chat_id, message_id, chat_id, caption=None, reply_to=None,
                  thread_id=None, silent=False):
     """Copy a message server-side (no 'Forwarded from' header, no re-upload)."""
@@ -202,6 +216,34 @@ def restrict_chat_member(chat_id, user_id, mute=True, until_date=None):
     if until_date:
         data["until_date"] = int(until_date)
     return _post("restrictChatMember", data)
+
+
+def promote_chat_member(chat_id, user_id, rights=None):
+    """Give a member admin rights (a sensible default set if none given)."""
+    r = rights or {"can_change_info": True, "can_delete_messages": True,
+                   "can_invite_users": True, "can_restrict_members": True,
+                   "can_pin_messages": True, "can_manage_video_chats": True,
+                   "can_promote_members": False}
+    data = {"chat_id": chat_id, "user_id": user_id}
+    data.update({k: bool(v) for k, v in r.items()})
+    return _post("promoteChatMember", data)
+
+
+def demote_chat_member(chat_id, user_id):
+    data = {"chat_id": chat_id, "user_id": user_id}
+    for k in ("can_change_info", "can_delete_messages", "can_invite_users",
+              "can_restrict_members", "can_pin_messages", "can_manage_video_chats",
+              "can_promote_members"):
+        data[k] = False
+    return _post("promoteChatMember", data)
+
+
+def set_chat_title(chat_id, title):
+    return _post("setChatTitle", {"chat_id": chat_id, "title": title})
+
+
+def set_chat_description(chat_id, description):
+    return _post("setChatDescription", {"chat_id": chat_id, "description": description})
 
 
 def pin_chat_message(chat_id, message_id, notify=False):

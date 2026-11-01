@@ -19,7 +19,7 @@ import hashlib
 import logging
 import math
 
-from . import db, llm
+from . import db, llm, localvec
 
 log = logging.getLogger("embed")
 
@@ -29,7 +29,23 @@ _MAX_CACHE = 4000
 
 
 def enabled():
-    return llm.enabled()
+    """Always true: local vectors need no key. API embeddings are an upgrade."""
+    return localvec.available() or llm.enabled()
+
+
+def source():
+    """Which embedding engine is actually in use."""
+    if llm.enabled():
+        return "api"
+    return "local" if localvec.available() else "off"
+
+
+def describe():
+    if llm.enabled():
+        return "pretrained transformer (API)"
+    if localvec.available():
+        return localvec.describe()
+    return "off"
 
 
 def _key(text):
@@ -53,10 +69,24 @@ def embed_many(texts):
             todo.append(t)
     if not todo:
         return out
-    vecs = llm.embed(todo)
-    if not vecs:
-        return out
-    for text, vec in zip(todo, vecs):
+
+    vecs = None
+    if llm.enabled():                      # prefer a real pretrained model
+        try:
+            vecs = llm.embed(todo)
+        except Exception as e:
+            log.info("api embeddings failed, using local vectors: %s", e)
+    if vecs:
+        for text, vec in zip(todo, vecs):
+            if vec:
+                _remember(_key(text), vec)
+                out[text] = vec
+        if out:
+            return out
+
+    # local fallback - no key, no download, learned from this corpus
+    local = localvec.embed_many(todo, corpus=texts)
+    for text, vec in (local or {}).items():
         if vec:
             _remember(_key(text), vec)
             out[text] = vec

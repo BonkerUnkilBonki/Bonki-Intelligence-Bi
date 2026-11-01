@@ -81,6 +81,7 @@ DEFAULT_SETTINGS = {
     # ---- user account (MTProto) - for reading history a bot can't ----
     "tg_api_id": "",
     "tg_api_hash": "",
+    "tg_phone": "",
     "tg_session": "",
     "userbot_last_error": "",
 
