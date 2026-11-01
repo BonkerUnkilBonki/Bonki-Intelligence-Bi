@@ -86,6 +86,12 @@ group 3 times" stays a scan.
 > obeys the `retry_after` and continues instead of giving up — so `/tag @user 69`
 > genuinely delivers 69 messages, in about 3–4 minutes.
 
+### Bonk aliases (from UnkilBonker)
+
+```
+/bonk  = /ban      /fbonk = /fban      /bonki = /warn
+```
+
 ### Ported from BonkBot
 
 Bonki absorbed the features from the earlier BonkBot project that it did **not**
@@ -95,11 +101,24 @@ already have. Everything below is new here; nothing was duplicated.
 |---|---|
 | `/filter hi Hello` · `/stop hi` · `/stopall` · `/filters` | Auto-replies on a trigger word. Supports `prefix:` and `exact:` modifiers, or reply to a message to use it as the reply |
 | `/afk eating` | Auto-replies when someone pings or replies to you, and clears itself when you return |
-| `/tagall hello` · `/utagall` | Mentions everyone who has spoken here (bots can't list members, so it can only tag people it has seen) |
+| `/tagall hello` · `/utagall` | Mentions **everyone** — including silent members — when `/userbot` is connected. Without it, admins + members seen speaking |
 | `/disable purge` · `/enable purge` · `/disabled` | Per-chat command toggles |
 | `/gban` · `/ungban` · `/gbanlist` | **Owner only** — ban across every chat Bonki is in, enforced on sight |
 | `/export` · `/import` | Move a chat's settings, notes and rules to another group as JSON |
 | `/promote` · `/demote` · `/settitle` · `/setdesc` · `/ping` | Admin conveniences |
+
+**How `/tagall` reaches everyone.** The Bot API has **no member-list method** —
+`getChatMembers` does not exist — so a bot alone can only reach admins (via
+`getChatAdministrators`) and people it has watched speak. `/tagall` therefore uses
+the best source available and tells you which one it used:
+
+| Source | Who gets mentioned |
+|---|---|
+| `/userbot` connected | **every member**, including those who never spoke (up to 1000) |
+| no user account | admins + members seen speaking |
+
+Bots are excluded, long lists are split across messages to stay under Telegram's
+4096-character limit, and there's a 60-second cooldown so it can't be used to spam.
 
 **Already present, so not ported:** moderation (ban/kick/mute/warn/purge/pin),
 locks, notes, rules, welcome, federations, captcha, blocklist, antiflood,
@@ -198,6 +217,43 @@ Requirements and caveats, stated plainly:
 - **Automating another bot may breach Rose's terms.** This is your account
   running your commands, and you carry that risk. Bonki relays her text reply
   verbatim rather than parsing it, so nothing is invented if she changes wording.
+
+### Full two-way sync with Rose (needs `/userbot`)
+
+With a user account connected, Bonki and a Rose federation share **one live ban
+list** in both directions:
+
+**Sync is ON by default — there is nothing to switch on.** As soon as a user
+account is connected, the loop runs every 5 minutes with no user action:
+
+- queued Bonki bans are pushed to Rose
+- Rose's ban list is pulled every 10 minutes and imported
+- a `/fban` pushes **immediately**, not on the next cycle
+
+```
+/fedsync                       status: on/off, queued, last pull
+/fedsync push                  force a push now
+/fedsync pull                  force a pull now
+/fedsync sub <rose_fed_id>     subscribe this fed to ANOTHER Rose fed
+/fedsync unsub <rose_fed_id>   unsubscribe
+/fedsync off                   stop (set "0"; on is the default)
+```
+
+What happens automatically:
+
+| Direction | Mechanism |
+|---|---|
+| **Bonki → Rose** | A `/fban` here is queued and pushed **immediately** to Rose as `/fban <id> <reason>` from your account |
+| **Rose → Bonki** | Bonki asks Rose for `/fbanlist json`, downloads the file she replies with, and imports it — on the 15-minute loop or on `/fedsync pull` |
+| **Enforcement** | An imported Rose ban is applied **the moment that user speaks** in any chat in your federation: banned and the message deleted |
+
+**Crossing between Rose federations** is `/fedsync sub <id>`, which drives Rose's
+own `/subfed`. Note what that does: it makes Rose enforce *their* bans, it does not
+merge the two ban lists.
+
+**The limit that remains:** all of this runs through your user account, because
+Telegram forbids bot-to-bot messages (`403`). If the account disconnects, syncing
+stops — `/fedsync` shows `user account: ❌ needed` when that happens.
 
 ### `/fedbridge` — the account-free bridge (both directions)
 

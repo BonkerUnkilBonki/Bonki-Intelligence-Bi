@@ -1523,6 +1523,8 @@ COMMANDS = {
     "setgoodbye": cmd_setgoodbye, "goodbye": cmd_goodbye,
     "id": cmd_id, "info": cmd_info, "admins": cmd_admins,
     "tag": cmd_tag, "help": cmd_help, "start": cmd_start,
+    # UnkilBonker flavour: /bonk = ban, /fbonk = fedban, /bonki = warn
+    "bonk": cmd_ban, "fbonk": federation.cmd_fban, "bonki": cmd_warn,
     "indexstatus": cmd_indexstatus,
     "groups": cmd_chats, "chats": cmd_chats, "channels": cmd_chats,
     "remember": cmd_remember, "save": cmd_remember, "learn": cmd_remember,

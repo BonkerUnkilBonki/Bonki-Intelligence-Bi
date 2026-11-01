@@ -166,8 +166,48 @@ def track_member(chat_id, user):
                     user.get("first_name") or user.get("username") or "user")
 
 
+async def _all_members(chat):
+    """Best possible member list, with the honest caveat about where it came from.
+
+    Order of preference:
+      1. the user account (only thing that can list EVERY member)
+      2. admins, via the Bot API
+      3. members Bonki has seen speak
+    Returns (members, source, truncated).
+    """
+    from . import userbot
+    cid = chat.get("id")
+    seen = {str(m["id"]): {"id": m["id"], "name": m["name"]} for m in db.list_members(cid)}
+
+    if userbot.is_running():
+        try:
+            handle = chat.get("username") or cid
+            people = await asyncio.to_thread(userbot.list_participants, handle, 1000)
+            out = [{"id": p["id"], "name": p.get("name") or str(p["id"])}
+                   for p in people if not p.get("bot")]
+            if out:
+                return out, "user account", len(out) >= 1000
+        except Exception as e:
+            log.info("participant listing failed: %s", e)
+
+    merged = dict(seen)
+    try:
+        admins = await asyncio.to_thread(telegram.get_chat_administrators, cid)
+        for a in (admins.get("result") or []):
+            u = a.get("user") or {}
+            if u.get("id") and not u.get("is_bot"):
+                merged.setdefault(str(u["id"]),
+                                  {"id": u["id"],
+                                   "name": u.get("first_name") or str(u["id"])})
+    except Exception as e:
+        log.info("admin listing failed: %s", e)
+
+    source = "admins + members I've seen" if len(merged) > len(seen) else "members I've seen"
+    return list(merged.values()), source, False
+
+
 async def cmd_tagall(chat, msg, user, args):
-    """Mention everyone who has spoken here. Bots cannot list members."""
+    """Mention everyone in the group."""
     from . import rose
     cid = chat.get("id")
     uid = (user or {}).get("id")
@@ -178,18 +218,42 @@ async def cmd_tagall(chat, msg, user, args):
     if now - _tagall_last.get(cid, 0) < _TAGALL_COOLDOWN:
         left = int(_TAGALL_COOLDOWN - (now - _tagall_last.get(cid, 0)))
         return await rose._reply(chat, msg, f"⏳ Wait {left}s before tagging again.")
-
-    members = db.list_members(cid)[:_MAX_TAGALL]
-    if not members:
-        return await rose._reply(
-            chat, msg, "I haven't seen anyone speak yet — I can only tag members "
-                       "who have posted while I was here (bots can't list members).")
     _tagall_last[cid] = now
+
+    members, source, truncated = await _all_members(chat)
+    if not members:
+        return await rose._reply(chat, msg, "I couldn't get a member list here.")
+
     note = (args or "").strip()
-    mentions = " ".join(f'<a href="tg://user?id={m["id"]}">'
-                        f'{html.escape(m["name"][:20])}</a>' for m in members)
-    body = (f"{telegram.esc(note)}\n\n" if note else "") + mentions
-    await rose._reply(chat, msg, body[:4000])
+    # Telegram caps a message at 4096 chars, so mention in chunks
+    head = f"{telegram.esc(note)}\n\n" if note else ""
+    chunks, cur = [], head
+    for m in members[:_MAX_TAGALL]:
+        tag = f'<a href="tg://user?id={m["id"]}">{html.escape(str(m["name"])[:24])}</a> '
+        if len(cur) + len(tag) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += tag
+    if cur:
+        chunks.append(cur)
+
+    for i, c in enumerate(chunks[:3]):
+        try:
+            await asyncio.to_thread(telegram.send_message, c, chat_id=cid,
+                                    reply_to=msg.get("message_id") if i == 0 else None)
+        except Exception as e:
+            log.info("tagall chunk failed: %s", e)
+
+    tail = f"\n<i>{len(members)} mentioned · source: {source}</i>"
+    if source != "user account":
+        tail += ("\n<i>Telegram gives bots no member list, so I can only see admins "
+                 "and people who have spoken. Connect /userbot to reach everyone.</i>")
+    if truncated:
+        tail += "\n<i>First 1000 members only.</i>"
+    try:
+        await asyncio.to_thread(telegram.send_message, tail.strip(), chat_id=cid)
+    except Exception:
+        pass
     return True
 
 
@@ -197,7 +261,7 @@ async def cmd_utagall(chat, msg, user, args):
     """Tag everyone EXCEPT admins."""
     from . import rose
     cid = chat.get("id")
-    members = db.list_members(cid)[:_MAX_TAGALL]
+    members, source, truncated = await _all_members(chat)
     keep = []
     for m in members:
         try:
@@ -209,10 +273,23 @@ async def cmd_utagall(chat, msg, user, args):
     if not keep:
         return await rose._reply(chat, msg, "Nobody to tag.")
     note = (args or "").strip()
-    mentions = " ".join(f'<a href="tg://user?id={m["id"]}">'
-                        f'{html.escape(m["name"][:20])}</a>' for m in keep)
-    body = (f"{telegram.esc(note)}\n\n" if note else "") + mentions
-    await rose._reply(chat, msg, body[:4000])
+    head = f"{telegram.esc(note)}\n\n" if note else ""
+    chunks, cur = [], head
+    for m in keep[:_MAX_TAGALL]:
+        tag = f'<a href="tg://user?id={m["id"]}">{html.escape(str(m["name"])[:24])}</a> '
+        if len(cur) + len(tag) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += tag
+    if cur:
+        chunks.append(cur)
+    for i, c in enumerate(chunks[:3]):
+        try:
+            await asyncio.to_thread(telegram.send_message, c, chat_id=cid,
+                                    reply_to=msg.get("message_id") if i == 0 else None)
+        except Exception as e:
+            log.info("utagall chunk failed: %s", e)
+    return True
 
 
 # ---------------------------------------------------------------- disabling --

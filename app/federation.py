@@ -337,6 +337,12 @@ async def cmd_fban(chat, msg, user, args):
     db.fed_ban(fed["id"], str(uid), reason or "no reason", user.get("id"))
     if sync_on():
         db.queue_fed_push(fed["id"], str(uid), reason or "no reason")
+        # push straight away instead of waiting for the next sync cycle
+        try:
+            if userbot.is_running():
+                asyncio.create_task(push_pending(fed))
+        except Exception as e:
+            log.info("immediate push skipped: %s", e)
     if db.get_settings().get("fed_sync_chat"):
         # account-free path: keep the published file current
         try:
@@ -594,7 +600,12 @@ def _parse_banlist(text):
 #   Rose  -> Bonki: /fbanlist json asked for, the file she replies with imported
 # Without /userbot neither direction can move automatically.
 def sync_on():
-    return str(db.get_settings().get("fed_sync_rose") or "") == "1"
+    """Rose sync is ON by default - there is nothing to switch on.
+
+    It only does anything when a user account is connected, so defaulting it on is
+    safe: without /userbot the loop simply finds nothing to do.
+    """
+    return str(db.get_settings().get("fed_sync_rose") or "1") != "0"
 
 
 async def push_pending(fed):
@@ -648,7 +659,8 @@ async def cmd_fedsync(chat, msg, user, args):
 
     arg = (args or "").strip().lower()
     if arg in ("on", "off"):
-        db.set_settings({"fed_sync_rose": "1" if arg == "on" else ""})
+        db.set_settings({"fed_sync_rose": "1" if arg == "on" else "0",
+                         "fed_sync_fed": str(fed["id"]) if arg == "on" else ""})
         if arg == "off":
             return await _reply(chat, msg, "⏹ Mirroring with Rose stopped.")
         if not userbot.is_running():
@@ -663,6 +675,24 @@ async def cmd_fedsync(chat, msg, user, args):
                             "• Bonki bans → sent to Rose\n"
                             "• Rose bans → pulled every 15 minutes\n"
                             "Rose rate-limits hard, so a batch is 10 per cycle.")
+
+    if arg.split() and arg.split()[0] in ("sub", "unsub", "subscribe", "unsubscribe"):
+        parts = arg.split()
+        if len(parts) < 2:
+            return await _reply(chat, msg, "Usage: <code>/fedsync sub &lt;rose_fed_id&gt;</code>")
+        if not userbot.is_running():
+            return await _reply(chat, msg, "🔌 Needs /userbot to reach Rose.")
+        fid = parts[1]
+        cmd = "/subfed " + fid if parts[0] in ("sub", "subscribe") else "/unsubfed " + fid
+        try:
+            reply = await userbot.ask(ROSE, cmd, wait=10.0)
+        except Exception as e:
+            return await _reply(chat, msg, f"⚠️ {telegram.esc(e)}")
+        return await _reply(chat, msg,
+                            f"📨 Sent <code>{telegram.esc(cmd)}</code>\n\n"
+                            f"<b>Rose says:</b>\n{telegram.esc((reply or 'no reply')[:800])}\n\n"
+                            f"<i>Subscribing makes Rose ban users that fed has banned; it "
+                            f"does not merge ban lists.</i>")
 
     if arg == "pull":
         if not userbot.is_running():
@@ -692,42 +722,61 @@ async def cmd_fedsync(chat, msg, user, args):
         pass
     await _reply(chat, msg,
                  f"🔁 <b>Rose mirror — {fed['name']}</b>\n"
-                 f"• sync: {'✅ on' if sync_on() else '⏹ off'}\n"
+                 f"• sync: {'✅ automatic' if sync_on() else '⏹ off'}\n"
                  f"• user account: {'✅ connected' if userbot.is_running() else '❌ needed'}\n"
                  f"• queued to send: {queued}\n"
                  f"• last pull from Rose: {last}\n\n"
-                 f"<code>/fedsync on|off</code> · <code>push</code> · <code>pull</code>")
+                 f"<code>/fedsync on|off</code> · <code>push</code> · <code>pull</code>\n"
+                 f"<code>/fedsync sub &lt;rose_fed_id&gt;</code> — subscribe this fed to "
+                 f"another Rose fed\n"
+                 f"<code>/fedsync unsub &lt;rose_fed_id&gt;</code>")
 
 
 async def sync_loop():
-    """Background: push queued bans and pull Rose's list, every 15 minutes."""
-    log.info("fed sync loop started")
+    """Keep Bonki and Rose in sync with no user action.
+
+    Runs every 5 minutes while a user account is connected:
+      * pushes any queued Bonki bans to Rose
+      * pulls Rose's ban list every 10 minutes and imports it
+    """
+    log.info("fed sync loop started (automatic)")
     while True:
         try:
             if sync_on() and userbot.is_running():
-                for g in db.list_groups():
-                    fed = db.get_fed_for_chat(g.get("chat_id"))
-                    if not fed:
-                        continue
+                st = db.get_settings()
+                fed = db.get_fed(st.get("fed_sync_fed") or "")
+                if not fed:
+                    for g in db.list_groups():
+                        fed = db.get_fed_for_chat(g.get("chat_id"))
+                        if fed:
+                            db.set_settings({"fed_sync_fed": str(fed["id"])})
+                            break
+                if fed:
                     if db.list_fed_pushes(fed["id"]):
-                        await push_pending(fed)
-                    await pull_from_rose(fed)
-                    break                    # one fed per cycle, keep it gentle
+                        n = await push_pending(fed)
+                        if n:
+                            log.info("auto-pushed %d ban(s) to Rose", n)
+                    last = int(db.get_settings().get("fed_sync_last_pull") or 0)
+                    if time.time() - last > 600:
+                        try:
+                            n = await pull_from_rose(fed)
+                            if n:
+                                log.info("auto-pulled %d ban(s) from Rose", n)
+                        except Exception as e:
+                            log.info("auto pull failed: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("fed sync loop error: %s", e)
-        await asyncio.sleep(900)
+        await asyncio.sleep(300)
 
 
 # ------------------------------------- Account-free bridge: publish + import --
 # With no user account the ONLY channel between two bots is a file a human moves.
-# So Bonki maximises what it can do alone:
-#   * it publishes its ban list as a Rose-importable file, automatically, whenever
-#     a ban changes - into a chat you nominate
-#   * it imports a Rose file the moment one is forwarded in (auto_import_doc)
-# The one remaining human step is forwarding that file to Rose and tapping
-# /importfbans there. Telegram's bot-to-bot block makes that unavoidable.
+# Bonki maximises what it can do alone: it publishes its ban list as a
+# Rose-importable file whenever a ban changes, and imports a Rose file the moment
+# one is forwarded in. The last hop needs one human tap - Telegram blocks
+# bot-to-bot messaging (403), so no bot can do it.
 def _banlist_bytes(fed, fmt="csv"):
     bans = fed.get("bans") or []
     if fmt == "json":

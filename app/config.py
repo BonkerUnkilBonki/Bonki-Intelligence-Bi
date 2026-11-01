@@ -35,6 +35,12 @@ DEFAULT_SETTINGS = {
     # max tags in one /tag command (Telegram allows ~20 messages/min per group,
     # so a big number simply takes proportionally longer)
     "tag_max": "100",
+    # Rose federation sync: ON by default so there is nothing to switch on.
+    # Set to "0" to stop it.
+    "fed_sync_rose": "1",
+    "fed_sync_fed": "",          # which Bonki fed mirrors Rose
+    "fed_sync_last_pull": "",
+
     "keepalive_last": "",      # informational: "<epoch>:<status>" of the last ping
 
     # ---- the brain ----

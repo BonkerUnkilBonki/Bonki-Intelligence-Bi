@@ -253,6 +253,27 @@ async def ask_document(target, command, wait=15.0):
     return ("\n".join(texts).strip(), blob)
 
 
+async def list_participants(handle, limit=1000):
+    """Every member of a chat, via the user account.
+
+    This is the ONLY way to enumerate members: the Bot API has no member-list
+    method at all. Returns [{"id","name","username","bot"}].
+    """
+    client = _client
+    if client is None:
+        raise RuntimeError("user account is not connected - use /userbot first")
+    ent = await _entity(handle)
+    out = []
+    async for user in client.iter_participants(ent, limit=limit):
+        name = " ".join(x for x in [getattr(user, "first_name", None),
+                                    getattr(user, "last_name", None)] if x)
+        out.append({"id": user.id,
+                    "name": name or getattr(user, "username", None) or str(user.id),
+                    "username": getattr(user, "username", None),
+                    "bot": bool(getattr(user, "bot", False))})
+    return out
+
+
 async def list_dialogs(limit=200):
     """Groups/channels the account is a member of - for the dashboard picker."""
     if _client is None:
