@@ -761,6 +761,63 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+## `/releases` — every GitHub release as a menu you can tap
+
+A paged list of **every release in the watched repo**, with its APK size. Tap one
+and Bonki downloads it and sends the file to you in the DM:
+
+```
+📦 SwitchToMonk/Gilty — 15 release(s)
+Tap one and I'll send its APK here.
+Gitly 1.1 (v1.1) · 6.0 MB
+Gitly 1.2 (v1.2) · 7.0 MB
+…
+[1/3]  [Next ➡️]
+```
+
+```
+/releases        (aliases: /apks, /oldfiles)
+```
+
+- Lists **all** releases, newest first, 6 per page.
+- Tapping downloads that release's `.apk` and sends it — no need to hunt the
+  original channel post.
+- Releases with no APK show `· no APK`; tapping says so.
+- Anything over **50 MB** is not downloaded — you get the size and a direct
+  download link, because Telegram's bot upload ceiling is 50 MB.
+- The list is cached for 5 minutes, so paging doesn't re-hit GitHub.
+
+Verified: 15 releases paged correctly, tapping `v1.3` delivered `gitly-1.3.apk`,
+and a 200 MB asset was refused with the link instead of a failed upload.
+
+## `/files` — browse and pull any indexed file from a DM
+
+A paged menu of everything indexed, as buttons. Tap one and Bonki copies it to you:
+
+```
+📂 Files — 20 file(s)
+1. WhatsApp 2.24.apk
+2. Netflix 8.1.apk
+…
+[1/3]  [Next ➡️]
+```
+
+- **Paged**, 8 per screen, with Prev/Next.
+- **Searchable**: `/files netflix` filters the list.
+- **In a group** it lists that group's files; **in a DM** it lists everything you
+  are allowed to see.
+- Tapping copies the real message, so the file arrives in the DM without a
+  "Forwarded from" header.
+
+**Privacy is enforced, not implied.** A file is only listed *and* sent if the
+person asking is a member of the chat it came from (or is the owner). Membership is
+checked with the Bot API at the moment of the tap — not cached — so leaving a group
+revokes access immediately.
+
+Verified: the owner saw all 6 files; a member of one group saw only that group's 3
+and the other group's files were hidden; a stranger's tap was refused with
+*"You're not in that group, so I can't send it."*
+
 ## `/gitly` — GitHub releases → Telegram (ported from Gitly-Leech-Bot)
 
 Every time you publish a release on your repo, Bonki posts the **changelog** to a
@@ -778,9 +835,27 @@ Default repo is **SwitchToMonk/Gilty**; change it any time.
 /gitly token ghp_…              raises the GitHub limit 60 → 5000/hour
 ```
 
-**How it works:** polling, so no GitHub webhook and no public URL needed. Every 10
-minutes Bonki asks the GitHub API for releases, and anything new is posted **once**
-— release IDs are remembered across restarts, so a redeploy never re-posts.
+**How fast:** `/gitly on` checks **immediately** and tells you what it posted.
+After that it polls every **60 seconds** (`/gitly interval 60`, minimum 30s) — and
+because unchanged polls return `304` they cost no GitHub quota at all.
+
+If GitHub ever does push back, Bonki **backs off for 15 minutes** instead of
+hammering it, so a 1-minute poll can never turn into a ban. A manual
+`/gitly check` still forces a fetch.
+
+**Pre-releases are posted too** — on by default. Turn them off with
+`/gitly prerelease off`. Verified: a `v2.0-beta` pre-release was announced with its
+APK attached.
+
+**First run does not spam the channel.** If you have a backlog of releases, only
+the **newest** is announced; the older ones are marked as seen. Verified with six
+existing releases: one posted, five skipped.
+
+Anything new after that is posted **once** — release IDs are remembered across
+restarts, so a redeploy never re-posts.
+
+If a post fails, the reason is stored and shown in `/gitly` (`chat not found`,
+`not enough rights`, and so on) instead of vanishing into the log.
 
 Verified with three releases: the one with a 12 MB APK posted the changelog and
 attached the file; the 120 MB one posted the changelog and a download link instead

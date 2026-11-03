@@ -15,8 +15,8 @@ import asyncio
 import logging
 import re
 
-from . import (agent, approval, db, extras, federation, indexer, modules, perms,
-               rose, security, telegram)
+from . import (agent, approval, browse, db, extras, federation, indexer, modules,
+               perms, rose, security, telegram)
 
 log = logging.getLogger("handlers")
 
@@ -286,6 +286,59 @@ async def _handle_callback(cq):
                                         chat.get("id"), m.get("message_id"))
             except Exception:
                 pass
+        return
+
+    if data.startswith("gh:"):
+        # tap a GitHub release -> download its APK and send it here
+        try:
+            from . import gitly
+            await gitly.send_release(cq, data[3:])
+        except Exception as e:
+            log.info("release send failed: %s", e)
+        return
+
+    if data.startswith("ghp:"):
+        page = data[4:]
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        if page == "noop" or not page.isdigit():
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
+            return
+        try:
+            from . import gitly
+            text, kb = await asyncio.to_thread(gitly.menu, int(page))
+            await asyncio.to_thread(telegram.edit_message_text, chat.get("id"),
+                                    m.get("message_id"), text, kb)
+        except Exception as e:
+            log.info("release page failed: %s", e)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
+        return
+
+    if data.startswith("file:"):
+        # tap a file in the DM browser -> copy it to the DM
+        try:
+            _, fchat, fmsg = data.split(":", 2)
+            await browse.send_file(cq, fchat, fmsg)
+        except Exception as e:
+            log.info("file callback failed: %s", e)
+        return
+
+    if data.startswith("browse:"):
+        page = data.split(":", 1)[1]
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        if page == "noop" or not page.isdigit():
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
+            return
+        scope = None if chat.get("type") == "private" else chat.get("id")
+        text, kb = browse.menu(scope, int(page),
+                               user_id=(cq.get("from") or {}).get("id"))
+        try:
+            await asyncio.to_thread(telegram.edit_message_text, chat.get("id"),
+                                    m.get("message_id"), text, kb)
+        except Exception as e:
+            log.info("browse page redraw failed: %s", e)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
         return
 
     if data.startswith("mod:"):

@@ -28,7 +28,7 @@ log = logging.getLogger("gitly")
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gilty"
 UPLOAD_LIMIT = 50 * 1024 * 1024        # Telegram bot upload ceiling
-POLL_SECONDS = 600
+POLL_SECONDS = 60         # 1 min; unchanged polls (304) cost no GitHub quota
 MAX_SEEN = 100
 
 
@@ -46,7 +46,17 @@ def enabled():
 
 
 def include_prereleases():
+    """Pre-releases are posted too, by default."""
     return str(db.get_settings().get("gitly_prerelease") or "1") == "1"
+
+
+def interval():
+    """Seconds between checks. 60 by default; unchanged polls cost no quota."""
+    try:
+        v = int(db.get_settings().get("gitly_interval") or POLL_SECONDS)
+    except (TypeError, ValueError):
+        v = POLL_SECONDS
+    return max(30, min(v, 3600))
 
 
 def _seen():
@@ -158,7 +168,10 @@ def post_release(rel, target):
     try:
         telegram.send_message(f"{header}\n\n{body}" if body else header, chat_id=target)
     except Exception as e:
+        # surface it: "chat not found" / "not enough rights" is the usual cause
+        db.set_settings({"gitly_last_error": f"posting to {target}: {str(e)[:160]}"})
         log.warning("gitly changelog failed: %s", e)
+        return "post-failed"
 
     apk = pick_apk(rel.get("assets"))
     if not apk:
@@ -210,14 +223,38 @@ async def check(force=False, target=None):
     if not tgt:
         return 0, "no-channel"
     try:
+        backoff = int(db.get_settings().get("gitly_backoff_until") or 0)
+    except (TypeError, ValueError):
+        backoff = 0
+    if backoff > time.time() and not force:
+        return 0, "backoff"
+
+    try:
         rels = await asyncio.to_thread(fetch_releases)
     except Exception as e:
-        db.set_settings({"gitly_last_error": str(e)[:200]})
-        return 0, str(e)
+        msg = str(e)
+        db.set_settings({"gitly_last_error": msg[:200]})
+        # If GitHub pushes back, stop hammering it for a while. Polling every
+        # minute must never turn into a rate-limit ban.
+        if "rate limit" in msg.lower():
+            wait = 15 * 60
+            db.set_settings({"gitly_backoff_until": str(int(time.time()) + wait)})
+            log.warning("gitly backing off for %d minutes", wait // 60)
+        return 0, msg
     if rels is None:
         db.set_settings({"gitly_last_check": str(int(time.time())),
                          "gitly_last_error": ""})
         return 0, "no-change"
+
+    # First ever run: don't dump every old release into the channel. Mark the
+    # history as seen and announce only the newest one.
+    if not _seen() and rels:
+        newest = max(rels, key=lambda r: r.get("id") or 0)
+        for rel in rels:
+            if rel is not newest:
+                _mark_seen(rel.get("id") or rel.get("tag_name"))
+        log.info("gitly first run: marked %d older release(s) as seen",
+                 max(0, len(rels) - 1))
 
     posted = 0
     for rel in reversed(rels):                 # oldest first, so order is natural
@@ -248,7 +285,7 @@ async def loop():
             raise
         except Exception as e:
             log.warning("gitly loop error: %s", e)
-        await asyncio.sleep(POLL_SECONDS)
+        await asyncio.sleep(interval())
 
 
 # ------------------------------------------------------------------ command --
@@ -279,6 +316,22 @@ async def cmd_gitly(chat, msg, user, args):
                                  "✅ GitHub token saved — 5000 requests/hour and "
                                  "private repos now readable.")
 
+    if sub in ("interval", "every"):
+        if not approval.is_owner((user or {}).get("id")) and \
+                not await rose._is_admin(chat.get("id"), (user or {}).get("id")):
+            return await rose._reply(chat, msg, "Admins only.")
+        try:
+            secs = int(re.sub(r"[^0-9]", "", rest) or 60)
+        except ValueError:
+            secs = 60
+        secs = max(30, min(secs, 3600))
+        db.set_settings({"gitly_interval": str(secs)})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(chat, msg,
+                                 f"⏱ Checking every <b>{secs}s</b>.\n"
+                                 f"<i>Unchanged checks return 304 and cost no GitHub "
+                                 f"quota, so this stays free.</i>")
+
     if sub in ("repo", "channel", "on", "off", "prerelease"):
         if not approval.is_owner((user or {}).get("id")) and \
                 not await rose._is_admin(chat.get("id"), (user or {}).get("id")):
@@ -303,10 +356,22 @@ async def cmd_gitly(chat, msg, user, args):
         if sub in ("on", "off"):
             db.set_settings({"gitly_on": "1" if sub == "on" else "0"})
             await asyncio.to_thread(db.flush, True)
-            return await rose._reply(
-                chat, msg,
-                "✅ Release watcher on — checking every 10 minutes."
-                if sub == "on" else "⏹ Release watcher off.")
+            if sub == "off":
+                return await rose._reply(chat, msg, "⏹ Release watcher off.")
+            if not channel():
+                return await rose._reply(
+                    chat, msg,
+                    "⚠️ Turned on, but no channel is set yet.\n"
+                    "Run <code>/gitly channel @yourchannel</code> — then I'll check "
+                    "every 3 minutes.")
+            await rose._reply(chat, msg, "✅ On — checking GitHub right now…")
+            n, status = await check(force=True)
+            if status == "ok":
+                return await rose._reply(
+                    chat, msg,
+                    f"📦 Posted {n} release(s) to <code>{telegram.esc(channel())}</code>."
+                    if n else "📦 No new releases right now. I'll check every 3 minutes.")
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(status)}")
         if sub == "prerelease":
             on = rest.lower() in ("on", "1", "yes", "true")
             db.set_settings({"gitly_prerelease": "1" if on else "0"})
@@ -336,16 +401,130 @@ async def cmd_gitly(chat, msg, user, args):
         f"• channel: {('<code>' + telegram.esc(channel()) + '</code>') if channel() else '❌ not set'}",
         f"• status: {'✅ on' if enabled() else '⏹ off'}",
         f"• pre-releases: {'included' if include_prereleases() else 'ignored'}",
-        f"• last check: {last_s}",
+        f"• last check: {last_s} (every {interval()}s)",
     ]
     if err:
         lines.append(f"• ⚠️ last error: {telegram.esc(err[:120])}")
     lines += ["",
               "<code>/gitly channel @mychannel</code> — where to post",
               "<code>/gitly repo owner/name</code> — what to watch",
-              "<code>/gitly on</code> · <code>/gitly check</code>",
+              "<code>/gitly on</code> · <code>/gitly check</code> · "
+              "<code>/gitly interval 60</code>",
               "<i>A public repo needs no token — one is only useful if the host's "
               "IP is shared, or the repo is private.</i>",
               "<i>Posts the changelog and attaches the .apk. Files over 50 MB "
               "are announced with a link — Telegram's bot limit.</i>"]
     await rose._reply(chat, msg, "\n".join(lines))
+
+
+# ------------------------------------------------- release menu (DM) --------
+_CACHE = {"at": 0, "rels": []}
+CACHE_TTL = 300
+PAGE = 6
+
+
+def cached_releases(force=False):
+    """Releases for the menu, cached briefly so paging does not re-hit GitHub."""
+    now = time.time()
+    if force or not _CACHE["rels"] or (now - _CACHE["at"]) > CACHE_TTL:
+        rels = fetch_releases(limit=30) or []
+        _CACHE["rels"] = [r for r in rels if not r.get("draft")]
+        _CACHE["at"] = now
+    return _CACHE["rels"]
+
+
+def menu(page=0):
+    """(text, keyboard) listing every release with its APK as a button."""
+    rels = cached_releases()
+    if not rels:
+        return ("📦 No releases found on <code>%s</code>." % telegram.esc(repo()), None)
+    pages = max(1, (len(rels) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for r in rels[page * PAGE:(page + 1) * PAGE]:
+        apk = pick_apk(r.get("assets"))
+        name = r.get("name") or r.get("tag_name") or "release"
+        tag = r.get("tag_name") or ""
+        if apk:
+            mb = int(apk.get("size") or 0) / (1024 * 1024)
+            label = f"{name} ({tag}) · {mb:.1f} MB"
+            rows.append([{"text": label[:58],
+                          "callback_data": f"gh:{r.get('id')}"}])
+        else:
+            rows.append([{"text": f"{name} ({tag}) · no APK"[:58],
+                          "callback_data": f"gh:{r.get('id')}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "⬅️ Prev", "callback_data": f"ghp:{page - 1}"})
+    nav.append({"text": f"{page + 1}/{pages}", "callback_data": "ghp:noop"})
+    if page < pages - 1:
+        nav.append({"text": "Next ➡️", "callback_data": f"ghp:{page + 1}"})
+    if len(nav) > 1:
+        rows.append(nav)
+    head = (f"📦 <b>{telegram.esc(repo())}</b> — {len(rels)} release(s)\n"
+            f"<i>Tap one and I'll send its APK here.</i>")
+    return head, {"inline_keyboard": rows}
+
+
+def _find_release(rid):
+    for r in cached_releases():
+        if str(r.get("id")) == str(rid):
+            return r
+    return None
+
+
+async def send_release(cq, rid):
+    """Download one release's APK and send it to the DM."""
+    m = cq.get("message") or {}
+    dm = (m.get("chat") or {}).get("id")
+    rel = _find_release(rid)
+    if not rel:
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                "Release not found — try /releases again.", True)
+        return
+    apk = pick_apk(rel.get("assets"))
+    if not apk:
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                "That release has no .apk attached.", True)
+        return
+    size = int(apk.get("size") or 0)
+    if size > UPLOAD_LIMIT:
+        mb = size / (1024 * 1024)
+        await asyncio.to_thread(
+            telegram.send_message,
+            f"⚠️ <b>{telegram.esc(apk.get('name'))}</b> is {mb:.1f} MB — over "
+            f"Telegram's 50 MB bot limit, so I can't send it.\n"
+            f"Download: {apk.get('browser_download_url', '')}", chat_id=dm)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "Too big")
+        return
+
+    await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                            "Downloading…")
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, apk.get("name") or "release.apk")
+        try:
+            await asyncio.to_thread(download_asset, apk, dest)
+            caption = (f"{rel.get('name') or rel.get('tag_name')}\n"
+                       f"{rel.get('html_url') or ''}")
+            await asyncio.to_thread(telegram.send_document, dest,
+                                    apk.get("name") or "release.apk", caption, dm)
+        except Exception as e:
+            log.warning("release send failed: %s", e)
+            try:
+                await asyncio.to_thread(
+                    telegram.send_message,
+                    f"⚠️ Couldn't fetch that APK: {telegram.esc(str(e)[:120])}",
+                    chat_id=dm)
+            except Exception:
+                pass
+
+
+async def cmd_releases(chat, msg, user, args):
+    """Menu of every GitHub release, tap to pull its APK."""
+    from . import rose
+    try:
+        text, kb = await asyncio.to_thread(menu, 0)
+    except Exception as e:
+        return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+    await asyncio.to_thread(telegram.send_message, text, chat_id=chat.get("id"),
+                            reply_to=msg.get("message_id"), reply_markup=kb)
