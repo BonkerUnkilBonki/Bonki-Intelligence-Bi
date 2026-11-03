@@ -89,6 +89,13 @@ That first-vs-third distinction matters: any sentence ending in "N times" used t
 start a run, so an ordinary message could fire 69 mentions, hit Telegram's flood
 limit and leave the bot silent for minutes.
 
+**Rate limits are handled, not lost.** Telegram allows ~20 messages/minute per
+group. A 429 used to raise an exception and the reply simply vanished — the bot
+looked dead for the whole restriction window while it was running fine. Sends now
+wait out `retry_after` and retry, and a large tag run pauses while the bot is
+restricted instead of burning attempts on guaranteed failures. Anything over 200
+tags warns you up front how long it will take and that other replies will stall.
+
 **Stopping a run:** while tagging is in progress the **owner** can say `stop` or
 `bonki stop` (or `/stop` with no argument) and it halts within a second, replying
 `⏹ Stopped after N of M tags`. Members cannot stop it. This works because the tag
@@ -714,6 +721,23 @@ Run it in the chat that seems dead. One screen, no guessing:
 
 It works **even in an unapproved chat** when the owner asks — that is precisely
 when it is needed. Members cannot run it.
+
+## "Find" doing nothing (fixed)
+
+A trained intent model could label **"find music"** as *chat*, so the bot answered
+conversationally instead of returning the file — indistinguishable from "search is
+broken". Two fixes:
+
+- **Explicit search words now outrank the classifier.** `find`, `search`, `get`,
+  `send`, `give`, `download`, `show`, `share`, `list`, `scan` force the search
+  path regardless of what the model guesses. An extension in the text already did.
+- **The wake word is stripped from the query**, so `Bonki find music` searches for
+  `music` instead of `Bonki music`.
+
+Verified with a deliberately hostile classifier returning `chat` at 0.95 for every
+input: `find music`, `search netflix apk` and `get me spotify` all reached the
+search path, while `hello how are you` and `who shares the most` stayed
+conversational.
 
 ## Fewer wrong files: confidence gating
 

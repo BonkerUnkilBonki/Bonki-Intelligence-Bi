@@ -634,9 +634,15 @@ async def cmd_tag(chat, msg, user, args):
     mention = _mention(uid, un, locals().get("_shown") or "user")
     if count > 5:
         try:                        # the notice must never abort the command
+            mins = max(1, round(count / 20))
             note = (f"⏳ Sending {count} tags. Telegram allows about 20 messages a "
                     f"minute per group, so this takes about "
-                    f"{max(1, round(count / 20))} minute(s) — please wait.")
+                    f"{mins} minute(s) — please wait.")
+            if count > 200:
+                note += (f"\n\n⚠️ <b>{count} is a lot.</b> That is roughly "
+                         f"{round(mins/60, 1)} hour(s) of sending and Telegram will "
+                         f"rate-limit me on the way — during which I cannot answer "
+                         f"anything else. Say <i>stop</i> any time to cancel.")
             if wanted > count:
                 note = (f"⚠️ You asked for {wanted}, but the cap is {count} per "
                         f"command (Settings → Tag cap).\n" + note)
@@ -654,6 +660,14 @@ async def _run_tag(chat, msg, cid, mention, count):
         for _ in range(count):
             if tag_stop_requested(cid):
                 break               # owner said stop
+            # if Telegram is still cooling us down, wait it out instead of
+            # burning the remaining attempts on guaranteed failures
+            try:
+                wait = telegram.flood_until() - time.time()
+                if wait > 0:
+                    await asyncio.sleep(min(wait, 30))
+            except Exception:
+                pass
             ok = False
             for _attempt in range(5):
                 try:

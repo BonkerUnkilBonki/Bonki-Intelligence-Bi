@@ -1,6 +1,7 @@
 """Thin wrapper over the Telegram Bot API (what Bonki uses to *speak*)."""
 import html
 import json
+import time
 import logging
 import os
 
@@ -52,6 +53,34 @@ def esc(s):
     return html.escape(str(s or ""), quote=True)
 
 
+# Telegram rate-limits bots (~20 msgs/min per group). Without this, a 429 raised
+# an exception and the reply was simply LOST - the bot looked dead for the whole
+# restriction window while it was actually running fine.
+_FLOOD_UNTIL = [0.0]
+
+
+def flood_until():
+    """Unix time until which Telegram is still rate-limiting us."""
+    return _FLOOD_UNTIL[0]
+
+
+def _send_with_retry(method, data, retries=2):
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return _post(method, data)
+        except RateLimited as rl:
+            last = rl
+            wait = min(max(rl.retry_after, 1), 45)
+            _FLOOD_UNTIL[0] = time.time() + wait
+            log.warning("flood-limited: waiting %ds before retrying (%s)",
+                        wait, method)
+            if attempt == retries:
+                break
+            time.sleep(wait)
+    raise last
+
+
 def send_message(text, chat_id, reply_to=None, thread_id=None, silent=False,
                  disable_preview=True, parse_mode="HTML", reply_markup=None):
     data = {
@@ -68,7 +97,7 @@ def send_message(text, chat_id, reply_to=None, thread_id=None, silent=False,
         data["message_thread_id"] = thread_id
     if reply_markup is not None:
         data["reply_markup"] = json.dumps(reply_markup)
-    return _post("sendMessage", data)
+    return _send_with_retry("sendMessage", data)
 
 
 def answer_callback_query(callback_query_id, text=None, show_alert=False):

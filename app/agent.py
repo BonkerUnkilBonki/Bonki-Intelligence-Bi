@@ -384,9 +384,18 @@ async def parse(text):
         try:
             intent, conf, _ = await asyncio.to_thread(nn.classify, text)
             has_ext = bool(re.search(r"\.[A-Za-z0-9]{2,5}\b", text or ""))
-            if intent and not has_ext and conf >= 0.55:
+            # An explicit search word outranks the classifier. Without this the
+            # net could label "find music" as chat, and the bot would answer
+            # conversationally instead of returning the file - which looked
+            # exactly like "find is broken".
+            has_search_word = bool(re.search(
+                r"\b(find|search|get|give|send|download|show|share|list|scan)\b",
+                text or "", re.I))
+            if intent and not has_ext and not has_search_word and conf >= 0.55:
                 hint = dict(hint, intent=intent,
                             scan=hint.get("scan") or intent == "scan")
+            elif has_search_word and hint.get("intent") in ("unknown", "chat", ""):
+                hint = dict(hint, intent="find")
         except Exception as e:
             log.info("intent net skipped: %s", e)
     return hint
@@ -468,8 +477,18 @@ def _heuristic_parse(text):
         looks_like_file = bool(re.search(r"\.[A-Za-z0-9]{2,5}\b", text or ""))
         intent = "find" if looks_like_file else "unknown"
 
+    # Drop the wake words too - "Bonki find music" should search for "music",
+    # not for "Bonki music".
+    try:
+        from . import handlers as _h
+        wake = set(_h._wake_words())
+    except Exception:
+        wake = {"bonki"}
     words = [w for w in re.split(r"\s+", (text or "").strip()) if w]
-    qwords = [w for w in words if norm(w) not in _STOP and not w.startswith("#")
+    qwords = [w for w in words
+              if norm(w) not in _STOP
+              and norm(w) not in wake
+              and not w.startswith("#")
               and not w.startswith("@")]
     query = " ".join(qwords).strip()
     hashtag = normalize_hashtag(hashtag_m.group(0) if hashtag_m else "", query)
