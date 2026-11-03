@@ -18,8 +18,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.templating import Jinja2Templates
 
-from . import (agent, analytics, approval, db, federation, handlers, indexer,
-               learn, llm, skills, telegram, userbot)
+from . import (agent, analytics, approval, db, federation, handlers, health,
+               indexer, learn, llm, skills, telegram, userbot)
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +52,7 @@ async def lifespan(app: FastAPI):
     _set_commands()
     asyncio.create_task(_auto_index_loop())
     asyncio.create_task(_keepalive_loop())
+    asyncio.create_task(_watchdog_loop())
     try:
         st = db.storage_info()
         log.info("startup: storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",
@@ -66,6 +67,13 @@ async def lifespan(app: FastAPI):
     # Tell the owner we're back. Skipped if we booted less than 2 minutes ago,
     # so a crash-restart loop can't spam their DM.
     try:
+        boots, gap = health.note_boot()
+        log.info("boot #%d (down for %s)", boots, health.human_gap(gap))
+    except Exception as e:
+        log.info("boot counter failed: %s", e)
+        boots, gap = 0, 0
+
+    try:
         oid = approval.owner_id()
         if oid:
             last = float(db.get_settings().get("last_boot_ts") or 0)
@@ -75,6 +83,7 @@ async def lifespan(app: FastAPI):
                 await asyncio.to_thread(
                     telegram.send_message,
                     "🔄 <b>Bonki-Intelligence restarted</b>\n"
+                    f"🔁 boot #{boots} · was down {health.human_gap(gap)}\n"
                     f"🕒 {time.strftime('%d %b %Y, %H:%M:%S')}\n"
                     f"👥 {len(db.list_groups())} group(s) · "
                     f"📦 {db.count_files()} file(s)\n"
@@ -154,6 +163,68 @@ def _disable_webhook():
         log.info("cleared any existing webhook (polling mode)")
     except Exception as e:
         log.warning("could not delete webhook: %s", e)
+
+
+async def _watchdog_check():
+    """One health check: is the bot reachable, and is the webhook still right?
+
+    Returns a short status string so it can be tested and logged.
+    """
+    try:
+        await asyncio.to_thread(telegram.get_me)
+    except Exception as e:
+        log.warning("watchdog: getMe failed: %s", e)
+        return "token-fail"
+
+    if _use_polling():
+        return "polling"
+
+    want = _webhook_url()
+    if not want:
+        return "no-url"
+    try:
+        info = await asyncio.to_thread(telegram.get_webhook_info)
+        r = info.get("result") or {}
+    except Exception as e:
+        log.info("watchdog: webhook info failed: %s", e)
+        return "info-fail"
+
+    have = (r.get("url") or "").rstrip("/")
+    err = r.get("last_error_message") or ""
+    if have == want.rstrip("/") and not err:
+        return "ok"
+    log.warning("watchdog: re-registering webhook (have=%s want=%s err=%s)",
+                have or "none", want, err or "none")
+    try:
+        await asyncio.to_thread(
+            telegram.set_webhook, want,
+            secret_token=db.get_settings().get("webhook_secret"))
+        db.set_settings({"watchdog_last_fix": str(int(time.time()))})
+        await asyncio.to_thread(db.flush)
+        return "repaired"
+    except Exception as e:
+        log.warning("watchdog: webhook repair failed: %s", e)
+        return "repair-fail"
+
+
+async def _watchdog_loop():
+    """Keep the bot reachable after a restart, redeploy or server renewal.
+
+    The failure this fixes: the webhook is registered once at startup. If the
+    host's public URL changes (a renew, a redeploy, a new instance) Telegram keeps
+    delivering to the OLD url, so the bot looks completely dead while the process
+    is running fine. This checks every 3 minutes and re-registers the webhook
+    whenever it is wrong or Telegram reports an error.
+    """
+    log.info("watchdog started")
+    while True:
+        try:
+            await _watchdog_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("watchdog error: %s", e)
+        await asyncio.sleep(180)
 
 
 def _keepalive_str():
@@ -613,6 +684,9 @@ def diagnostics_page(request: Request, msg: str = ""):
                         or os.environ.get("WEBHOOK_BASE") or ""),
          "groups": groups, "total_files": db.count_files(),
         "webhook": _webhook_url(), "paused": db.is_paused(),
+        "health": health.summary(),
+        "health_gap": health.human_gap(
+            db.get_settings().get("last_downtime_sec") or 0),
         "activity": [dict(a, time=time.strftime("%H:%M:%S", time.localtime(a["t"])))
                      for a in db.list_activity(40)],
     })

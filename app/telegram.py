@@ -335,6 +335,11 @@ def download_file(file_path):
     return r.content
 
 
+def get_webhook_info():
+    """What Telegram currently thinks our webhook is - used by the watchdog."""
+    return _post("getWebhookInfo", {})
+
+
 def set_webhook(url, secret_token=None):
     data = {"url": url,
             "allowed_updates": '["message","edited_message","channel_post","callback_query","my_chat_member"]'}

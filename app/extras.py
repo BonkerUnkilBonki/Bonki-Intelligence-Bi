@@ -59,7 +59,16 @@ async def cmd_filter(chat, msg, user, args):
 
 
 async def cmd_stop(chat, msg, user, args):
-    from . import rose
+    from . import approval, rose
+    trig = (args or "").strip().lower()
+    if not trig:
+        # no filter named - treat it as "stop the tag run" for the owner only
+        if approval.is_owner((user or {}).get("id")):
+            if rose.tag_running(chat.get("id")):
+                rose.request_tag_stop(chat.get("id"))
+                return await rose._reply(chat, msg, "⏹ Stopping the tag run.")
+            return await rose._reply(chat, msg, "Nothing is running to stop.")
+        return await rose._reply(chat, msg, "Usage: <code>/stop &lt;trigger&gt;</code>")
     if not await rose._need_admin(chat, msg, user):
         return
     cid = chat.get("id")

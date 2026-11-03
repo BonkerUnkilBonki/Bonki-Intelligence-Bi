@@ -13,6 +13,13 @@
     <tr><td>Storage</td><td>
       <span class="pill {{ 'ok' if storage.durable else 'warn' }}">{{ storage.mode }}</span>
       <span class="small muted">{{ storage.note }}</span></td></tr>
+    <tr><td>Uptime</td><td>
+      <span class="pill ok">boot #{{ health.boots }}</span>
+      <span class="small muted">up {{ health.uptime_min }} min · started {{ health.started }}
+      · last downtime {{ health_gap }}{% if health.mem_mb %} · {{ health.mem_mb }} MB RAM{% endif %}</span>
+      <div class="small muted">If this keeps climbing the bot is restarting in a loop —
+      check the logs. The watchdog re-registers the webhook by itself when a renewal
+      changes the public URL.</div></td></tr>
     <tr><td>Brain</td><td><span class="pill {{ 'ok' if llm_on else 'warn' }}">{{ brain }}</span></td></tr>
     <tr><td>User account</td><td>
       {% if userbot_running %}<span class="pill ok">connected</span>

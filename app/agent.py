@@ -608,6 +608,21 @@ async def handle(chat, msg, user, text):
     if approval.gate(chat_id, chat.get("username")):
         return                      # not verified by the owner yet - do nothing
     text = (text or "").strip()
+
+    # The OWNER can abort a running /tag by simply saying "stop" or "bonki stop".
+    # Nobody else can - a member must not be able to cut off a tag run.
+    try:
+        if approval.is_owner((user or {}).get("id")) and \
+                re.fullmatch(r"(bonki[\s,]*)?stop[.!]*", text, re.I):
+            if rose.tag_running(chat_id):
+                rose.request_tag_stop(chat_id)
+                return await _send("⏹ Stopping the tag run.",
+                                   chat_id, reply_to=msg.get("message_id"))
+            return await _send("Nothing is running to stop.",
+                               chat_id, reply_to=msg.get("message_id"))
+    except Exception as e:
+        log.info("tag stop check failed: %s", e)
+
     if text.startswith("/"):                     # explicit /commands
         parts = text.split(None, 1)
         cmd = parts[0].lstrip("/").split("@")[0].lower()

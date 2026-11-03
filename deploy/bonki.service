@@ -1,0 +1,42 @@
+[Unit]
+Description=Bonki-Intelligence Telegram bot
+Documentation=file:///opt/bonki-intel/README.md
+# Bring the bot up as soon as the machine boots, and after the network is ready.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bonki
+WorkingDirectory=/opt/bonki-intel
+EnvironmentFile=/opt/bonki-intel/.env
+
+# start.sh runs `python main.py` (reads SERVER_PORT / PORT itself)
+ExecStart=/usr/bin/env python3 /opt/bonki-intel/main.py
+
+# ---- this is the part that fixes "the bot stays dead after a renewal" ----
+Restart=always
+RestartSec=5
+# keep trying forever; never give up after a few crashes
+StartLimitIntervalSec=0
+
+# give it a moment to shut down cleanly (state flush)
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=append:/var/log/bonki-intel.log
+StandardError=append:/var/log/bonki-intel.log
+
+[Install]
+WantedBy=multi-user.target
+
+# Install:
+#   sudo cp deploy/bonki.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bonki-intel
+#
+# Check:
+#   systemctl status bonki-intel
+#   journalctl -u bonki-intel -f
+#
+# `enable` is what makes it start by itself after a reboot or a server renewal.

@@ -69,10 +69,18 @@ Moderation needs the **bot to be an admin** with the relevant rights (ban/mute/p
 and the person issuing it to be a **group admin** (or you, the owner). At 3
 warnings the member is muted for an hour and warnings reset.
 
-**`/tag` guardrails.** Capped at **100 per command** (change it in Settings → Tag
-cap; 100 is the hard ceiling) and limited to one tag command per user per minute.
-If you ask for more than the cap, the bot says so instead of silently dropping the
-difference. Works
+**`/tag` — no cap.** Whatever number you say is the number sent
+(`/tag @user 500`). Only a one-per-minute cooldown per user remains, and the
+per-group Telegram limit (~20 messages/minute) still paces the sending, so a large
+number takes proportionally longer.
+
+**Stopping a run:** while tagging is in progress the **owner** can say `stop` or
+`bonki stop` (or `/stop` with no argument) and it halts within a second, replying
+`⏹ Stopped after N of M tags`. Members cannot stop it. This works because the tag
+loop runs as a background task — previously the bot was blocked inside the command
+and could not even receive the stop message.
+
+Works
 as `/tag @user 5`, `Bonki tag @user 5`, or reply to a user with `/tag 5`.
 
 It also understands natural phrasing: `Bonki <anything> @user 5 times`, or reply
@@ -942,6 +950,44 @@ Bonki, scan this group and tag apple music apk
 ```
 
 ---
+
+## Surviving a restart, redeploy or server renewal
+
+Two separate things decide whether the bot is alive after a renewal: the **process
+must come back**, and the **bot must be reachable by Telegram**.
+
+### 1. The process starts itself
+
+| Host | What makes it restart automatically |
+|---|---|
+| **VPS / dedicated** | `deploy/bonki.service` — a systemd unit with `Restart=always` and `StartLimitIntervalSec=0`. Install once: `sudo cp deploy/bonki.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now bonki-intel`. `enable` is what starts it after a reboot. |
+| **Docker** | `docker-compose.yml` already has `restart: unless-stopped` — `docker compose up -d` and it comes back after a daemon restart or machine reboot. |
+| **Render** | Auto-deploy on push; a paid instance never sleeps. On free it sleeps after ~15 min idle — the keep-alive loop plus an external cron hitting `/healthz` wakes it. |
+| **Panel hosts** | Set the startup file to `main.py` and enable the panel's auto-restart if it has one. |
+
+### 2. Telegram can still reach it (the real "dead bot" cause)
+
+The webhook is registered at startup. **If the host's public URL changes on a
+renewal — a new instance, a new subdomain — Telegram keeps delivering to the OLD
+URL.** The process is running perfectly and the bot looks completely dead. Nothing
+in the logs screams about it.
+
+A **watchdog** now runs every 3 minutes and fixes this with no user action:
+
+- checks the token still works (`getMe`)
+- asks Telegram what webhook it currently has (`getWebhookInfo`)
+- if the URL is wrong, empty, or Telegram reports `last_error_message`, it
+  **re-registers the webhook** against the current public URL
+
+Verified: a stale URL is repaired, a `502` error report is repaired, a healthy
+webhook is left alone, and in polling mode it makes no webhook calls at all.
+
+### 3. You can see it happening
+
+- **Diagnostics** shows `boot #N`, uptime, last downtime and RAM. A climbing boot
+  count means a restart loop rather than a silent failure.
+- The **restart DM** now says `boot #N · was down 3h` so you know it went away and
+  came back without opening anything.
 
 ## Deploy on Render
 

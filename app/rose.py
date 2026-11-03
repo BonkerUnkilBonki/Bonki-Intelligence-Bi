@@ -37,10 +37,31 @@ LOCK_TYPES = ("media", "sticker", "gif", "link", "forward", "bots", "commands")
 
 
 def _tag_cap():
-    try:
-        return max(1, min(int(db.get_settings().get("tag_max") or TAG_MAX), 100))
-    except (TypeError, ValueError):
-        return TAG_MAX
+    """No cap: the owner decides. A very high ceiling only stops a typo like
+    999999999 from wedging the bot forever."""
+    return 100000
+
+
+# a running /tag can be aborted by the owner
+_TAG_CANCEL = {}
+_TAG_RUNNING = {}
+
+
+def tag_running(chat_id):
+    return bool(_TAG_RUNNING.get(str(chat_id)))
+
+
+def request_tag_stop(chat_id):
+    _TAG_CANCEL[str(chat_id)] = time.time()
+    return True
+
+
+def tag_stop_requested(chat_id):
+    return str(chat_id) in _TAG_CANCEL
+
+
+def clear_tag_stop(chat_id):
+    _TAG_CANCEL.pop(str(chat_id), None)
 ADMIN_STATUS = ("administrator", "creator")
 
 _tag_last = {}
@@ -594,7 +615,7 @@ async def cmd_tag(chat, msg, user, args):
     except Exception:
         pass
 
-    m = re.search(r"\b(\d{1,4})\b", rest or "")
+    m = re.search(r"\b(\d{1,6})\b", rest or "")
     count = int(m.group(1)) if m else 1
     cap = _tag_cap()
     wanted = count
@@ -607,6 +628,7 @@ async def cmd_tag(chat, msg, user, args):
         return await _reply(chat, msg, f"⏳ Slow down — you can tag again in {left}s.")
     _tag_last[key] = now
 
+    clear_tag_stop(cid)          # a fresh run starts clean
     mention = _mention(uid, un)
     if count > 5:
         try:                        # the notice must never abort the command
@@ -620,32 +642,48 @@ async def cmd_tag(chat, msg, user, args):
         except Exception:
             pass
 
-    sent = 0
-    for _ in range(count):
-        ok = False
-        for _attempt in range(5):
-            try:
-                await _reply(chat, msg, mention)
-                sent += 1
-                ok = True
-                break
-            except telegram.RateLimited as rl:
-                # Telegram told us exactly how long to wait - obey it, don't give up
-                await asyncio.sleep(min(rl.retry_after + 1, 60))
-            except Exception as e:
-                log.warning("tag send failed after %d: %s", sent, e)
-                break
-        if not ok:
-            break
-        await asyncio.sleep(0.9)               # gentle pacing, under the per-group cap
+    asyncio.create_task(_run_tag(chat, msg, cid, mention, count))
 
-    note = f"⚠️ Only {sent} of {count} tags went through (Telegram flood limit)."
-    if sent < count:
+
+async def _run_tag(chat, msg, cid, mention, count):
+    _TAG_RUNNING[str(cid)] = True
+    sent = 0
+    try:
+        for _ in range(count):
+            if tag_stop_requested(cid):
+                break               # owner said stop
+            ok = False
+            for _attempt in range(5):
+                try:
+                    await _reply(chat, msg, mention)
+                    sent += 1
+                    ok = True
+                    break
+                except telegram.RateLimited as rl:
+                    await asyncio.sleep(min(rl.retry_after + 1, 60))
+                except Exception as e:
+                    log.warning("tag send failed after %d: %s", sent, e)
+                    break
+            if not ok:
+                break
+            await asyncio.sleep(0.9)
+    finally:
+        _TAG_RUNNING.pop(str(cid), None)
+
+    if tag_stop_requested(cid):
+        clear_tag_stop(cid)
         try:
-            await _reply(chat, msg, note)
+            await _reply(chat, msg, f"⏹ Stopped after {sent} of {count} tags.")
         except Exception:
             pass
-
+        return
+    if sent < count:
+        try:
+            await _reply(chat, msg,
+                         f"⚠️ Only {sent} of {count} tags went through "
+                         f"(Telegram flood limit).")
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------ help ----
 HELP = (
@@ -663,7 +701,7 @@ HELP = (
     "<b>Quotes</b>: /q — reply to a message to make a quote image\n"
     "<b>Locks</b>: /lock media|sticker|gif|link|forward|bots|commands · /unlock · /locks\n"
     "<b>Federation</b>: /newfed name · /joinfed id · /leavefed · /fedinfo · /fban · /unfban\n"
-    "<b>Special</b>: /tag @user 5 — tags them 5 times, in 5 separate messages (max 20)\n\n"
+    "<b>Special</b>: /tag @user 500 — any number you say, one message each. Owner can abort with <i>stop</i>\n\n"
     "Files: <i>Bonki, find apple music apk</i> · <i>Bonki, scan this group</i>"
 )
 
