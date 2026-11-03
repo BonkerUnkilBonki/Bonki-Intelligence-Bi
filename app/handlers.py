@@ -132,6 +132,15 @@ async def _handle_membership(cm):
                 db.update_group(row, {"chat_type": chat.get("type") or ""})
             except Exception:
                 pass
+        else:
+            # Removed and re-added: clear the stale flags. Without this the row
+            # kept enabled=0 / approved=0 from the removal, so the bot came back
+            # but stayed silent and never asked for approval again.
+            g = db.get_group_by_chat(chat.get("id"), chat.get("username"))
+            if g:
+                db.update_group(g["id"], {"enabled": 1, "approval_notified": 0,
+                                          "chat_type": chat.get("type") or ""})
+                await asyncio.to_thread(db.flush, True)
         if chat.get("type") == "channel":
             # greet in the channel itself
             try:
@@ -169,7 +178,24 @@ async def _handle_membership(cm):
         except Exception as e:
             log.info("auto-fed attach failed: %s", e)
 
-        if approval.gate(chat.get("id"), chat.get("username")):
+        # If the OWNER added the bot, there is nothing to verify - approve it
+        # straight away. Otherwise a newly added channel just sits there silent
+        # until someone remembers to tap approve, which looks like "not working".
+        owner_added = (who.get("id") and approval.is_owner(who.get("id")))
+        if owner_added:
+            try:
+                g = db.get_group_by_chat(chat.get("id"), chat.get("username"))
+                if g and (not g.get("approved") or g.get("approval_notified")):
+                    db.update_group(g["id"], {"approved": 1, "enabled": 1,
+                                              "approval_notified": 0})
+                    await asyncio.to_thread(db.flush, True)
+                    await _notify_owner(
+                        f"✅ Auto-approved “{telegram.esc(title)}” because you added "
+                        f"me there.\n<code>{chat.get('id')}</code>\n\n"
+                        f"Send <i>Bonki find …</i> to test it.")
+            except Exception as e:
+                log.info("auto-approve failed: %s", e)
+        elif approval.gate(chat.get("id"), chat.get("username")):
             await approval.announce(chat, by=by)   # verify button + DM owner
     elif status in ("left", "kicked"):
         g = db.get_group_by_chat(chat.get("id"), chat.get("username"))

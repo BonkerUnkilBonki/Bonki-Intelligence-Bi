@@ -22,7 +22,7 @@ DEFAULT_SETTINGS = {
     "owner_id": "",
     # "1" = a group the bot is added to must be approved by the owner before it
     # will scan, index or answer there. "0" = approve automatically.
-    "require_approval": "1",
+    "require_approval": "0",       # off: works in any chat it is added to
     # "1" = answer only when addressed (wake word / @mention / reply to bot)
     "require_mention": "1",
     # "1" = PAUSE everything

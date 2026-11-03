@@ -50,6 +50,18 @@ async def lifespan(app: FastAPI):
     else:
         _set_webhook()
         log.info("telegram mode: webhook")
+    # One-time migration: approval used to default to ON, which left newly added
+    # chats silent until someone tapped approve. Turn it off once so existing
+    # deployments start working everywhere; the owner can re-enable it in Settings.
+    try:
+        if not db.get_settings().get("approval_default_migrated"):
+            db.set_settings({"require_approval": "0",
+                             "approval_default_migrated": "1"})
+            await asyncio.to_thread(db.flush, True)
+            log.info("approval gate turned off (one-time migration)")
+    except Exception as e:
+        log.info("approval migration skipped: %s", e)
+
     # If no AI is configured yet, look for a local open-source one (Ollama).
     # Free, no key, nothing leaves the machine - so this is a safe default.
     try:

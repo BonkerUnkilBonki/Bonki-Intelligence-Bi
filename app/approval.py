@@ -28,7 +28,13 @@ def is_owner(uid):
 
 
 def require_approval():
-    return str(db.get_settings().get("require_approval") or "1") == "1"
+    """Off by default: the bot works in any chat it is added to.
+
+    The gate is still available (Settings → Require approval) for owners who want
+    to vet groups first, but it is no longer the default - it was the reason a
+    newly added channel sat there doing nothing.
+    """
+    return str(db.get_settings().get("require_approval") or "0") == "1"
 
 
 def gate(chat_id, username=None):

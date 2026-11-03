@@ -761,6 +761,20 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+## Adding the bot to a new chat — it just works
+
+**Approval is OFF by default.** The bot works in whatever chat it is added to, with
+no tapping. Existing installs are migrated once on startup, so a deployment that
+previously had the gate on is switched off automatically.
+
+The gate is still available if you want it (Settings → Require approval). When on,
+`/pending` lists waiting chats and `/approve <chat_id>` verifies them.
+
+**Remove and re-add** now resets the chat's flags (`enabled`, `approval_notified`).
+Before, a removal left `enabled=0` behind, so the bot came back but stayed silent —
+and because it was still marked approved, it never asked again. Verified: add →
+works, remove, re-add → works.
+
 ## Channels (public and private)
 
 Two bugs made a **private channel** look dead while a public one worked:
