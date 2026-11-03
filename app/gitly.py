@@ -26,7 +26,7 @@ from . import db, telegram
 log = logging.getLogger("gitly")
 
 API = "https://api.github.com"
-DEFAULT_REPO = "SwitchToMonk/Gilty"
+DEFAULT_REPO = "SwitchToMonk/Gitly"
 UPLOAD_LIMIT = 50 * 1024 * 1024        # Telegram bot upload ceiling
 POLL_SECONDS = 60         # 1 min; unchanged polls (304) cost no GitHub quota
 MAX_SEEN = 100
@@ -34,7 +34,12 @@ MAX_SEEN = 100
 
 # ------------------------------------------------------------------ config --
 def repo():
-    return (db.get_settings().get("gitly_repo") or DEFAULT_REPO).strip()
+    name = (db.get_settings().get("gitly_repo") or DEFAULT_REPO).strip()
+    # tolerate the common typo and fix it in place
+    if name.lower() in ("switchtomonk/gilty", "switchtomonk/gilty.git"):
+        db.set_settings({"gitly_repo": DEFAULT_REPO})
+        return DEFAULT_REPO
+    return name.rstrip("/")
 
 
 def channel():
@@ -437,7 +442,10 @@ def menu(page=0):
     """(text, keyboard) listing every release with its APK as a button."""
     rels = cached_releases()
     if not rels:
-        return ("📦 No releases found on <code>%s</code>." % telegram.esc(repo()), None)
+        return (f"📦 No releases found on <code>{telegram.esc(repo())}</code>.\n\n"
+                f"• If that repo name is wrong: <code>/gitly repo owner/name</code>\n"
+                f"• If it has no published releases yet, publish one and try again.",
+                None)
     pages = max(1, (len(rels) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
     rows = []
@@ -448,8 +456,11 @@ def menu(page=0):
         if apk:
             mb = int(apk.get("size") or 0) / (1024 * 1024)
             label = f"{name} ({tag}) · {mb:.1f} MB"
-            rows.append([{"text": label[:58],
-                          "callback_data": f"gh:{r.get('id')}"}])
+            rows.append([{"text": label[:52], "callback_data": f"gh:{r.get('id')}"}])
+            rows.append([{"text": "📥 send to me",
+                          "callback_data": f"gh:{r.get('id')}"},
+                         {"text": "📢 to channel",
+                          "callback_data": f"ghc:{r.get('id')}"}])
         else:
             rows.append([{"text": f"{name} ({tag}) · no APK"[:58],
                           "callback_data": f"gh:{r.get('id')}"}])
@@ -473,10 +484,17 @@ def _find_release(rid):
     return None
 
 
-async def send_release(cq, rid):
-    """Download one release's APK and send it to the DM."""
+async def send_release(cq, rid, to_channel=False):
+    """Download one release's APK and send it to the DM (or the channel)."""
     m = cq.get("message") or {}
     dm = (m.get("chat") or {}).get("id")
+    if to_channel:
+        dm = channel()
+        if not dm:
+            await asyncio.to_thread(
+                telegram.answer_callback_query, cq.get("id"),
+                "No channel set — use /gitly channel @yourchannel", True)
+            return
     rel = _find_release(rid)
     if not rel:
         await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),

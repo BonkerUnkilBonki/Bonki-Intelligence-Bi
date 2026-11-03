@@ -780,8 +780,17 @@ Gitly 1.2 (v1.2) · 7.0 MB
 ```
 
 - Lists **all** releases, newest first, 6 per page.
-- Tapping downloads that release's `.apk` and sends it — no need to hunt the
-  original channel post.
+- Each release has **two buttons**:
+
+```
+Gitly 1.1 (v1.1) · 6.0 MB
+[📥 send to me]  [📢 to channel]
+```
+
+  **📥 send to me** delivers the APK to your DM. **📢 to channel** posts it to the
+  channel set with `/gitly channel` — so you can re-publish an old release without
+  touching GitHub.
+- If no channel is set, the channel button says so instead of failing.
 - Releases with no APK show `· no APK`; tapping says so.
 - Anything over **50 MB** is not downloaded — you get the size and a direct
   download link, because Telegram's bot upload ceiling is 50 MB.

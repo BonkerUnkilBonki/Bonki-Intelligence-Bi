@@ -297,6 +297,15 @@ async def _handle_callback(cq):
             log.info("release send failed: %s", e)
         return
 
+    if data.startswith("ghc:"):
+        # send a release straight to the configured channel
+        try:
+            from . import gitly
+            await gitly.send_release(cq, data[4:], to_channel=True)
+        except Exception as e:
+            log.info("release->channel failed: %s", e)
+        return
+
     if data.startswith("ghp:"):
         page = data[4:]
         m = cq.get("message") or {}
