@@ -395,6 +395,17 @@ async def handle_update(update):
         return                              # never react to bots (incl. itself)
 
     if ctype == "private":
+        # Owner pasted an API key? Detect, test and save it with no command.
+        try:
+            if approval.is_owner(frm.get("id")) and text:
+                from . import keys as _keys
+                note = await _keys.auto_add(text)
+                if note:
+                    await _send(note, chat.get("id"), reply_to=msg.get("message_id"))
+                    return
+        except Exception as e:
+            log.info("key auto-add failed: %s", e)
+
         # A DM must NEVER be silent: a non-owner messaging the bot and getting
         # nothing at all reads as a broken bot - which is exactly what happened.
         try:
@@ -429,6 +440,13 @@ async def handle_update(update):
                          chat.get("username") or "")
 
         if approval.gate(chat.get("id"), chat.get("username")):   # not verified -> do nothing
+            # The owner must still be able to ask why: /diag has to work in an
+            # unapproved chat, because that is exactly when it is needed.
+            if text.startswith("/") and approval.is_owner(frm.get("id")):
+                _c = text.split()[0].lstrip("/").split("@")[0].lower()
+                if _c in ("diag", "why", "status"):
+                    await rose.handle_command(chat, msg, frm, _c, "")
+                    return
             await approval.announce(chat)
             if (ctype in ("group", "supergroup") and text and is_addressed(msg, text)
                 and modules.enabled(chat.get("id"), "ai")):

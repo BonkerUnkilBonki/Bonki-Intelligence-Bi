@@ -24,8 +24,9 @@ import re
 import tempfile
 import time
 
-from . import (analytics, ask, categorize, db, embed, extras, federation, memory,
-               ml, modules, security, skills, stickers, telegram)
+from . import (analytics, ask, categorize, db, embed, extras, federation, keys,
+               memory, ml, modules, ollama, security, skills, stickers, telegram,
+               websearch)
 
 log = logging.getLogger("rose")
 
@@ -951,6 +952,73 @@ async def cmd_decisions(chat, msg, user, args):
 # -------------------------------------------------------------------- ML -----
 # ------------------------------------------------------ anti-spam commands ---
 # ------------------------------------------------------------------ config ---
+async def cmd_diag(chat, msg, user, args):
+    """Why is (or isn't) the bot working in THIS chat? One screen, no guessing."""
+    from . import approval, handlers, indexer, llm, modules, userbot
+    cid = chat.get("id")
+    ctype = chat.get("type")
+    lines = ["🩺 <b>Bonki diagnostics for this chat</b>", ""]
+
+    lines.append(f"• chat: <code>{cid}</code> ({telegram.esc(str(ctype))})")
+
+    # 1. is the bot allowed to work here at all?
+    try:
+        gated = approval.gate(cid, chat.get("username"))
+    except Exception:
+        gated = False
+    approved = db.is_approved(cid, chat.get("username"))
+    lines.append(f"• approved: {'✅ yes' if approved else '❌ NO — owner must approve'}")
+    if gated:
+        lines.append("  ⛔ <b>This is why I stay silent.</b> Approve it with "
+                     "<code>/pending</code> then <code>/approve &lt;id&gt;</code>.")
+
+    # 2. paused?
+    paused = db.is_paused()
+    lines.append(f"• paused: {'⛔ YES — everything is stopped' if paused else '✅ no'}")
+
+    # 3. admin rights
+    bot_id = handlers._bot_identity.get("id")
+    try:
+        m = (await asyncio.to_thread(telegram.get_chat_member, cid, bot_id)).get("result") or {}
+        status = m.get("status")
+        if status in ("administrator", "creator"):
+            missing = [k for k in ("can_delete_messages", "can_restrict_members",
+                                   "can_ban_users", "can_invite_users")
+                       if not m.get(k)]
+            lines.append("• admin: ✅" + (f" (missing: {', '.join(missing)})"
+                                         if missing else " (all rights)"))
+        else:
+            lines.append(f"• admin: ❌ <b>{telegram.esc(str(status))}</b> — moderation, "
+                         f"CAPTCHA and locks will not work")
+    except Exception as e:
+        lines.append(f"• admin: ⚠️ could not check ({telegram.esc(str(e))[:40]})")
+
+    # 4. modules
+    off = [modules.MODULES[n][0] for n in modules.MODULES if not modules.enabled(cid, n)]
+    lines.append("• modules off: " + (", ".join(off) if off else "none"))
+
+    # 5. index
+    try:
+        n = db.count_files(cid)
+        lines.append(f"• files indexed here: <b>{n}</b>")
+        if n == 0:
+            lines.append("  ℹ️ I only see messages from when I joined. Old history "
+                         "needs /userbot.")
+    except Exception:
+        pass
+
+    # 6. brains
+    lines.append(f"• AI: {telegram.esc(llm.describe_model())}")
+    lines.append(f"• user account: {'✅ on' if userbot.is_running() else '⭕ off'}")
+    ws = db.get_settings().get("wake_words") or "bonki"
+    lines.append(f"• wake words: <code>{telegram.esc(ws)}</code> "
+                 f"(or start with @{telegram.esc(handlers._bot_identity.get('username') or 'the bot')})")
+
+    lines.append("")
+    lines.append("<i>Reply to a message or use /tag @user 5 if tagging does nothing.</i>")
+    await _reply(chat, msg, "\n".join(lines))
+
+
 async def cmd_config(chat, msg, user, args):
     """In-Telegram switches for every module, so Bonki can coexist with Rose."""
     cid = chat.get("id")
@@ -1115,6 +1183,122 @@ async def cmd_flood(chat, msg, user, args):
                  f"🌊 Antiflood: <b>{limit}</b> messages in "
                  f"<b>{conf.get('flood_window') or 10}s</b> → mute "
                  f"{conf.get('flood_mute_minutes') or 10}m.")
+
+
+# --------------------------------------------------------------- AI keys ----
+async def cmd_setkey(chat, msg, user, args):
+    """Add one or more AI keys; each is tested before it is stored."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, "🔒 Owner only — this stores credentials.")
+    parts = (args or "").strip().split(None, 1)
+    if len(parts) < 2:
+        names = ", ".join(sp["name"] for sp in keys.llm.SPECS)
+        return await _reply(chat, msg,
+                            "Usage: <code>/setkey groq gsk_xxx</code>\n"
+                            "Several at once: <code>/setkey groq k1,k2,k3</code>\n\n"
+                            f"Providers: {telegram.esc(names)}\n"
+                            "Where free keys come from: /freeai")
+    name = parts[0].lower().strip()
+    raw = parts[1].strip()
+    added, failed = [], []
+    for k in [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]:
+        try:
+            await keys.test_key(name, k)
+        except Exception as e:
+            failed.append(f"{keys.mask(k)} ({telegram.esc(str(e))[:60]})")
+            continue
+        try:
+            is_new, total = keys.add_key(name, k)
+            try:
+                from . import envfile
+                envfile.set_env(f"{name.upper()}_API_KEY", k)
+            except Exception:
+                pass
+            added.append((keys.mask(k), total))
+        except Exception as e:
+            failed.append(f"{keys.mask(k)} ({telegram.esc(str(e))[:60]})")
+    lines = []
+    if added:
+        lines.append(f"✅ Added to <b>{telegram.esc(name)}</b>: " +
+                     ", ".join(f"<code>{m}</code>" for m, _ in added))
+        lines.append(f"Pool now holds <b>{added[-1][1]}</b> key(s) — used in order, "
+                     f"next one takes over when this hits its quota.")
+    if failed:
+        lines.append("⚠️ Rejected: " + "; ".join(failed))
+    if not lines:
+        lines.append("Nothing added.")
+    await _reply(chat, msg, "\n".join(lines))
+
+
+async def cmd_keys(chat, msg, user, args):
+    """Which providers have keys, how many, and which is active."""
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, "🔒 Owner only.")
+    rows = keys.status()
+    lines = ["🔑 <b>AI keys</b>", ""]
+    have = [r for r in rows if r["count"]]
+    if not have:
+        lines.append("No keys yet. Get a free one (/freeai) then:")
+        lines.append("<code>/setkey gemini YOUR_KEY</code>")
+    for r in rows:
+        if not r["count"]:
+            continue
+        mark = " ← active" if r["active"] else ""
+        extra = f" (+{r['count'] - 1} more)" if r["count"] > 1 else ""
+        lines.append(f"• <b>{r['name']}</b> — <code>{r['masked']}</code>{extra}{mark}")
+    lines.append("")
+    from . import llm as _llm
+    lines.append(f"Brain: <b>{telegram.esc(_llm.describe_model())}</b>")
+    lines.append("<code>/setkey &lt;provider&gt; &lt;key&gt;</code> · "
+                 "<code>/delkey &lt;provider&gt;</code> · /freeai")
+    await _reply(chat, msg, "\n".join(lines))
+
+
+async def cmd_delkey(chat, msg, user, args):
+    from . import approval
+    if not approval.is_owner((user or {}).get("id")):
+        return await _reply(chat, msg, "🔒 Owner only.")
+    name = (args or "").strip().lower()
+    if not name:
+        return await _reply(chat, msg, "Usage: <code>/delkey groq</code>")
+    keys.remove_keys(name)
+    await _reply(chat, msg, f"🗑 Removed all <b>{telegram.esc(name)}</b> keys.")
+
+
+async def cmd_freeai(chat, msg, user, args):
+    """Where free AI keys actually come from."""
+    lines = ["🆓 <b>Free AI keys — where to get them</b>", ""]
+    for label, prov, url, note in keys.FREE_TIERS:
+        lines.append(f"• <a href=\"{url}\">{telegram.esc(label)}</a> — {telegram.esc(note)}")
+        lines.append(f"   then: <code>/setkey {prov} YOUR_KEY</code>")
+    lines.append("")
+    lines.append("<i>A key is issued to an account holder — I can't create or find "
+                 "one for you, and using keys posted publicly would be using someone "
+                 "else's credentials.</i>")
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
+
+
+async def cmd_web(chat, msg, user, args):
+    """Search the web (no API key). Fails loudly if the host blocks it."""
+    q = (args or "").strip()
+    if not q:
+        return await _reply(chat, msg, "Usage: <code>/web best android apk sites</code>")
+    await _reply(chat, msg, "🌐 Searching the web…")
+    try:
+        rows = await asyncio.to_thread(websearch.search, q, 5)
+    except Exception as e:
+        return await _reply(chat, msg,
+                            f"⚠️ Web search unavailable: {telegram.esc(str(e))}\n"
+                            f"<i>This needs outbound HTTPS to duckduckgo.com — some "
+                            f"hosts block it.</i>")
+    if not rows:
+        return await _reply(chat, msg, "No results.")
+    lines = [f"🌐 <b>Web results for</b> “{telegram.esc(q)}”"]
+    for title, url in rows:
+        lines.append(f'• <a href="{url}">{telegram.esc(title[:70])}</a>')
+    await _reply(chat, msg, "\n".join(lines)[:telegram.MAX_MESSAGE])
 
 
 async def cmd_ask(chat, msg, user, args):
@@ -1623,8 +1807,15 @@ COMMANDS = {
     "ml": cmd_ml, "mlstatus": cmd_ml, "brain": cmd_ml,
     "dupes": cmd_dupes, "duplicates": cmd_dupes,
     "ask": cmd_ask, "q": cmd_ask, "qa": cmd_ask,
+    "web": cmd_web, "google": cmd_web, "search_web": cmd_web,
+    "setkey": cmd_setkey, "addkey": cmd_setkey,
+    "keys": cmd_keys, "mykeys": cmd_keys,
+    "delkey": cmd_delkey, "rmkey": cmd_delkey,
+    "freeai": cmd_freeai, "aikeys": cmd_freeai,
+    "ollama": ollama.cmd_ollama, "localai": ollama.cmd_ollama,
     "captcha": cmd_captcha,
     "config": cmd_config, "modules": cmd_config, "features": cmd_config,
+    "diag": cmd_diag, "why": cmd_diag, "status": cmd_diag,
     "permissions": cmd_permissions, "perms": cmd_permissions,
     "filter": extras.cmd_filter, "stop": extras.cmd_stop,
     "stopall": extras.cmd_stop, "filters": extras.cmd_filters,

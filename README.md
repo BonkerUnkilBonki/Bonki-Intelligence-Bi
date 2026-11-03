@@ -678,6 +678,201 @@ greetings, thanks, identity and rudeness well, and gives a short honest line for
 anything else. For real conversation, connect an LLM — Bonki then prefers it and
 falls back to these rules offline.
 
+## `/diag` — "why isn't it working in this chat?"
+
+Run it in the chat that seems dead. One screen, no guessing:
+
+```
+🩺 Bonki diagnostics for this chat
+
+• chat: -1001234567890 (supergroup)
+• approved: ❌ NO — owner must approve
+  ⛔ This is why I stay silent.
+• paused: ✅ no
+• admin: ✅ (missing: can_restrict_members)
+• modules off: none
+• files indexed here: 2702
+• AI: gemini / gemini-2.0-flash
+• user account: ✅ on
+• wake words: bonki
+```
+
+It works **even in an unapproved chat** when the owner asks — that is precisely
+when it is needed. Members cannot run it.
+
+## Fewer wrong files: confidence gating
+
+The single biggest cause of "it sent the wrong file" was not bad ranking — it was
+**certainty**. The bot shared whatever came first even when three files were
+equally plausible.
+
+Now, before sharing, it checks two things:
+
+- is the top score high enough (`≥ 0.95`)?
+- is the runner-up at least **18% behind**, relatively?
+
+If either fails — and the query is not a full name match — it **shows the
+candidates with links and buttons instead of guessing**:
+
+```
+🔎 Not sure which one you mean by "whatsapp":
+1. WhatsApp Messenger 2.24.apk — 48 MB
+2. WhatsApp Business 2.23.apk — 51 MB
+3. WhatsApp Mod Gold.apk — 44 MB
+[1] [2] [3] [❌ None of these]
+```
+
+Verified: `whatsapp` (three matches) asks; `whatsapp messenger 2.24` shares;
+`netflix` with one match shares. A wrong file you have to delete is worse than one
+extra tap.
+
+Also fixed: the LLM "pick" step could previously overrule a correct top match. It
+now refuses to overrule an exact name match or a clear leader.
+
+## Continuous background learning
+
+A loop runs every 20 minutes while the bot is up and does, with no user action:
+
+- rebuilds the TF-IDF model from the current file list
+- retrains the logistic-regression ranker once it has enough feedback
+- clears the embedding cache so newly added files become searchable by meaning
+- enriches remembered files that still have no tags
+
+## Adding AI keys from inside Telegram
+
+```
+/freeai                       where free keys actually come from (with links)
+/setkey groq gsk_xxx          test it, store it, start using it
+/setkey groq k1,k2,k3         add several - used in order
+/keys                         what's configured (masked) and which is active
+/delkey groq                  remove them
+```
+
+**Every key is tested before it is stored**, so a typo or an expired key is
+rejected immediately instead of failing mid-conversation.
+
+**Key pools and rotation.** Several keys per provider are supported. When one hits
+its free quota (HTTP 429) or is rejected, the next is tried automatically — verified:
+key #1 returned 429, key #2 answered, and the bot carried on. That is the closest
+thing to "auto keys" that exists.
+
+**What Bonki will not do: find or generate keys.** A key is issued by a provider to
+an account holder. Scraping publicly posted keys off the internet would mean using
+someone else's credentials — a terms-of-service breach, usually revoked within
+hours, and frequently a honeypot. `/freeai` lists the legitimate free sources
+instead.
+
+## Auto-add and auto-save keys
+
+**Just paste the key.** In a DM with the bot, sending a bare key is enough — Bonki
+recognises the provider from its prefix, tests it, saves it, and writes it to
+`.env`:
+
+```
+you:  gsk_abcdefghijklmnop…
+bot:  ✅ Saved a groq key (gsk_…3456). Pool now holds 1.
+      Also written to .env, so it survives a restart.
+```
+
+Recognised prefixes: `gsk_` (Groq), `AIza…` (Gemini), `sk-or-v1-` (OpenRouter),
+`sk-…` (OpenAI), `csk-` (Cerebras), `hf_` (Hugging Face), 64-char hex (Together).
+
+Safety rules that apply:
+
+- **Owner only.** A member pasting a key is ignored — it never reaches the store.
+- **Tested before saving.** A wrong or expired key is rejected with the provider's
+  own reason instead of being stored and failing later.
+- **Written to `.env` as well as the state store**, so an ephemeral disk or a
+  redeploy does not lose it. If the host is read-only, it says so rather than
+  pretending.
+
+**What "auto" does not include:** discovering or generating keys. A key is issued
+by a provider to an account holder — see `/freeai` for where the free ones come
+from.
+
+## Free and open-source AI — Ollama, auto-connected
+
+**Open-weight models running on your own machine**: no account, no key, no cost,
+and nothing leaves your hardware. That is what "free and open source AI" actually
+delivers, and Bonki now finds it by itself.
+
+```
+/ollama            status: server, model, what's installed
+/ollama detect     search for a local server and switch to it
+/ollama setup      3-step install instructions
+/ollama url http://IP:11434    point at a remote one
+```
+
+At startup, **if no AI provider is configured, Bonki probes for Ollama
+automatically** (`localhost`, `127.0.0.1`, `host.docker.internal`, `ollama`) and
+switches the brain to it if it answers. Nothing to set up.
+
+**Open models that run well on modest hardware:**
+
+| Model | Size | Good for |
+|---|---|---|
+| `tinyllama` | 640 MB | weak machines, quick replies |
+| `llama3.2` | 2 GB | best all-rounder at this size |
+| `qwen2.5` | 4.7 GB | multilingual, strong reasoning |
+| `gemma2` | 5 GB | fast and capable |
+
+**Bot on a server, Ollama on your PC?** Start Ollama with `OLLAMA_HOST=0.0.0.0` and
+run `/ollama url http://YOUR-IP:11434`. Use a tunnel (Tailscale, Cloudflare Tunnel)
+rather than exposing the port to the internet.
+
+**Honest limits:** Ollama needs roughly 8 GB RAM for the small models and more for
+bigger ones, so it will not run on a 256 MB free host. It also writes prose far
+worse than Gemini or Groq — a 2 GB model is a fallback, not a replacement. The bot
+prefers an API key when one exists and uses Ollama when none does.
+
+## Eighteen providers, auto-switch, and owner notifications
+
+**Local open-source servers (no key, no cost, nothing leaves your machine):**
+`ollama` · `lmstudio` · `vllm` · `llamacpp` · `localai`
+
+**Free/cheap hosts of open-weight models:**
+`gemini` · `groq` · `openrouter` · `cerebras` · `mistral` · `github` ·
+`together` · `sambanova` · `hyperbolic` · `fireworks` · `deepinfra` ·
+`huggingface` · `openai`
+
+**Auto-switch.** Every call walks the providers in order, then each key in that
+provider's pool. A failure marks that key cooling (15 min for a quota error, 6
+hours for an auth error) and the next one answers — so a dead key or an exhausted
+free tier never takes the bot down.
+
+**The owner gets a DM whenever the model changes:**
+
+```
+🟢 AI model started
+• groq / llama-3.1-8b-instant
+• key pool: 2 key(s)
+
+🔀 Switched AI model
+• now: gemini / gemini-2.0-flash
+• was: groq
+• reason: the previous model failed or hit its quota
+```
+
+Only one message per event — a switch on the first call sends the switch notice
+alone, and the same provider is not re-announced within 10 minutes, so a flapping
+endpoint cannot spam you. Verified: 1 DM on switch, 1 on clean start, 0 on repeats.
+
+## More free AI providers (auto-hook)
+
+Nine providers are now understood, all auto-detected from whichever key exists:
+
+`gemini` · `openai` · `openrouter` · `groq` · `together` · `cerebras` ·
+`deepinfra` · `huggingface` · `ollama`
+
+Any OpenAI-compatible endpoint works by setting `*_BASE_URL` and `*_MODEL`. If the
+active one fails or hits quota, the next is used automatically and remembered.
+
+## `/web` — internet search
+
+`/web <query>` searches the web with no API key (DuckDuckGo HTML, then the lite
+endpoint). **It depends on outbound HTTPS being allowed**: many hosts block it, and
+when they do the bot says so plainly rather than failing silently.
+
 ## Why a search can return the wrong file (and how it is fixed)
 
 Ranking blends four signals: fuzzy spelling, TF-IDF, learned associations and

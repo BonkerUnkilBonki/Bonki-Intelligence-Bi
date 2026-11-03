@@ -59,10 +59,78 @@ SPECS = [
      "env": "GROQ_API_KEY",
      "base": ("groq_base_url", "GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
      "model": ("groq_model", "GROQ_MODEL", "llama-3.1-8b-instant")},
+    {"name": "together", "kind": "openai", "key": "together_api_key",
+     "env": "TOGETHER_API_KEY",
+     "base": ("together_base_url", "TOGETHER_BASE_URL", "https://api.together.xyz/v1"),
+     "model": ("together_model", "TOGETHER_MODEL",
+               "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free")},
+    {"name": "cerebras", "kind": "openai", "key": "cerebras_api_key",
+     "env": "CEREBRAS_API_KEY",
+     "base": ("cerebras_base_url", "CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
+     "model": ("cerebras_model", "CEREBRAS_MODEL", "llama3.1-8b")},
+    {"name": "deepinfra", "kind": "openai", "key": "deepinfra_api_key",
+     "env": "DEEPINFRA_API_KEY",
+     "base": ("deepinfra_base_url", "DEEPINFRA_BASE_URL",
+              "https://api.deepinfra.com/v1/openai"),
+     "model": ("deepinfra_model", "DEEPINFRA_MODEL",
+               "meta-llama/Meta-Llama-3.1-8B-Instruct")},
+    {"name": "huggingface", "kind": "openai", "key": "hf_api_key",
+     "env": "HF_API_KEY",
+     "base": ("hf_base_url", "HF_BASE_URL", "https://api-inference.huggingface.co/v1"),
+     "model": ("hf_model", "HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")},
     {"name": "ollama", "kind": "openai", "key": "ollama_api_key",
      "env": "OLLAMA_API_KEY",
      "base": ("ollama_base_url", "OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-     "model": ("ollama_model", "OLLAMA_MODEL", "llama3.2")},
+     "model": ("ollama_model", "OLLAMA_MODEL", "llama3.2"), "local": True},
+
+    # ---- other local open-source servers (all OpenAI-compatible, no key) ----
+    {"name": "lmstudio", "kind": "openai", "key": "lmstudio_api_key",
+     "env": "LMSTUDIO_API_KEY",
+     "base": ("lmstudio_base_url", "LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
+     "model": ("lmstudio_model", "LMSTUDIO_MODEL", "local-model"), "local": True},
+    {"name": "vllm", "kind": "openai", "key": "vllm_api_key",
+     "env": "VLLM_API_KEY",
+     "base": ("vllm_base_url", "VLLM_BASE_URL", "http://localhost:8000/v1"),
+     "model": ("vllm_model", "VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct"),
+     "local": True},
+    {"name": "llamacpp", "kind": "openai", "key": "llamacpp_api_key",
+     "env": "LLAMACPP_API_KEY",
+     "base": ("llamacpp_base_url", "LLAMACPP_BASE_URL", "http://localhost:8080/v1"),
+     "model": ("llamacpp_model", "LLAMACPP_MODEL", "local-model"), "local": True},
+    {"name": "localai", "kind": "openai", "key": "localai_api_key",
+     "env": "LOCALAI_API_KEY",
+     "base": ("localai_base_url", "LOCALAI_BASE_URL", "http://localhost:8080/v1"),
+     "model": ("localai_model", "LOCALAI_MODEL", "llama-3.2-3b-instruct"),
+     "local": True},
+
+    # ---- free/cheap hosts of open-weight models ----
+    {"name": "mistral", "kind": "openai", "key": "mistral_api_key",
+     "env": "MISTRAL_API_KEY",
+     "base": ("mistral_base_url", "MISTRAL_BASE_URL", "https://api.mistral.ai/v1"),
+     "model": ("mistral_model", "MISTRAL_MODEL", "open-mistral-nemo")},
+    {"name": "github", "kind": "openai", "key": "github_models_key",
+     "env": "GITHUB_MODELS_TOKEN",
+     "base": ("github_models_base_url", "GITHUB_MODELS_BASE_URL",
+              "https://models.inference.ai.azure.com"),
+     "model": ("github_models_model", "GITHUB_MODELS_MODEL", "gpt-4o-mini")},
+    {"name": "sambanova", "kind": "openai", "key": "sambanova_api_key",
+     "env": "SAMBANOVA_API_KEY",
+     "base": ("sambanova_base_url", "SAMBANOVA_BASE_URL",
+              "https://api.sambanova.ai/v1"),
+     "model": ("sambanova_model", "SAMBANOVA_MODEL",
+               "Meta-Llama-3.1-8B-Instruct")},
+    {"name": "hyperbolic", "kind": "openai", "key": "hyperbolic_api_key",
+     "env": "HYPERBOLIC_API_KEY",
+     "base": ("hyperbolic_base_url", "HYPERBOLIC_BASE_URL",
+              "https://api.hyperbolic.xyz/v1"),
+     "model": ("hyperbolic_model", "HYPERBOLIC_MODEL",
+               "meta-llama/Llama-3.3-70B-Instruct")},
+    {"name": "fireworks", "kind": "openai", "key": "fireworks_api_key",
+     "env": "FIREWORKS_API_KEY",
+     "base": ("fireworks_base_url", "FIREWORKS_BASE_URL",
+              "https://api.fireworks.ai/inference/v1"),
+     "model": ("fireworks_model", "FIREWORKS_MODEL",
+               "accounts/fireworks/models/llama-v3p1-8b-instruct")},
 ]
 
 
@@ -73,22 +141,137 @@ def _spec(name):
     return None
 
 
-def _key_for(sp):
+def _keys_for(sp):
+    """All keys for a provider: settings (comma/newline separated) then env.
+
+    Supporting several keys per provider is what makes "auto" useful - when one
+    hits its free quota, the next is used instead of the bot going silent.
+    """
     if not sp:
-        return ""
-    k = _s(sp["key"], sp["env"])
-    if not k and sp["name"] == "ollama":
-        return "ollama"                     # local server needs no real key
-    return k
+        return []
+    raw = _s(sp["key"], sp["env"])
+    out, seen = [], set()
+    for part in re.split(r"[,\n;]+", raw or ""):
+        k = part.strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    if not out and sp.get("local"):
+        return ["local"]                    # local server needs no real key
+    return out
+
+
+_NOTIFY_COOLDOWN = 600          # don't repeat the same notice within 10 minutes
+
+
+def _notify_owner(text, key=""):
+    """DM the owner when an AI model starts or the bot switches between them.
+
+    Throttled per provider so a flapping endpoint cannot spam the DM.
+    """
+    try:
+        from . import approval, telegram
+        oid = approval.owner_id()
+        if not oid:
+            return
+        now = time.time()
+        try:
+            last = float(db.get_settings().get("llm_notify_last") or 0)
+            last_key = db.get_settings().get("llm_notify_key") or ""
+        except (TypeError, ValueError):
+            last, last_key = 0, ""
+        if key and key == last_key and (now - last) < _NOTIFY_COOLDOWN:
+            return
+        telegram.send_message(text, chat_id=oid)
+        db.set_settings({"llm_notify_last": str(int(now)), "llm_notify_key": key})
+    except Exception as e:
+        log.info("owner notify failed: %s", e)
+
+
+def describe_model():
+    """'provider / model' for the active brain, for messages and the dashboard."""
+    name = provider()
+    if name == "off":
+        return "built-in ML (no AI model)"
+    sp = _spec(name) or {}
+    model = _s(*sp["model"]) if sp.get("model") else ""
+    return f"{name} / {model}" if model else name
+
+
+def _health():
+    try:
+        return json.loads(db.get_settings().get("key_health") or "{}")
+    except Exception:
+        return {}
+
+
+def _save_health(h):
+    try:
+        db.set_settings({"key_health": json.dumps(h)[:8000]})
+    except Exception:
+        pass
+
+
+def _kid(name, key):
+    """Stable id for a key without storing it in the health map."""
+    k = str(key or "")
+    return f"{name}:{k[-6:] if len(k) > 6 else k}"
+
+
+def key_ready(name, key, health=None):
+    """False while a key is cooling down after a quota/auth failure."""
+    h = health if health is not None else _health()
+    e = h.get(_kid(name, key)) or {}
+    return float(e.get("until") or 0) <= time.time()
+
+
+def mark_fail(name, key, err):
+    """A 429 cools for 15 min; an auth failure cools for 6 hours."""
+    h = _health()
+    text = str(err).lower()
+    mins = 15
+    if "401" in text or "invalid" in text or "unauthor" in text or "403" in text:
+        mins = 360
+    h[_kid(name, key)] = {"until": time.time() + mins * 60,
+                          "err": str(err)[:120], "t": time.time()}
+    _save_health(h)
+    log.info("key %s cooling for %dm", _kid(name, key), mins)
+
+
+def mark_ok(name, key):
+    h = _health()
+    if h.pop(_kid(name, key), None) is not None:
+        _save_health(h)
+
+
+def _key_for(sp):
+    ks = _keys_for(sp)
+    return ks[0] if ks else ""
+
+
+def _explicit(sp):
+    """Was this provider configured on purpose (a key, or a base URL for local)?"""
+    if _keys_for(sp):
+        # a local spec reports a placeholder key, so check the base separately
+        if not sp.get("local"):
+            return True
+    if sp.get("local"):
+        base_setting, base_env = sp["base"][0], sp["base"][1]
+        return bool((db.get_settings().get(base_setting) or "").strip()
+                    or (os.environ.get(base_env) or "").strip())
+    return False
 
 
 def available():
-    """Auto-hook: providers that have credentials right now, in priority order."""
+    """Auto-hook: providers that have credentials right now, in priority order.
+
+    A local server counts ONLY if it was explicitly configured. Otherwise every
+    message would try to reach a dead localhost:1234 before answering, which made
+    the bot look dead instead of using its built-in ML.
+    """
     out = []
     for sp in SPECS:
-        if sp["name"] == "ollama" and not _s(sp["key"], sp["env"]):
-            continue                        # only if explicitly configured
-        if _key_for(sp):
+        if _explicit(sp):
             out.append(sp["name"])
     return out
 
@@ -169,20 +352,54 @@ def complete(prompt, system=None, temperature=0.2, max_tokens=900, json_mode=Fal
         sp = _spec(name)
         if not sp:
             continue
-        try:
-            if sp["kind"] == "gemini":
-                out = _gemini(prompt, system, temperature, max_tokens, json_mode, sp)
-            else:
-                out = _openai(prompt, system, temperature, max_tokens, json_mode, sp)
-            if out:
-                if name != active:
-                    db.set_settings({"llm_provider": name,
-                                     "llm_switched_to": name,
-                                     "llm_switched_at": str(int(time.time()))})
-                    log.warning("llm auto-switched to %s", name)
-                return out
-        except Exception as e:
-            log.warning("llm(%s) failed: %s", name, e)
+        all_keys = _keys_for(sp) or [None]
+        health = _health()
+        ready = [k for k in all_keys if k is None or key_ready(name, k, health)]
+        # if every key is cooling, try them anyway rather than giving up
+        keys = ready or all_keys
+        for idx, key in enumerate(keys):
+            try:
+                if sp["kind"] == "gemini":
+                    out = _gemini(prompt, system, temperature, max_tokens,
+                                  json_mode, sp, key)
+                else:
+                    out = _openai(prompt, system, temperature, max_tokens,
+                                  json_mode, sp, key)
+                if out:
+                    if key:
+                        mark_ok(name, key)
+                    # only announce a "start" when this IS the active model -
+                    # otherwise the switch notice below says it all
+                    if name == active and not db.get_settings().get("llm_started_notified"):
+                        db.set_settings({"llm_started_notified": "1"})
+                        _notify_owner(
+                            f"🟢 <b>AI model started</b>\n"
+                            f"• {describe_model()}\n"
+                            f"• key pool: {len(all_keys)} key(s)"
+                            + ("\n• local model — free, nothing leaves your machine"
+                               if sp.get("local") else ""),
+                            key=f"start:{name}")
+                    if name != active:
+                        db.set_settings({"llm_provider": name,
+                                         "llm_switched_to": name,
+                                         "llm_switched_at": str(int(time.time()))})
+                        log.warning("llm auto-switched to %s", name)
+                        _notify_owner(
+                            f"🔀 <b>Switched AI model</b>\n"
+                            f"• now: <b>{name}</b>"
+                            + (f" / <code>{_s(*sp['model'])}</code>"
+                               if sp.get("model") else "")
+                            + f"\n• was: {active or 'nothing'}"
+                            + ("\n• reason: the previous model failed or hit its quota"
+                               if active and active != "off" else ""),
+                            key=f"switch:{name}")
+                    if idx:
+                        log.info("llm(%s) answered on key #%d", name, idx + 1)
+                    return out
+            except Exception as e:
+                log.warning("llm(%s) key #%d failed: %s", name, idx + 1, e)
+                if key:
+                    mark_fail(name, key, e)
     return None
 
 
@@ -213,9 +430,10 @@ def _loads(text):
 
 
 # --------------------------------------------------------------- backends ---
-def _gemini(prompt, system, temperature, max_tokens, json_mode, spec=None):
+def _gemini(prompt, system, temperature, max_tokens, json_mode, spec=None,
+            key=None):
     sp = spec or _spec("gemini")
-    key = _key_for(sp)
+    key = key or _key_for(sp)
     model = _s(*sp["model"])
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -235,9 +453,10 @@ def _gemini(prompt, system, temperature, max_tokens, json_mode, spec=None):
     return text.strip() or None
 
 
-def _openai(prompt, system, temperature, max_tokens, json_mode, spec=None):
+def _openai(prompt, system, temperature, max_tokens, json_mode, spec=None,
+            key=None):
     sp = spec or _spec("openai")
-    key = _key_for(sp)
+    key = key or _key_for(sp)
     base = _s(*sp["base"]).rstrip("/")
     model = _s(*sp["model"])
     messages = []

@@ -19,7 +19,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 from fastapi.templating import Jinja2Templates
 
 from . import (agent, analytics, approval, db, federation, handlers, health,
-               indexer, learn, llm, skills, telegram, userbot)
+               indexer, learn, learnloop, llm, ollama, skills, telegram, userbot)
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +49,19 @@ async def lifespan(app: FastAPI):
     else:
         _set_webhook()
         log.info("telegram mode: webhook")
+    # If no AI is configured yet, look for a local open-source one (Ollama).
+    # Free, no key, nothing leaves the machine - so this is a safe default.
+    try:
+        if llm.provider() == "off":
+            res = await asyncio.to_thread(ollama.autodetect, True)
+            if res.get("ok"):
+                log.info("open-source AI auto-connected: %s (%s)",
+                         res.get("model"), res.get("base"))
+            else:
+                log.info("no local Ollama found - running on built-in ML")
+    except Exception as e:
+        log.info("ollama autodetect skipped: %s", e)
+
     _set_commands()
     asyncio.create_task(_auto_index_loop())
     asyncio.create_task(_keepalive_loop())
@@ -100,6 +113,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(skills.loop())
         asyncio.create_task(analytics.snapshot_loop())
         asyncio.create_task(federation.sync_loop())
+        asyncio.create_task(learnloop.loop())
     except Exception as e:
         log.warning("background loops not started: %s", e)
     yield

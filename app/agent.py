@@ -69,6 +69,8 @@ _SYSTEM = (
 )
 
 MIN_SCORE = 0.30          # below this, we say we found nothing
+SHARE_CONF = 0.95         # auto-share only above this score
+SHARE_MARGIN = 0.18       # ...and the runner-up must be this far behind (relative)
 
 
 # ------------------------------------------------------------ small utils ---
@@ -216,22 +218,34 @@ def _score(q, f):
 
 
 def _exact_rank(query, f):
-    """2 = the query is contained in the file name, 1 = every word is, 0 = no.
+    """How strongly the query names this file.
 
-    Deliberately name-only: a caption mentioning "netflix" must never beat a file
-    actually called Netflix.apk.
+    2 = the query covers most of the file name (a real name match)
+    1 = every query word appears in the name, but the name says more
+    0 = no
+
+    Name-only on purpose: a caption mentioning "netflix" must never beat a file
+    actually called Netflix.apk. Level 2 requires the query to cover ~70% of the
+    name's words, so a bare "whatsapp" against "WhatsApp Mod Gold.apk" is level 1
+    (ambiguous) rather than certain.
     """
     q = norm(query or "")
-    if not q:
-        return 0
     n = norm(_name_core(f.get("name", "")))
-    if not n:
+    if not q or not n:
         return 0
     q_core = re.sub(r"\.[a-z0-9]{1,6}$", "", q).strip()
-    if len(q_core) >= 3 and q_core in n:
+    if q_core and q_core == n:
         return 2
-    qt = [t for t in tokens(q_core) if t not in _EXT_WORDS]
-    if qt and all(t in n for t in qt):
+    qt = {t for t in tokens(q_core) if t not in _EXT_WORDS}
+    ntok = {t for t in tokens(n) if t not in _EXT_WORDS}
+    if not qt or not ntok:
+        return 0
+    inter = qt & ntok
+    if not inter:
+        return 0
+    if len(inter) / len(ntok) >= 0.7:
+        return 2
+    if qt <= ntok or (q_core and q_core in n):
         return 1
     return 0
 
@@ -258,7 +272,11 @@ async def _llm_pick(query, candidates):
     if not llm.enabled() or len(candidates) < 2:
         return candidates[0][1] if candidates else None
     # a clear leader doesn't need a second opinion - skip the round-trip
-    if candidates[0][0] - candidates[1][0] >= 0.25:
+    # A clear leader, or an exact name match, is not up for a second opinion.
+    # Letting a small model re-pick here was a real source of wrong files.
+    if candidates[0][0] - candidates[1][0] >= 0.35:
+        return candidates[0][1]
+    if _exact_rank(query, candidates[0][1]) >= 1:
         return candidates[0][1]
     listing = "\n".join(
         f"{i}. {f['name']} [{f.get('ext')}] size={human_size(f.get('size'))} "
@@ -338,6 +356,10 @@ async def find_best(query, chat_id):
         return None, []
     best_score, best = ranked[0]
     best = await _llm_pick(query, ranked) or best
+    try:
+        best["_score"] = best_score
+    except Exception:
+        pass
     others = [f for s, f in ranked[1:6] if s >= max(MIN_SCORE, best_score * 0.6)]
     return best, others
 
@@ -642,7 +664,7 @@ async def handle(chat, msg, user, text):
     # Natural phrasing: "Bonki <anything> @user 5 times" or reply + "10 times".
     # NOTE: only the @mention is sent - the bot never repeats the user's wording,
     # so it can't be used to fire an insult at someone. Caps + cooldown still apply.
-    mt = re.search(r"\b(\d{1,3})\s*times?\b", text, re.I)
+    mt = re.search(r"\b(\d{1,6})\s*times?\b", text, re.I)
     if mt and not re.search(r"\b(scan|find|list|count|stats|summar|search|index)\b",
                             text, re.I):
         n = max(1, int(mt.group(1)))
@@ -780,6 +802,23 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     if str(db.get_settings().get("persist_tags") or "1") == "1" and hashtag:
         db.add_tag(best.get("chat_id"), best.get("message_id"), hashtag)
 
+    # ---- confidence gate ---------------------------------------------------
+    # If the top hit is weak, or the runner-up is nearly as good, do NOT quietly
+    # share one file. Show the shortlist with links so the user picks. Sharing a
+    # confident wrong file is worse than asking.
+    second = others[0] if others else None
+    best_score = float(best.get("_score") or 0.0)
+    runner = _score_of(others, query)
+    rel = ((best_score - runner) / best_score) if best_score else 0.0
+    confident = (best_score >= SHARE_CONF
+                 and (not second or rel >= SHARE_MARGIN))
+    # only a FULL name match (level 2) overrides low confidence; level 1 means the
+    # words appear somewhere, which is exactly the ambiguous case we want to show
+    if _exact_rank(query, best) >= 2:
+        confident = True
+    if not confident and others:
+        return await _offer_choices(chat, msg, user, query, best, others, hashtag)
+
     how = await _reply_with_file(chat, msg, user, best, hashtag)
     db.log_activity("find", chat_id, f"{best.get('name')} ({how}) for {query}")
     await _flush()
@@ -807,6 +846,36 @@ async def _do_find(chat, msg, user, query, hashtag, scan):
     if sent_id:
         asyncio.create_task(_autodelete_close_matches(chat_id, sent_id, token))
     asyncio.create_task(_learn_implicit(chat_id, query, best, token))
+
+
+def _score_of(others, query):
+    """Best score among the runner-up candidates, for the confidence margin."""
+    if not others:
+        return 0.0
+    try:
+        scored = rank(query, others)
+        return scored[0][0] if scored else 0.0
+    except Exception:
+        return 0.0
+
+
+async def _offer_choices(chat, msg, user, query, best, others, hashtag):
+    """Low confidence: list the candidates instead of sharing one wrong file."""
+    cands = [best] + [f for f in others if _fkey(f) != _fkey(best)][:4]
+    lines = [f"🔎 <b>Not sure which one you mean</b> by “{telegram.esc(query)}”:"]
+    for i, f in enumerate(cands, 1):
+        link = _link(chat, f.get("message_id"))
+        nm = telegram.esc(f.get("name") or "?")
+        lines.append(f"{i}. " + (f'<a href="{link}">{nm}</a>' if link else nm)
+                     + f" — {human_size(f.get('size'))}")
+    token = learn.remember_search(chat.get("id"), query, cands, user,
+                                  msg.get("message_id"), hashtag)
+    rows = [[{"text": f"{i}. {f.get('name')}"[:60],
+              "callback_data": f"fb|p|{token}|{i-1}"}] for i, f in enumerate(cands)]
+    rows.append([{"text": "❌ None of these", "callback_data": f"fb|n|{token}"}])
+    await _send("\n".join(lines) + "\n\n<i>Tap the right one and I'll send it.</i>",
+                chat.get("id"), reply_to=msg.get("message_id"),
+                reply_markup={"inline_keyboard": rows})
 
 
 async def _learn_implicit(chat_id, query, best, token):
