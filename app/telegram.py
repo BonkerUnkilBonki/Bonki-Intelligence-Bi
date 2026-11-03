@@ -57,11 +57,55 @@ def esc(s):
 # an exception and the reply was simply LOST - the bot looked dead for the whole
 # restriction window while it was actually running fine.
 _FLOOD_UNTIL = [0.0]
+_OUTBOX = []                 # replies Telegram refused; drained by app/outbox.py
 
 
 def flood_until():
     """Unix time until which Telegram is still rate-limiting us."""
     return _FLOOD_UNTIL[0]
+
+
+_LAST_RIGHTS_DM = {}          # chat_id -> when we last warned the owner
+
+
+def _explain_failure(method, data, err):
+    """DM the owner when Telegram refuses because of permissions.
+
+    This is the private-channel case: a bot can only post in a channel if it is an
+    admin with 'post messages'. Without this the send just failed and the bot went
+    silent, which looks identical to a crash.
+    """
+    text = str(err or "")
+    low = text.lower()
+    if not any(k in low for k in ("403", "not enough rights", "chat_write_forbidden",
+                                  "chat_admin_required", "have no rights",
+                                  "not a member", "chat not found", "bot was kicked")):
+        return
+    cid = data.get("chat_id")
+    now = time.time()
+    if now - _LAST_RIGHTS_DM.get(str(cid), 0) < 3600:
+        return
+    _LAST_RIGHTS_DM[str(cid)] = now
+    try:
+        from . import approval
+        oid = approval.owner_id()
+        if not oid:
+            return
+        reason = "I'm not an admin there" if "not enough rights" in low or "403" in low \
+            else "Telegram refused access"
+        _post("sendMessage", {
+            "chat_id": oid, "parse_mode": "HTML",
+            "text": (f"🚫 <b>I can't post in a chat</b>\n"
+                     f"• chat: <code>{cid}</code>\n"
+                     f"• reason: {esc(reason)}\n\n"
+                     f"In a <b>channel</b> I must be an <b>admin with 'Post messages'</b> "
+                     f"— a private channel especially, since there is no username to "
+                     f"invite me by.\n"
+                     f"Fix: Channel → Administrators → Add → give me Post messages, "
+                     f"then I'll start working there.\n\n"
+                     f"<i>Telegram said: {esc(text[:180])}</i>")})
+    except Exception as e:
+        log.info("rights DM failed: %s", e)
 
 
 def _send_with_retry(method, data, retries=2):
@@ -78,6 +122,17 @@ def _send_with_retry(method, data, retries=2):
             if attempt == retries:
                 break
             time.sleep(wait)
+        except Exception as e:
+            _explain_failure(method, data, e)
+            raise
+    # Could not deliver now. Park it instead of throwing the reply away - the
+    # outbox retries for up to 30 minutes, so the user still gets an answer.
+    try:
+        from . import outbox
+        outbox.enqueue(method, data, last)
+        return {"ok": False, "queued": True}
+    except Exception:
+        pass
     raise last
 
 

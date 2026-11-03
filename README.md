@@ -700,6 +700,91 @@ greetings, thanks, identity and rudeness well, and gives a short honest line for
 anything else. For real conversation, connect an LLM — Bonki then prefers it and
 falls back to these rules offline.
 
+## Replies that fail are queued, not lost
+
+When Telegram rate-limits the bot, a send raises 429 and the reply used to be
+thrown away — so the bot looked **completely dead** even though the search had
+worked and the answer existed.
+
+Now a refused reply goes to an **outbox** that retries every 45 seconds for up to
+30 minutes, and the owner gets one DM saying so (a DM is a different chat, so a
+group restriction does not block it):
+
+```
+⚠️ Telegram is rate-limiting me
+• 3 repl(y/ies) queued, not lost
+• I will send them as soon as the limit lifts
+• cause: usually a very large /tag run
+
+I'm still running — this is a delivery limit, not a crash.
+```
+
+Verified: with every send refused, the reply was queued (`queued: 1`); once the
+restriction lifted, `drain_once` delivered it and the queue emptied.
+
+`/diag` also reports the current restriction and queue size.
+
+## Running without admin rights
+
+**In a group, most of what matters needs no admin at all.** Bonki checks once and
+runs in read-only mode instead of firing API calls that are certain to fail:
+
+| Works without admin | Needs admin |
+|---|---|
+| search and share files | ban · kick · mute · warn |
+| indexing new files* | purge · pin |
+| notes, filters, `/tag`, `/diag` | locks · CAPTCHA · antiflood · blocklist |
+| federation *lookups* | applying bans |
+
+\* only if privacy mode is off — see below.
+
+`/setup` explains the rest, and `/diag` shows `mode: 🔓 read-only (not admin)`.
+Moderation commands now answer *"needs me to be an admin here"* instead of failing
+silently.
+
+### The privacy setting that actually matters
+
+With **privacy mode ON** (Telegram's default), a bot in a group only receives
+commands and replies — **it never sees the files people post**, so it cannot index
+them. Fix it in [@BotFather](https://t.me/BotFather):
+
+```
+/setprivacy → choose your bot → Disable
+then remove and re-add the bot to the group
+```
+
+This is the single most common reason a file bot "finds nothing".
+
+### Channels are different
+
+A bot **must** be an admin with *Post messages* to send anything in a channel.
+That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
+a plain member. `/setup` says so plainly when run inside a channel.
+
+## Channels (public and private)
+
+Two bugs made a **private channel** look dead while a public one worked:
+
+1. **Channels were excluded from command and reply handling.** The dispatch only
+   ran for `group` and `supergroup`, so in a channel the bot indexed files and
+   never answered anything — `/diag` included. Channels are now included.
+2. **A permission failure was silent.** A bot can only post in a channel as an
+   **admin with "Post messages"**; without it Telegram returns `403` and the send
+   simply failed. Bonki now DMs the owner once an hour per chat:
+
+```
+🚫 I can't post in a chat
+• chat: -1002222222222
+• reason: I'm not an admin there
+
+In a channel I must be an admin with 'Post messages' — a private
+channel especially, since there is no username to invite me by.
+Fix: Channel → Administrators → Add → give me Post messages.
+```
+
+Verified: `Bonki find poweramp` and `/diag` both answer in a channel, and a
+simulated 403 produced exactly one owner DM (repeats suppressed for an hour).
+
 ## `/diag` — "why isn't it working in this chat?"
 
 Run it in the chat that seems dead. One screen, no guessing:

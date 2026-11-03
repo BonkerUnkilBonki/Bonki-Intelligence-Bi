@@ -25,8 +25,8 @@ import tempfile
 import time
 
 from . import (analytics, ask, categorize, db, embed, extras, federation, keys,
-               memory, ml, modules, ollama, security, skills, stickers, telegram,
-               websearch)
+               memory, ml, modules, ollama, perms, security, skills, stickers,
+               telegram, websearch)
 
 log = logging.getLogger("rose")
 
@@ -967,6 +967,43 @@ async def cmd_decisions(chat, msg, user, args):
 # -------------------------------------------------------------------- ML -----
 # ------------------------------------------------------ anti-spam commands ---
 # ------------------------------------------------------------------ config ---
+async def cmd_setup(chat, msg, user, args):
+    """What works with and without admin rights - and how to enable the rest."""
+    from . import perms
+    cid = chat.get("id")
+    is_admin = await perms.bot_admin(cid, force=True)
+    ctype = chat.get("type") or "group"
+    lines = ["⚙️ <b>Bonki setup</b>", ""]
+    if ctype == "channel":
+        lines.append("This is a <b>channel</b>. Telegram requires a bot to be an "
+                     "<b>admin with 'Post messages'</b> to send anything here — "
+                     "there is no way around that, for any bot.")
+        lines.append("")
+        lines.append("Channel → Administrators → Add → Bonki-Intelligence → "
+                     "✅ Post messages.")
+        return await _reply(chat, msg, "\n".join(lines))
+
+    if is_admin:
+        lines.append("✅ I'm an <b>admin</b> here — everything is available.")
+    else:
+        lines.append("🔓 I'm <b>not an admin</b> here. That's fine for what matters:")
+        lines.append("• ✅ searching and sharing files")
+        lines.append("• ✅ indexing new files (if privacy mode is off)")
+        lines.append("• ✅ notes, filters, /diag, /tag")
+        lines.append("")
+        lines.append("🔒 Needs admin: ban · kick · mute · warn · purge · locks · "
+                     "CAPTCHA · antiflood · blocklist")
+    lines.append("")
+    lines.append("<b>Make sure I can see messages</b> (needed to index files):")
+    lines.append("1. Open <a href=\"https://t.me/BotFather\">@BotFather</a>")
+    lines.append("2. <code>/setprivacy</code> → choose this bot → <b>Disable</b>")
+    lines.append("3. Remove and re-add me to this group")
+    lines.append("")
+    lines.append("<i>With privacy ON, Telegram only shows me commands and replies — "
+                 "so I never see the files people post.</i>")
+    await _reply(chat, msg, "\n".join(lines))
+
+
 async def cmd_diag(chat, msg, user, args):
     """Why is (or isn't) the bot working in THIS chat? One screen, no guessing."""
     from . import approval, handlers, indexer, llm, modules, userbot
@@ -1011,6 +1048,13 @@ async def cmd_diag(chat, msg, user, args):
     # 4. modules
     off = [modules.MODULES[n][0] for n in modules.MODULES if not modules.enabled(cid, n)]
     lines.append("• modules off: " + (", ".join(off) if off else "none"))
+    try:
+        from . import perms as _p
+        lines.append("• mode: " + ("✅ full (admin)" if await _p.bot_admin(cid)
+                                   else "🔓 read-only (not admin) — search/share "
+                                        "work, moderation does not"))
+    except Exception:
+        pass
 
     # 5. index
     try:
@@ -1025,6 +1069,17 @@ async def cmd_diag(chat, msg, user, args):
     # 6. brains
     lines.append(f"• AI: {telegram.esc(llm.describe_model())}")
     lines.append(f"• user account: {'✅ on' if userbot.is_running() else '⭕ off'}")
+    try:
+        import time as _t
+        from . import outbox
+        wait = telegram.flood_until() - _t.time()
+        if wait > 0:
+            lines.append(f"• ⚠️ Telegram rate-limiting me for another {int(wait)}s")
+        if outbox.size():
+            lines.append(f"• ⚠️ {outbox.size()} repl(y/ies) queued — will send when "
+                         f"the limit lifts")
+    except Exception:
+        pass
     ws = db.get_settings().get("wake_words") or "bonki"
     lines.append(f"• wake words: <code>{telegram.esc(ws)}</code> "
                  f"(or start with @{telegram.esc(handlers._bot_identity.get('username') or 'the bot')})")
@@ -1831,6 +1886,7 @@ COMMANDS = {
     "captcha": cmd_captcha,
     "config": cmd_config, "modules": cmd_config, "features": cmd_config,
     "diag": cmd_diag, "why": cmd_diag, "status": cmd_diag,
+    "setup": cmd_setup, "howto": cmd_setup,
     "permissions": cmd_permissions, "perms": cmd_permissions,
     "filter": extras.cmd_filter, "stop": extras.cmd_stop,
     "stopall": extras.cmd_stop, "filters": extras.cmd_filters,
@@ -1881,6 +1937,20 @@ async def handle_command(chat, msg, user, cmd, args):
     handler = COMMANDS.get((cmd or "").lower())
     if not handler:
         return False
+    NEEDS_ADMIN = {"ban", "bonk", "unban", "kick", "mute", "unmute", "warn",
+                   "bonki", "del", "purge", "spurge", "pin", "unpin", "captcha",
+                   "lock", "unlock", "fban", "fbonk", "unfban", "gban", "ungban",
+                   "setflood", "addblocklist", "rmblocklist", "promote", "demote"}
+    if (cmd or "").lower() in NEEDS_ADMIN and not await perms.bot_admin(chat.get("id")):
+        try:
+            await _reply(chat, msg,
+                         f"🔓 <code>/{cmd}</code> needs me to be an <b>admin</b> here.\n"
+                         f"Searching, sharing files, notes and filters still work "
+                         f"without it — see <code>/setup</code>.")
+        except Exception:
+            pass
+        return True
+
     if not modules.command_allowed(chat.get("id"), cmd):
         try:
             await _reply(chat, msg, f"⚙️ <code>/{cmd}</code> is switched off in this "

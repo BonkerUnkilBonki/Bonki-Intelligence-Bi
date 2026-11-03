@@ -19,7 +19,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 from fastapi.templating import Jinja2Templates
 
 from . import (agent, analytics, approval, db, federation, handlers, health,
-               indexer, learn, learnloop, llm, ollama, skills, telegram, userbot)
+               indexer, learn, learnloop, llm, ollama, outbox, skills, telegram,
+               userbot)
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_auto_index_loop())
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(_watchdog_loop())
+    asyncio.create_task(outbox.loop())
     try:
         st = db.storage_info()
         log.info("startup: storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",

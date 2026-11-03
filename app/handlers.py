@@ -15,8 +15,8 @@ import asyncio
 import logging
 import re
 
-from . import (agent, approval, db, extras, federation, indexer, modules, rose,
-               security, telegram)
+from . import (agent, approval, db, extras, federation, indexer, modules, perms,
+               rose, security, telegram)
 
 log = logging.getLogger("handlers")
 
@@ -448,7 +448,7 @@ async def handle_update(update):
                     await rose.handle_command(chat, msg, frm, _c, "")
                     return
             await approval.announce(chat)
-            if (ctype in ("group", "supergroup") and text and is_addressed(msg, text)
+            if (ctype in ("group", "supergroup", "channel") and text and is_addressed(msg, text)
                 and modules.enabled(chat.get("id"), "ai")):
                 await _send("🛡️ This group isn't verified yet — the bot's owner has "
                             "to approve it before I can index or answer here.",
@@ -458,9 +458,15 @@ async def handle_update(update):
         # moderation first: federation bans and active locks can remove the
         # message before we index or answer it.
         try:
-            if modules.enabled(chat.get("id"), "fedbans") and await federation.enforce(chat, msg, frm):
+            # Everything below this point needs admin rights to act. Without them
+            # the calls fail anyway, so check once and skip instead of spamming
+            # the log - search, indexing and sharing keep working either way.
+            can_moderate = await perms.bot_admin(chat.get("id"))
+            if can_moderate and modules.enabled(chat.get("id"), "fedbans") and \
+                    await federation.enforce(chat, msg, frm):
                 return
-            if modules.enabled(chat.get("id"), "locks") and await rose.enforce_locks(chat, msg, frm):
+            if can_moderate and modules.enabled(chat.get("id"), "locks") and \
+                    await rose.enforce_locks(chat, msg, frm):
                 return
         except Exception as e:
             log.warning("moderation check failed: %s", e)
@@ -477,10 +483,10 @@ async def handle_update(update):
 
         # anti-spam: blocked words and message floods
         try:
-            if modules.enabled(chat.get("id"), "blocklist") and \
+            if can_moderate and modules.enabled(chat.get("id"), "blocklist") and \
                     await security.check_blocklist(chat, msg, frm):
                 return
-            if modules.enabled(chat.get("id"), "antiflood") and \
+            if can_moderate and modules.enabled(chat.get("id"), "antiflood") and \
                     await security.check_flood(chat, msg, frm):
                 return
         except Exception as e:
@@ -517,7 +523,7 @@ async def handle_update(update):
 
         # ported features: global bans, member tracking, AFK, filters
         try:
-            if modules.enabled(chat.get("id"), "fedbans") and \
+            if can_moderate and modules.enabled(chat.get("id"), "fedbans") and \
                     await extras.enforce_gban(chat, msg, frm):
                 return
             extras.track_member(chat.get("id"), frm)
@@ -531,7 +537,7 @@ async def handle_update(update):
 
         # Rose-style commands need NO wake word - that's what makes it behave
         # like a normal group-management bot in every approved chat.
-        if ctype in ("group", "supergroup") and text.startswith("/"):
+        if ctype in ("group", "supergroup", "channel") and text.startswith("/"):
             parts = text.split(None, 1)
             cmd = parts[0].lstrip("/").split("@")[0].lower()
             args = parts[1] if len(parts) > 1 else ""
@@ -557,13 +563,14 @@ async def handle_update(update):
                 if mbr.get("is_bot"):
                     continue
                 try:
-                    if modules.enabled(chat.get("id"), "captcha") and \
+                    if can_moderate and modules.enabled(chat.get("id"), "captcha") and \
                             await security.start_captcha(chat, msg, mbr):
                         security.mark_pending(chat.get("id"), mbr.get("id"), True)
                 except Exception as e:
                     log.warning("captcha failed: %s", e)
 
-        if (ctype in ("group", "supergroup") and text and is_addressed(msg, text)
+        if (ctype in ("group", "supergroup", "channel") and text
+                and is_addressed(msg, text)
                 and modules.enabled(chat.get("id"), "ai")):
             clean = strip_address(text) or text
             try:
