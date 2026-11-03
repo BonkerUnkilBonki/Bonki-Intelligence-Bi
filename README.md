@@ -864,6 +864,33 @@ Bonki no longer gives up on that. When the configured target won't resolve it
 The error message now names the real cause too — "that address doesn't exist for
 me" instead of blaming permissions.
 
+### One post, not two
+
+The release used to arrive as a text message (header + changelog) **and then** the
+APK with its own caption. Now it is a **single post**: the file, with the whole
+release as its caption.
+
+```
+🚀 Gitly
+Tag: v6.19 · 🟠 Pre-Release
+
+- Updated settings, including links, a Support tab…
+- Improved image handling with folder galleries…
+- Fixed the owner/repository ".git" crash.
+…
+
+https://github.com/SwitchToMonk/Gitly/releases/tag/v6.19
+```
+
+**The constraint:** Telegram caps a caption at **1024 characters**, and real
+changelogs are longer. So a long one is trimmed in the **middle** — the header and
+the link always survive, and a `…` marks the cut. Verified: a 39-line changelog
+became a 969-character caption with header, notes and link intact, and **zero
+separate text messages**.
+
+A release with no APK is still a plain text post, because there is no file to
+attach it to.
+
 ### Release captions include the changelog
 
 Tapping 📥 or 📢 now sends the APK with the full release notes attached:
@@ -879,6 +906,41 @@ https://github.com/SwitchToMonk/Gitly/releases/tag/v3.94
 
 Previously the caption was just the tag and a link. Capped at Telegram's 1024-
 character caption limit.
+
+### "No releases found" when releases exist
+
+A bug in the ETag caching: `304 Not Modified` means *"nothing changed"*, not
+*"there are none"*. The watcher polls every minute and keeps the ETag fresh, so
+opening `/releases` right after a poll got a `304`, the code turned that into an
+empty list, and the menu said **"No releases found"** while releases were sitting
+right there.
+
+Fixed: a `304` now keeps whatever is already cached, and a cold cache with a stale
+ETag refetches without it. Verified — first load shows the release, a following
+`304` still shows it, and a cold cache recovers too.
+
+### `/gitly debug` — what GitHub actually answered
+
+If the release list ever looks wrong, this prints the raw facts instead of a guess:
+
+```
+🔍 GitHub probe
+
+repo: SwitchToMonk/Gitly
+url: https://api.github.com/repos/SwitchToMonk/Gitly/releases?per_page=5
+HTTP: 200
+releases returned: 5
+• v6.19  draft=False pre=True assets=1
+• v6     draft=False pre=True assets=1
+• v5.60  draft=False pre=True assets=1
+• v4.90  draft=False pre=True assets=1
+• v3.94  draft=False pre=False assets=1
+token in use: no
+```
+
+`/releases` also **self-heals**: if the first read comes back empty it clears the
+cache and ETag and asks GitHub again, and only if that is still empty does it show
+the probe output.
 
 ### Auto-push
 

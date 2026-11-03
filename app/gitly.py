@@ -159,6 +159,40 @@ def _header(rel):
     return out
 
 
+CAPTION_LIMIT = 1024        # Telegram's hard limit for a file caption
+
+
+def build_caption(rel):
+    """One caption holding the header, the changelog and the link.
+
+    Telegram caps a caption at 1024 characters, so a long changelog is trimmed in
+    the MIDDLE - the header and the link always survive, which is what matters.
+    """
+    tag = rel.get("tag_name") or ""
+    name = rel.get("name") or tag or "release"
+    kind = "🟠 Pre-Release" if rel.get("prerelease") else "🟢 Stable"
+    body = (rel.get("body") or "").strip()
+    url = rel.get("html_url") or ""
+
+    head = f"🚀 <b>{telegram.esc(name)}</b>\nTag: <code>{telegram.esc(tag)}</code> · {kind}"
+    tail = f"\n\n{url}" if url else ""
+
+    if not body:
+        return (head + tail)[:CAPTION_LIMIT]
+
+    room = CAPTION_LIMIT - len(head) - len(tail) - 6      # 6 for "\n\n…\n"
+    if room <= 40:
+        return (head + tail)[:CAPTION_LIMIT]
+    if len(body) <= room:
+        return head + "\n\n" + body + tail
+    cut = body[:room - 1].rstrip()
+    # prefer to break on a line boundary so it doesn't stop mid-word
+    nl = cut.rfind("\n")
+    if nl > room * 0.6:
+        cut = cut[:nl]
+    return head + "\n\n" + cut + "…" + tail
+
+
 def post_release(rel, target):
     """Post changelog + APK for one release. Returns a short status string."""
     if rel.get("draft"):
@@ -172,16 +206,18 @@ def post_release(rel, target):
 
     header = _header(rel)
     body = (rel.get("body") or "").strip()
-    try:
-        telegram.send_message(f"{header}\n\n{body}" if body else header, chat_id=target)
-    except Exception as e:
-        # surface it: "chat not found" / "not enough rights" is the usual cause
-        db.set_settings({"gitly_last_error": f"posting to {target}: {str(e)[:160]}"})
-        log.warning("gitly changelog failed: %s", e)
-        return "post-failed"
-
     apk = pick_apk(rel.get("assets"))
+
+    # With an APK, everything goes in ONE post: the file with the changelog as its
+    # caption. A separate text message first is what made two posts.
     if not apk:
+        try:
+            telegram.send_message(f"{header}\n\n{body}" if body else header,
+                                  chat_id=target)
+        except Exception as e:
+            db.set_settings({"gitly_last_error": f"posting to {target}: {str(e)[:160]}"})
+            log.warning("gitly changelog failed: %s", e)
+            return "post-failed"
         return "no-apk"
 
     size = int(apk.get("size") or 0)
@@ -190,17 +226,16 @@ def post_release(rel, target):
         mb = size / (1024 * 1024)
         try:
             telegram.send_message(
-                f"{header}\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB, above "
-                f"Telegram's 50 MB bot upload limit, so I can't attach it.\n"
+                build_caption(rel) +
+                f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over Telegram's "
+                f"50 MB bot limit, so it can't be attached.\n"
                 f"Download: {apk.get('browser_download_url', '')}",
                 chat_id=target)
         except Exception as e:
             log.warning("gitly oversize notice failed: %s", e)
         return "too-big"
 
-    caption = f"{rel.get('name') or rel.get('tag_name')}"
-    if body:
-        caption += f"\n\n{body}"
+    caption = build_caption(rel)
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, name)
         try:
@@ -417,6 +452,10 @@ async def cmd_gitly(chat, msg, user, args):
             return await rose._reply(chat, msg,
                                      f"Pre-releases: {'included' if on else 'ignored'}.")
 
+    if sub in ("debug", "diag"):
+        detail = await asyncio.to_thread(probe_github)
+        return await rose._reply(chat, msg, f"🔍 <b>GitHub probe</b>\n\n{detail}")
+
     if sub in ("check", "now", "sync"):
         await rose._reply(chat, msg, "🔎 Checking GitHub…")
         n, status = await check(force=True, target=rest or None)
@@ -463,12 +502,27 @@ PAGE = 6
 
 
 def cached_releases(force=False):
-    """Releases for the menu, cached briefly so paging does not re-hit GitHub."""
+    """Releases for the menu, cached briefly so paging does not re-hit GitHub.
+
+    Careful with HTTP 304: it means "nothing changed", NOT "there are none". The
+    watcher polls every minute and keeps the ETag fresh, so a menu opened right
+    after a poll got a 304 and showed "No releases found" while releases existed.
+    """
     now = time.time()
     if force or not _CACHE["rels"] or (now - _CACHE["at"]) > CACHE_TTL:
-        rels = fetch_releases(limit=30) or []
-        _CACHE["rels"] = [r for r in rels if not r.get("draft")]
-        _CACHE["at"] = now
+        rels = fetch_releases(limit=30)
+        if rels is None:                     # 304 - unchanged
+            if _CACHE["rels"]:
+                _CACHE["at"] = now           # keep what we already have
+            else:
+                # nothing cached yet: ask again without the ETag
+                db.set_settings({"gitly_etag": ""})
+                rels = fetch_releases(limit=30) or []
+                _CACHE["rels"] = [r for r in rels if not r.get("draft")]
+                _CACHE["at"] = now
+        else:
+            _CACHE["rels"] = [r for r in rels if not r.get("draft")]
+            _CACHE["at"] = now
     return _CACHE["rels"]
 
 
@@ -600,15 +654,7 @@ async def send_release(cq, rid, to_channel=False):
         dest = os.path.join(tmp, apk.get("name") or "release.apk")
         try:
             await asyncio.to_thread(download_asset, apk, dest)
-            body = (rel.get("body") or "").strip()
-            kind = "Pre-Release" if rel.get("prerelease") else "Stable"
-            caption = (f"{rel.get('name') or rel.get('tag_name')} "
-                       f"({rel.get('tag_name') or ''}) · {kind}\n")
-            if body:
-                caption += f"\n{body}\n"          # the changelog
-            if rel.get("html_url"):
-                caption += f"\n{rel['html_url']}"
-            caption = caption[:1024]               # Telegram caption limit
+            caption = build_caption(rel)           # same single-post caption
             await asyncio.to_thread(telegram.send_document, dest,
                                     apk.get("name") or "release.apk", caption, dm)
         except Exception as e:
@@ -622,6 +668,32 @@ async def send_release(cq, rid, to_channel=False):
                 pass
 
 
+def probe_github():
+    """Ask GitHub directly and report exactly what came back - for /gitly debug."""
+    url = f"{API}/repos/{repo()}/releases?per_page=5"
+    try:
+        r = requests.get(url, headers=_headers(), timeout=20)
+    except Exception as e:
+        return f"network error: {type(e).__name__}: {e}"
+    out = [f"repo: <code>{telegram.esc(repo())}</code>",
+           f"url: {telegram.esc(url)}",
+           f"HTTP: <b>{r.status_code}</b>"]
+    try:
+        data = r.json()
+    except Exception:
+        data = None
+    if isinstance(data, list):
+        out.append(f"releases returned: <b>{len(data)}</b>")
+        for x in data[:5]:
+            out.append(f"• <code>{telegram.esc(str(x.get('tag_name')))}</code>"
+                       f" draft={x.get('draft')} pre={x.get('prerelease')}"
+                       f" assets={len(x.get('assets') or [])}")
+    else:
+        out.append(f"body: {telegram.esc(str(data)[:200])}")
+    out.append(f"token in use: {'yes' if _headers().get('Authorization') else 'no'}")
+    return "\n".join(out)
+
+
 async def cmd_releases(chat, msg, user, args):
     """Menu of every GitHub release, tap to pull its APK."""
     from . import rose
@@ -629,6 +701,24 @@ async def cmd_releases(chat, msg, user, args):
         text, kb = await asyncio.to_thread(menu, 0)
     except Exception as e:
         return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+
+    if kb is None:
+        # Empty list - do NOT stop there. Clear the cache and ETag and ask again.
+        db.set_settings({"gitly_etag": ""})
+        _CACHE["rels"] = []
+        _CACHE["at"] = 0
+        try:
+            text, kb = await asyncio.to_thread(menu, 0)
+        except Exception as e:
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+    if kb is None:
+        # still nothing: report what GitHub actually said
+        detail = await asyncio.to_thread(probe_github)
+        return await rose._reply(
+            chat, msg,
+            f"📦 <b>No releases could be read.</b>\n\n{detail}\n\n"
+            f"<i>If GitHub returned releases above, the list was empty in memory — "
+            f"run /releases once more.</i>")
     await asyncio.to_thread(telegram.send_message, text, chat_id=chat.get("id"),
                             reply_to=msg.get("message_id"), reply_markup=kb)
 
