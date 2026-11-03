@@ -845,6 +845,41 @@ Default repo is **SwitchToMonk/Gilty**; change it any time.
 /gitly token ghp_…              raises the GitHub limit 60 → 5000/hour
 ```
 
+### "chat not found" on a channel that clearly exists
+
+`@username` is not always the channel's real username. The link shown in Channel
+Info (`t.me/GitlySupport`) is often a **custom invite link**, so sending to
+`@GitlySupport` returns `chat not found` even though the bot is an admin there.
+
+Bonki no longer gives up on that. When the configured target won't resolve it
+**falls back to the numeric ids of channels it is already in**, sends the post, and
+**corrects the stored setting**:
+
+```
+1) configured (broken): @GitlySupport
+2) 'to channel' -> sent to: -1001234567890
+   auto-corrected to: -1001234567890
+```
+
+The error message now names the real cause too — "that address doesn't exist for
+me" instead of blaming permissions.
+
+### Release captions include the changelog
+
+Tapping 📥 or 📢 now sends the APK with the full release notes attached:
+
+```
+Gitly (v3.94) · Stable
+
+• Fixed login
+• Faster builds
+
+https://github.com/SwitchToMonk/Gitly/releases/tag/v3.94
+```
+
+Previously the caption was just the tag and a link. Capped at Telegram's 1024-
+character caption limit.
+
 ### Auto-push
 
 **Setting the channel turns auto-push on.** No separate `/gitly on` needed — the

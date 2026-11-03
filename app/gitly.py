@@ -229,6 +229,16 @@ async def check(force=False, target=None):
     tgt = (target or channel()).strip()
     if not tgt:
         return 0, "no-channel"
+    resolved, _tried = await asyncio.to_thread(resolve_target, tgt)
+    if resolved:
+        if str(resolved) != str(tgt):
+            db.set_settings({"gitly_channel": str(resolved)})
+            log.info("gitly: using %s instead of %s", resolved, tgt)
+        tgt = resolved
+    else:
+        db.set_settings({"gitly_last_error":
+                         f"can't reach {tgt} — run /gitly channel and pick it"})
+        return 0, f"can't reach {tgt}"
     try:
         backoff = int(db.get_settings().get("gitly_backoff_until") or 0)
     except (TypeError, ValueError):
@@ -509,17 +519,60 @@ def _find_release(rid):
     return None
 
 
+def _known_channels():
+    """Channels Bonki has actually seen - these have real numeric ids."""
+    return [g for g in db.list_groups() if g.get("chat_type") == "channel"]
+
+
+def resolve_target(target):
+    """Return a chat id that works.
+
+    A channel @username can fail with "chat not found" even when the bot is an
+    admin there (custom invite links, renamed channels, or a typo). Rather than
+    give up, fall back to the numeric ids Bonki has recorded.
+    """
+    tried = []
+    for cand in [target] + [g.get("chat_id") for g in _known_channels()]:
+        if not cand:
+            continue
+        if str(cand) in [str(t) for t in tried]:
+            continue
+        tried.append(cand)
+        try:
+            telegram.get_chat(cand)
+            return cand, tried
+        except Exception as e:
+            log.info("target %s unusable: %s", cand, e)
+    return None, tried
+
+
 async def send_release(cq, rid, to_channel=False):
     """Download one release's APK and send it to the DM (or the channel)."""
     m = cq.get("message") or {}
     dm = (m.get("chat") or {}).get("id")
     if to_channel:
-        dm = channel()
+        want = channel()
+        if not want:
+            await asyncio.to_thread(
+                telegram.answer_callback_query, cq.get("id"),
+                "No channel set — run /gitly channel", True)
+            return
+        dm, tried = await asyncio.to_thread(resolve_target, want)
         if not dm:
             await asyncio.to_thread(
                 telegram.answer_callback_query, cq.get("id"),
-                "No channel set — use /gitly channel @yourchannel", True)
+                f"Can't reach {want} — run /gitly channel and pick it", True)
+            await asyncio.to_thread(
+                telegram.send_message,
+                f"⚠️ <b>Can't reach</b> <code>{telegram.esc(want)}</code>.\n"
+                f"Tried: {', '.join('<code>' + telegram.esc(str(t)) + '</code>' for t in tried) or 'nothing'}\n\n"
+                f"That address doesn't resolve for me. Run <code>/gitly channel</code> "
+                f"and pick the channel from the list — it uses the real numeric id.",
+                chat_id=(m.get("chat") or {}).get("id"))
             return
+        if str(dm) != str(want):
+            db.set_settings({"gitly_channel": str(dm)})
+            log.info("gitly channel corrected %s -> %s", want, dm)
     rel = _find_release(rid)
     if not rel:
         await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
@@ -547,8 +600,15 @@ async def send_release(cq, rid, to_channel=False):
         dest = os.path.join(tmp, apk.get("name") or "release.apk")
         try:
             await asyncio.to_thread(download_asset, apk, dest)
-            caption = (f"{rel.get('name') or rel.get('tag_name')}\n"
-                       f"{rel.get('html_url') or ''}")
+            body = (rel.get("body") or "").strip()
+            kind = "Pre-Release" if rel.get("prerelease") else "Stable"
+            caption = (f"{rel.get('name') or rel.get('tag_name')} "
+                       f"({rel.get('tag_name') or ''}) · {kind}\n")
+            if body:
+                caption += f"\n{body}\n"          # the changelog
+            if rel.get("html_url"):
+                caption += f"\n{rel['html_url']}"
+            caption = caption[:1024]               # Telegram caption limit
             await asyncio.to_thread(telegram.send_document, dest,
                                     apk.get("name") or "release.apk", caption, dm)
         except Exception as e:

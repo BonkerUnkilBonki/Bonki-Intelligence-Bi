@@ -91,19 +91,26 @@ def _explain_failure(method, data, err):
         oid = approval.owner_id()
         if not oid:
             return
-        reason = "I'm not an admin there" if "not enough rights" in low or "403" in low \
-            else "Telegram refused access"
+        if "chat not found" in low:
+            reason = ("that address doesn't exist for me — the @username may be a "
+                      "custom invite link, not the real username")
+        elif "not enough rights" in low or "403" in low:
+            reason = "I'm not an admin there"
+        else:
+            reason = "Telegram refused access"
         _post("sendMessage", {
             "chat_id": oid, "parse_mode": "HTML",
             "text": (f"🚫 <b>I can't post in a chat</b>\n"
                      f"• chat: <code>{cid}</code>\n"
                      f"• reason: {esc(reason)}\n\n"
-                     f"In a <b>channel</b> I must be an <b>admin with 'Post messages'</b> "
-                     f"— a private channel especially, since there is no username to "
-                     f"invite me by.\n"
-                     f"Fix: Channel → Administrators → Add → give me Post messages, "
-                     f"then I'll start working there.\n\n"
-                     f"<i>Telegram said: {esc(text[:180])}</i>")})
+                     + ("Pick the channel from the list instead: run "
+                        "<code>/gitly channel</code> — it uses the real numeric id, "
+                        "which always resolves.\n\n"
+                        if "chat not found" in low else
+                        "In a <b>channel</b> I must be an <b>admin with 'Post "
+                        "messages'</b>.\nFix: Channel → Administrators → Add → give me "
+                        "Post messages.\n\n")
+                     + f"<i>Telegram said: {esc(text[:180])}</i>")})
     except Exception as e:
         log.info("rights DM failed: %s", e)
 
