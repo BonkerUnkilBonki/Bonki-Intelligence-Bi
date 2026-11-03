@@ -297,6 +297,32 @@ async def _handle_callback(cq):
             log.info("release send failed: %s", e)
         return
 
+    if data.startswith("gch:"):
+        # pick a channel by its real numeric id
+        cid = data[4:]
+        m = cq.get("message") or {}
+        presser = (cq.get("from") or {}).get("id")
+        if not approval.is_owner(presser):
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Owner only.", True)
+            return
+        g = db.get_group_by_chat(cid)
+        title = (g or {}).get("title") or cid
+        db.set_settings({"gitly_channel": str(cid), "gitly_on": "1"})
+        await asyncio.to_thread(db.flush, True)
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                f"Set to {title}")
+        try:
+            await asyncio.to_thread(
+                telegram.edit_message_text, m.get("chat", {}).get("id"),
+                m.get("message_id"),
+                f"✅ Releases will be posted to <b>{telegram.esc(title)}</b>\n"
+                f"<code>{cid}</code>\n\n✅ Auto-push is <b>on</b> — new releases "
+                f"will appear here within a minute of publishing.")
+        except Exception:
+            pass
+        return
+
     if data.startswith("ghc:"):
         # send a release straight to the configured channel
         try:

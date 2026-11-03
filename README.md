@@ -779,6 +779,7 @@ Gitly 1.2 (v1.2) · 7.0 MB
 /releases        (aliases: /apks, /oldfiles)
 ```
 
+- Shows the **release type** on every line: `🟢 Stable` or `🟠 Pre-Release`.
 - Lists **all** releases, newest first, 6 per page.
 - Each release has **two buttons**:
 
@@ -843,6 +844,41 @@ Default repo is **SwitchToMonk/Gilty**; change it any time.
 /gitly prerelease on|off
 /gitly token ghp_…              raises the GitHub limit 60 → 5000/hour
 ```
+
+### Auto-push
+
+**Setting the channel turns auto-push on.** No separate `/gitly on` needed — the
+moment a channel is chosen, Bonki checks GitHub immediately and then keeps watching:
+
+```
+📢 Releases will be posted to Gitly (-1001234567890)
+✅ Auto-push is on — checking GitHub now…
+📦 Posted 1 release(s)
+```
+
+From then on, publishing a release is the only action required: it appears in the
+channel within about a minute. Verified end-to-end — a new release was posted with
+its APK attached, with **no command run at all**.
+
+`/gitly off` pauses it; `/gitly on` resumes.
+
+### Setting the channel without guessing
+
+`@username` often fails with `chat not found` — the invite link shown in the
+channel (`t.me/SomethingSupport`) is frequently a **custom invite link**, not the
+channel's real username.
+
+So `/gitly channel` with **no argument** lists the channels Bonki is already in,
+with buttons. Tap one and it stores that channel's **numeric id**, which always
+resolves:
+
+```
+📢 Which channel should I post releases to?
+[Gitly]
+```
+
+Setting a name is still validated up front: if Telegram can't resolve it you get the
+reason and the picker, instead of a silent failure at post time.
 
 **How fast:** `/gitly on` checks **immediately** and tells you what it posted.
 After that it polls every **60 seconds** (`/gitly interval 60`, minimum 30s) — and

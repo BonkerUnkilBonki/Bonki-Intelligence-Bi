@@ -151,7 +151,9 @@ def download_asset(asset, dest):
 def _header(rel):
     tag = rel.get("tag_name") or "?"
     title = rel.get("name") or tag
-    out = f"🚀 <b>New release</b>: {telegram.esc(title)}\nTag: <code>{telegram.esc(tag)}</code>"
+    kind = "🟠 Pre-Release" if rel.get("prerelease") else "🟢 Stable"
+    out = (f"🚀 <b>New release</b>: {telegram.esc(title)}\n"
+           f"Tag: <code>{telegram.esc(tag)}</code> · {kind}")
     if rel.get("html_url"):
         out += f"\n{rel['html_url']}"
     return out
@@ -350,14 +352,36 @@ async def cmd_gitly(chat, msg, user, args):
             return await rose._reply(chat, msg, f"📦 Watching <code>{telegram.esc(rest)}</code>.")
         if sub == "channel":
             if not rest:
-                return await rose._reply(chat, msg,
-                                         "Usage: <code>/gitly channel @mychannel</code> "
-                                         "or a numeric id")
-            db.set_settings({"gitly_channel": rest})
+                return await channel_picker(chat, msg)
+            target = rest.strip()
+            if not target.startswith("@") and not target.lstrip("-").isdigit():
+                target = "@" + target.lstrip("@")
+            # resolve it now, so a wrong name is caught here instead of at post time
+            try:
+                info = await asyncio.to_thread(telegram.get_chat, target)
+                title = ((info.get("result") or {}).get("title") or target)
+            except Exception as e:
+                await rose._reply(
+                    chat, msg,
+                    f"⚠️ I can't reach <code>{telegram.esc(target)}</code>: "
+                    f"{telegram.esc(str(e)[:120])}\n\n"
+                    f"<b>Use the numeric chat id instead</b> — pick one below, or send "
+                    f"any post in the channel and run <code>/gitly channel</code> "
+                    f"again.")
+                return await channel_picker(chat, msg)
+            db.set_settings({"gitly_channel": target, "gitly_on": "1"})
             await asyncio.to_thread(db.flush, True)
-            return await rose._reply(chat, msg,
-                                     f"📢 Releases will be posted to "
-                                     f"<code>{telegram.esc(rest)}</code>.")
+            await rose._reply(chat, msg,
+                              f"📢 Releases will be posted to <b>{telegram.esc(title)}</b> "
+                              f"(<code>{telegram.esc(target)}</code>).")
+            await rose._reply(chat, msg, "✅ Auto-push is <b>on</b> — checking GitHub now…")
+            n, status = await check(force=True)
+            if status == "ok":
+                return await rose._reply(
+                    chat, msg, f"📦 Posted {n} release(s)."
+                    if n else "📦 No new releases yet — I'll post the next one "
+                              "within a minute of you publishing it.")
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(status)}")
         if sub in ("on", "off"):
             db.set_settings({"gitly_on": "1" if sub == "on" else "0"})
             await asyncio.to_thread(db.flush, True)
@@ -453,16 +477,17 @@ def menu(page=0):
         apk = pick_apk(r.get("assets"))
         name = r.get("name") or r.get("tag_name") or "release"
         tag = r.get("tag_name") or ""
+        kind = "🟠 Pre-Release" if r.get("prerelease") else "🟢 Stable"
         if apk:
             mb = int(apk.get("size") or 0) / (1024 * 1024)
-            label = f"{name} ({tag}) · {mb:.1f} MB"
+            label = f"{kind} · {name} ({tag}) · {mb:.1f} MB"
             rows.append([{"text": label[:52], "callback_data": f"gh:{r.get('id')}"}])
             rows.append([{"text": "📥 send to me",
                           "callback_data": f"gh:{r.get('id')}"},
                          {"text": "📢 to channel",
                           "callback_data": f"ghc:{r.get('id')}"}])
         else:
-            rows.append([{"text": f"{name} ({tag}) · no APK"[:58],
+            rows.append([{"text": f"{kind} · {name} ({tag}) · no APK"[:58],
                           "callback_data": f"gh:{r.get('id')}"}])
     nav = []
     if page > 0:
@@ -546,3 +571,24 @@ async def cmd_releases(chat, msg, user, args):
         return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
     await asyncio.to_thread(telegram.send_message, text, chat_id=chat.get("id"),
                             reply_to=msg.get("message_id"), reply_markup=kb)
+
+
+async def channel_picker(chat, msg):
+    """Buttons for the channels Bonki is already in - no username guessing."""
+    from . import rose
+    chans = [g for g in db.list_groups()
+             if (g.get("chat_type") == "channel")]
+    if not chans:
+        return await rose._reply(
+            chat, msg,
+            "I'm not in any channel yet.\n\n"
+            "Add me as an <b>admin</b> of the channel (with Post messages), then run "
+            "<code>/gitly channel</code> again — I'll list it here with its real id.")
+    rows = [[{"text": (g.get("title") or str(g.get("chat_id")))[:40],
+              "callback_data": f"gch:{g.get('chat_id')}"}] for g in chans[:12]]
+    await asyncio.to_thread(
+        telegram.send_message,
+        "📢 <b>Which channel should I post releases to?</b>\n"
+        "<i>These are channels I'm already in.</i>",
+        chat_id=chat.get("id"), reply_to=msg.get("message_id"),
+        reply_markup={"inline_keyboard": rows})
