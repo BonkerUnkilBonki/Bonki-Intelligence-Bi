@@ -24,9 +24,9 @@ import re
 import tempfile
 import time
 
-from . import (analytics, ask, categorize, db, embed, extras, federation, keys,
-               memory, ml, modules, ollama, perms, security, skills, stickers,
-               telegram, websearch)
+from . import (analytics, ask, categorize, db, embed, extras, federation, gitly,
+               keys, memory, ml, modules, ollama, perms, security, skills,
+               stickers, telegram, websearch)
 
 log = logging.getLogger("rose")
 
@@ -1887,6 +1887,7 @@ COMMANDS = {
     "config": cmd_config, "modules": cmd_config, "features": cmd_config,
     "diag": cmd_diag, "why": cmd_diag, "status": cmd_diag,
     "setup": cmd_setup, "howto": cmd_setup,
+    "gitly": gitly.cmd_gitly, "release": gitly.cmd_gitly,
     "permissions": cmd_permissions, "perms": cmd_permissions,
     "filter": extras.cmd_filter, "stop": extras.cmd_stop,
     "stopall": extras.cmd_stop, "filters": extras.cmd_filters,

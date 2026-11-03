@@ -761,6 +761,46 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+## `/gitly` — GitHub releases → Telegram (ported from Gitly-Leech-Bot)
+
+Every time you publish a release on your repo, Bonki posts the **changelog** to a
+channel and attaches the release **`.apk`** as a document.
+
+Default repo is **SwitchToMonk/Gilty**; change it any time.
+
+```
+/gitly                          status: repo, channel, on/off, last check
+/gitly channel @BonkyFinds      where to post (or a numeric id)
+/gitly repo owner/name          what to watch
+/gitly on  ·  /gitly off
+/gitly check                    look for releases right now
+/gitly prerelease on|off
+/gitly token ghp_…              raises the GitHub limit 60 → 5000/hour
+```
+
+**How it works:** polling, so no GitHub webhook and no public URL needed. Every 10
+minutes Bonki asks the GitHub API for releases, and anything new is posted **once**
+— release IDs are remembered across restarts, so a redeploy never re-posts.
+
+Verified with three releases: the one with a 12 MB APK posted the changelog and
+attached the file; the 120 MB one posted the changelog and a download link instead
+of a broken upload; the one with no APK posted the changelog only; and a second run
+posted **nothing** (dedupe).
+
+**Two limits that are Telegram's, not the code's:**
+- A bot can only upload **50 MB**. A larger APK is announced with a download link —
+  no bot can attach it.
+- The channel must have the bot as an **admin with Post messages**.
+
+**No token is needed for a public repo.** GitHub allows 60 requests/hour to
+anonymous callers, and Bonki polls only 6 times an hour. It also sends
+`If-None-Match`, and a `304 Not Modified` reply **does not count against the
+limit at all** — so steady polling is effectively free.
+
+`/gitly token` is optional, and only useful in two cases: the host's IP is shared
+(Render and similar) and something else has already used the hourly quota, or the
+repo is private.
+
 ## Adding the bot to a new chat — it just works
 
 **Approval is OFF by default.** The bot works in whatever chat it is added to, with
