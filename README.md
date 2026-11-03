@@ -74,6 +74,21 @@ warnings the member is muted for an hour and warnings reset.
 per-group Telegram limit (~20 messages/minute) still paces the sending, so a large
 number takes proportionally longer.
 
+**Wording that triggers a run.** The sentence must contain a tag word
+(`tag`/`mention`/`ping`) plus a number, or an `@username` plus a number:
+
+| Message (replying to someone) | Result |
+|---|---|
+| `Bonki tag him 69 times` | tags 69 times |
+| `Bonki mention @saptak 5x` | tags 5 times |
+| `Bonki fuck him 69 times` | **does not tag** — says hello |
+| `Bonki tag him 69 times` (no reply, no @) | asks who to tag |
+| `Bonki find netflix 5 times` | searches, does not tag |
+
+That first-vs-third distinction matters: any sentence ending in "N times" used to
+start a run, so an ordinary message could fire 69 mentions, hit Telegram's flood
+limit and leave the bot silent for minutes.
+
 **Stopping a run:** while tagging is in progress the **owner** can say `stop` or
 `bonki stop` (or `/stop` with no argument) and it halts within a second, replying
 `⏹ Stopped after N of M tags`. Members cannot stop it. This works because the tag

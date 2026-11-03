@@ -603,6 +603,7 @@ async def cmd_tag(chat, msg, user, args):
         uid, un, rest = head, head.lstrip("@"), tail.strip()
     elif rfrom.get("id"):
         uid, un, rest = rfrom.get("id"), rfrom.get("username"), args
+        _shown = (rfrom.get("first_name") or rfrom.get("title") or "user")
     else:
         return await _reply(chat, msg, "Usage: <code>/tag @user 5</code> — or reply "
                                        "to their message with <code>/tag 5</code>.")
@@ -630,7 +631,7 @@ async def cmd_tag(chat, msg, user, args):
     _tag_last[key] = now
 
     clear_tag_stop(cid)          # a fresh run starts clean
-    mention = _mention(uid, un)
+    mention = _mention(uid, un, locals().get("_shown") or "user")
     if count > 5:
         try:                        # the notice must never abort the command
             note = (f"⏳ Sending {count} tags. Telegram allows about 20 messages a "

@@ -661,12 +661,14 @@ async def handle(chat, msg, user, text):
     if text.lower().startswith("tag "):            # "Bonki tag @user 5"
         return await rose.handle_command(chat, msg, user, "tag", text[4:].strip())
 
-    # Natural phrasing: "Bonki <anything> @user 5 times" or reply + "10 times".
-    # NOTE: only the @mention is sent - the bot never repeats the user's wording,
-    # so it can't be used to fire an insult at someone. Caps + cooldown still apply.
-    mt = re.search(r"\b(\d{1,6})\s*times?\b", text, re.I)
-    if mt and not re.search(r"\b(scan|find|list|count|stats|summar|search|index)\b",
-                            text, re.I):
+    # Natural phrasing: "Bonki tag him 69 times", "Bonki mention @user 5x".
+    # A tag-ish WORD must be present. Without that rule any sentence ending in
+    # "N times" fired a tag run - "Bonki <insult> him 69 times" would spam 69
+    # messages and get the bot flood-limited, which looked like a dead bot.
+    mt = re.search(r"\b(\d{1,6})\s*(?:times?|x)\b", text, re.I)
+    wants_tag = re.search(r"\b(tag|tags|mention|mentions|ping|pings)\b", text, re.I)
+    if mt and wants_tag and not re.search(
+            r"\b(scan|find|list|count|stats|summar|search|index)\b", text, re.I):
         n = max(1, int(mt.group(1)))
         un = re.search(r"@([A-Za-z0-9_]{3,})", text)
         rt_from = ((msg.get("reply_to_message") or {}).get("from") or {})
@@ -674,6 +676,11 @@ async def handle(chat, msg, user, text):
             return await rose.handle_command(chat, msg, user, "tag", f"@{un.group(1)} {n}")
         if rt_from.get("id"):
             return await rose.handle_command(chat, msg, user, "tag", str(n))
+        # tag words but no target - say so instead of silently searching files
+        return await _send(
+            "Who should I tag? Reply to their message, or give their @username — "
+            "e.g. <i>Bonki tag @someone 10 times</i>.",
+            chat_id, reply_to=msg.get("message_id"))
     parsed = await parse(text)
     intent, query, hashtag, scan = (parsed["intent"], parsed["query"],
                                     parsed["hashtag"], parsed["scan"])
