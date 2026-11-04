@@ -113,6 +113,10 @@ async def _notify_owner(text):
         log.info("owner DM failed: %s", e)
 
 
+# The only commands that exist in a LEECH chat. Everything else is dead there.
+LEECH_ONLY = {"leech", "mode", "diag", "setup", "why", "status", "howto"}
+
+
 async def _handle_membership(cm):
     """The bot was added to (or removed from) a chat."""
     chat = cm.get("chat") or {}
@@ -701,6 +705,13 @@ async def handle_update(update):
             parts = text.split(None, 1)
             cmd = parts[0].lstrip("/").split("@")[0].lower()
             args = parts[1] if len(parts) > 1 else ""
+
+            # LEECH MODE IS EXCLUSIVE. Nothing but the leech commands exists in a
+            # leech chat - no ban, no rose commands, no help, no find. The only
+            # exceptions are the commands needed to configure or leave leech.
+            if modes.is_leech(chat.get("id")) and cmd not in LEECH_ONLY:
+                return
+
             if extras.is_disabled(chat.get("id"), cmd):
                 return                      # /disable'd by an admin
             if await rose.handle_command(chat, msg, frm, cmd, args):

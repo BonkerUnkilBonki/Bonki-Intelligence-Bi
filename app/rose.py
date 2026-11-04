@@ -78,8 +78,16 @@ async def _reply(chat, msg, text):
                                    reply_to=msg.get("message_id"))
 
 
-async def _is_admin(chat_id, user_id):
+async def _is_admin(chat_id, user_id, chat_type=None):
+    """Is this user an admin here?
+
+    In a CHANNEL a post has no author - only an admin can post at all - so a
+    channel post is trusted. Without this every command sent in a channel failed
+    the admin check and answered "Admins only".
+    """
     from . import approval
+    if str(chat_type or "") == "channel":
+        return True
     if approval.is_owner(user_id):
         return True
     try:

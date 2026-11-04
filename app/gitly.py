@@ -34,13 +34,48 @@ MAX_SEEN = 100
 
 
 # ------------------------------------------------------------------ config --
+def normalize_repo(text):
+    """Turn anything the user pastes into 'owner/name'.
+
+    People paste a clone URL, a browser URL, or a name with '.git' on the end -
+    "https://github.com/SwitchToMonk/Gitly.git" is the normal thing to send, and
+    using it verbatim made GitHub answer 404.
+    """
+    t = (text or "").strip().strip("<>\"'` ")
+    if not t:
+        return ""
+    t = re.sub(r"^[a-z]+://", "", t, flags=re.I)          # https://
+    # ssh clone form: git@github.com:owner/repo.git
+    t = re.sub(r"^[\w.-]+@[\w.-]+:", "", t)               # git@github.com:
+    t = re.sub(r"^(www\.)?github\.com/", "", t, flags=re.I)
+    t = t.split("?")[0].split("#")[0].rstrip("/")
+    if t.lower().endswith(".git"):
+        t = t[:-4]
+    parts = [x for x in t.split("/") if x]
+    if len(parts) >= 2:
+        t = f"{parts[0]}/{parts[1]}"
+    return t.strip("/")
+
+
+def suggest_repos(owner, want, limit=4):
+    """Closest repo names for an owner - only used when a name 404s."""
+    try:
+        data = fetch_json(f"/users/{owner}/repos?per_page=100&sort=updated")
+    except Exception:
+        return []
+    if not data:
+        return []
+    names = [d.get("name") for d in data if d.get("name")]
+    from difflib import get_close_matches
+    return get_close_matches(want, names, n=limit, cutoff=0.5)
+
+
 def repo():
-    name = (db.get_settings().get("gitly_repo") or DEFAULT_REPO).strip()
-    # tolerate the common typo and fix it in place
-    if name.lower() in ("switchtomonk/gilty", "switchtomonk/gilty.git"):
-        db.set_settings({"gitly_repo": DEFAULT_REPO})
-        return DEFAULT_REPO
-    return name.rstrip("/")
+    raw = (db.get_settings().get("gitly_repo") or DEFAULT_REPO)
+    name = normalize_repo(raw)
+    if name and name != str(raw).strip():
+        db.set_settings({"gitly_repo": name})     # repair what was stored
+    return name or DEFAULT_REPO
 
 
 def channel():
@@ -396,12 +431,15 @@ async def cmd_gitly(chat, msg, user, args):
                 not await rose._is_admin(chat.get("id"), (user or {}).get("id")):
             return await rose._reply(chat, msg, "Admins only.")
         if sub == "repo":
-            if "/" not in rest:
+            name = normalize_repo(rest)
+            if "/" not in name:
                 return await rose._reply(chat, msg,
-                                         "Usage: <code>/gitly repo owner/name</code>")
-            db.set_settings({"gitly_repo": rest.strip().strip("/")})
+                                         "Usage: <code>/gitly repo owner/name</code> "
+                                         "(a full GitHub link works too)")
+            db.set_settings({"gitly_repo": name})
             await asyncio.to_thread(db.flush, True)
-            return await rose._reply(chat, msg, f"📦 Watching <code>{telegram.esc(rest)}</code>.")
+            return await rose._reply(chat, msg,
+                                     f"📦 Watching <code>{telegram.esc(name)}</code>.")
         if sub == "channel":
             if not rest:
                 return await channel_picker(chat, msg)
@@ -900,7 +938,8 @@ async def cmd_leech(chat, msg, user, args):
     rest = parts[1].strip() if len(parts) > 1 else ""
 
     owner = approval.is_owner((user or {}).get("id"))
-    admin = owner or await rose._is_admin(cid, (user or {}).get("id"))
+    admin = owner or await rose._is_admin(cid, (user or {}).get("id"),
+                                          chat.get("type"))
     if not admin:
         return await rose._reply(chat, msg, "Admins only.")
 
@@ -908,12 +947,26 @@ async def cmd_leech(chat, msg, user, args):
         if "/" not in rest:
             return await rose._reply(chat, msg,
                                      "Usage: <code>/leech repo owner/name</code>")
-        name = rest.strip().strip("/")
+        name = normalize_repo(rest)
+        if "/" not in name:
+            return await rose._reply(chat, msg,
+                                     "That doesn't look like a repo. Send "
+                                     "<code>owner/name</code> or paste the GitHub link.")
         try:
             rels = await asyncio.to_thread(fetch_releases, name, 3)
             n = len(rels or [])
         except Exception as e:
-            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+            owner, _, short = name.partition("/")
+            near = await asyncio.to_thread(suggest_repos, owner, short)
+            hint = ""
+            if near:
+                hint = ("\n\nDid you mean: " +
+                        " · ".join(f"<code>{telegram.esc(owner + '/' + x)}</code>"
+                                   for x in near))
+            return await rose._reply(
+                chat, msg,
+                f"⚠️ <code>{telegram.esc(name)}</code> — {telegram.esc(str(e))}"
+                f"{hint}")
         db.set_settings({"leech_repo": name, "gitly_on": "1"})
         await asyncio.to_thread(db.flush, True)
         modes.set_mode(cid, modes.LEECH)

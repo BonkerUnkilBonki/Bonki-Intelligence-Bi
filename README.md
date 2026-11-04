@@ -761,6 +761,50 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Pasting a repo link works
+
+`/leech repo` accepts anything you paste — a browser link, a clone URL, or a bare
+name:
+
+| You send | Used as |
+|---|---|
+| `https://github.com/SwitchToMonk/Gitly.git` | `SwitchToMonk/Gitly` |
+| `github.com/SwitchToMonk/Gitly/releases` | `SwitchToMonk/Gitly` |
+| `git@github.com:SwitchToMonk/Gitly.git` | `SwitchToMonk/Gitly` |
+| `SwitchToMonk/Gitly.git` | `SwitchToMonk/Gitly` |
+
+Using the URL verbatim was why a public repo answered **"not found"** — GitHub was
+asked for a repo literally named `https://github.com/…`.
+
+If a name still 404s, Bonki asks GitHub for that owner's repos and suggests the
+closest match:
+
+```
+⚠️ SwitchToMonk/Gity — not found
+
+Did you mean: SwitchToMonk/Gitly
+```
+
+### Switching an existing channel to Leech
+
+A channel added before this existed has no mode set, so it defaults to Find. Three
+commands, all sent **in the channel**:
+
+```
+/mode leech
+/leech repo SwitchToMonk/Gitly
+```
+then open the topic you want and send:
+```
+/leech here release
+```
+
+That's it — it's live. Anything new is pushed automatically.
+
+**Note:** in a channel a post has no author, so the admin check used to fail and
+every command answered "Admins only". Channel posts are now trusted, because only
+an admin can post in a channel at all.
+
 ## Two bots in one — Find and Leech
 
 The same bot runs as either mode, **per chat**:
@@ -818,14 +862,24 @@ Routes
 Verified: all three routes posted to their own topic — the APK to 42, the commit to
 43, the issue to 44 — and each item posts **once per route**.
 
-### Leech mode really turns Find off
+### Leech mode is exclusive — everything else is dead
 
-In a Leech chat every find-side behaviour is skipped: **no indexing, no search, no
-sharing, no moderation, no welcome, no filters**. Only the leech commands answer.
+In a Leech chat the bot is a release feed and nothing else. A hard allowlist gates
+every command:
 
-Verified in a Leech channel: a posted APK was **not indexed**, `Bonki find …` was
-ignored, `/leech` still worked, and switching back to Find resumed indexing
-immediately.
+**Allowed:** `/leech` · `/mode` · `/diag` · `/setup`
+
+**Dead:** everything else — `/ban`, `/kick`, `/mute`, `/warn`, `/purge`, `/tag`,
+`/lock`, `/welcome`, `/captcha`, `/filters`, `/notes`, `/stats`, `/find`, `/web`,
+`/config`, `/keys`, `/help`, and every other Rose command. Plain messages and
+`Bonki find …` are ignored outright.
+
+Also stopped in a Leech chat: indexing, searching, sharing, moderation, welcome,
+CAPTCHA, antiflood, blocklist, locks, filters and chat replies.
+
+Verified in **both a channel and a group**: 15 different non-leech commands produced
+no response at all, `/leech` still answered, plain messages were ignored, and
+`/mode find` switched the chat back to a working Find bot immediately.
 
 ## `/releases` — every GitHub release as a menu you can tap
 

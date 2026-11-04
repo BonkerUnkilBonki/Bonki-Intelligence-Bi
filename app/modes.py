@@ -75,7 +75,7 @@ async def cmd_mode(chat, msg, user, args):
     want = (args or "").strip().lower()
 
     if want in MODES:
-        if not await rose._is_admin(cid, (user or {}).get("id")):
+        if not await rose._is_admin(cid, (user or {}).get("id"), chat.get("type")):
             return await rose._reply(chat, msg, "Admins only.")
         m = set_mode(cid, want)
         await asyncio.to_thread(db.flush, True)
@@ -88,7 +88,7 @@ async def cmd_mode(chat, msg, user, args):
                                  f"✅ This chat is now <b>{label}</b> — {desc}.{extra}")
 
     if not approval.is_owner((user or {}).get("id")) and \
-            not await rose._is_admin(cid, (user or {}).get("id")):
+            not await rose._is_admin(cid, (user or {}).get("id"), chat.get("type")):
         return await rose._reply(chat, msg, "Admins only.")
 
     label, desc = MODES[get_mode(cid)]
