@@ -761,6 +761,72 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+## Two bots in one — Find and Leech
+
+The same bot runs as either mode, **per chat**:
+
+| Mode | What it does |
+|---|---|
+| **🔎 Bonki Find** | everything it already did — index, search, share, moderate |
+| **📦 Bonki Leech** | watch a GitHub repo and dump every new release into a channel **topic** |
+
+**When the bot is added to a chat it asks which one you want**, with buttons:
+
+```
+🤖 How should I work here?
+🔎 Bonki Find      📦 Bonki Leech
+```
+
+Change it any time with `/mode` (in a group) or by DMing the bot. A chat in Leech
+mode stops answering file searches — the two roles don't bleed into each other.
+
+### Leech: repo → topic
+
+```
+/leech repo SwitchToMonk/Gitly     what to watch
+/leech here                        run this INSIDE the topic you want
+/leech                             status: routes and watcher state
+/leech remove <repo>               drop a route
+/leech off                         pause
+```
+
+A repo produces more than releases, so **each route picks which activity it
+wants** and where it goes:
+
+| Type | What it posts |
+|---|---|
+| `release` | the APK + full changelog, tag, 🟢 Stable / 🟠 Pre-Release |
+| `commit` | `🔨 New commit abc1234 — message, by author, link` |
+| `issue` | `🟢 Issue #7 · open — title, body, link` (PRs included) |
+
+```
+/leech here release     ← run INSIDE the releases topic
+/leech here commit      ← run INSIDE the commits topic
+/leech here issue       ← run INSIDE the issues topic
+```
+
+Each route stores its own repo, event type and `thread_id`, so one repo can feed
+three topics with three different kinds of update:
+
+```
+Routes
+• 🚀 Releases · SwitchToMonk/Gitly → Gitly Support · topic 42
+• 🔨 Commits  · SwitchToMonk/Gitly → Gitly Support · topic 43
+• 🐞 Issues   · SwitchToMonk/Gitly → Gitly Support · topic 44
+```
+
+Verified: all three routes posted to their own topic — the APK to 42, the commit to
+43, the issue to 44 — and each item posts **once per route**.
+
+### Leech mode really turns Find off
+
+In a Leech chat every find-side behaviour is skipped: **no indexing, no search, no
+sharing, no moderation, no welcome, no filters**. Only the leech commands answer.
+
+Verified in a Leech channel: a posted APK was **not indexed**, `Bonki find …` was
+ignored, `/leech` still worked, and switching back to Find resumed indexing
+immediately.
+
 ## `/releases` — every GitHub release as a menu you can tap
 
 A paged list of **every release in the watched repo**, with its APK size. Tap one

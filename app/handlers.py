@@ -15,8 +15,8 @@ import asyncio
 import logging
 import re
 
-from . import (agent, approval, browse, db, extras, federation, indexer, modules,
-               perms, rose, security, telegram)
+from . import (agent, approval, browse, db, extras, federation, indexer, modes,
+               modules, perms, rose, security, telegram)
 
 log = logging.getLogger("handlers")
 
@@ -177,6 +177,15 @@ async def _handle_membership(cm):
                             f"<b>{telegram.esc(fed['name'])}</b>.")
         except Exception as e:
             log.info("auto-fed attach failed: %s", e)
+
+        # Ask which of the two bots to be here (find or leech) - once per chat.
+        try:
+            g = db.get_group_by_chat(chat.get("id"), chat.get("username"))
+            already = (db.get_chatconf(chat.get("id")) or {}).get("mode")
+            if g and not already:
+                await modes.ask(chat.get("id"), title)
+        except Exception as e:
+            log.info("mode prompt failed: %s", e)
 
         # If the OWNER added the bot, there is nothing to verify - approve it
         # straight away. Otherwise a newly added channel just sits there silent
@@ -376,6 +385,36 @@ async def _handle_callback(cq):
         await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
         return
 
+    if data.startswith("mode:"):
+        want = data[5:]
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        cid = chat.get("id")
+        presser = (cq.get("from") or {}).get("id")
+        if not await rose._is_admin(cid, presser):
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Admins only.", True)
+            return
+        if want not in modes.MODES:
+            return
+        modes.set_mode(cid, want)
+        await asyncio.to_thread(db.flush, True)
+        label, desc = modes.MODES[want]
+        await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                f"Now: {label}")
+        extra = ("\n\nNext: <code>/leech repo owner/name</code>, then "
+                 "<code>/leech here</code> inside the topic you want."
+                 if want == modes.LEECH else
+                 "\n\nPost files and I'll index them; search with "
+                 "<i>Bonki find …</i>.")
+        try:
+            await asyncio.to_thread(
+                telegram.edit_message_text, cid, m.get("message_id"),
+                f"✅ This chat is now <b>{label}</b> — {desc}.{extra}")
+        except Exception as e:
+            log.info("mode redraw failed: %s", e)
+        return
+
     if data.startswith("mod:"):
         name = data[4:]
         m = cq.get("message") or {}
@@ -569,6 +608,12 @@ async def handle_update(update):
                             chat.get("id"), reply_to=msg.get("message_id"))
             return
 
+        # In LEECH mode this chat is a release feed, not a file library. Every
+        # find-side behaviour is skipped: no indexing, no moderation, no filters,
+        # no welcome, no search. Only the leech commands still work.
+        if modes.is_leech(chat.get("id")) and not text.startswith("/"):
+            return
+
         # moderation first: federation bans and active locks can remove the
         # message before we index or answer it.
         try:
@@ -627,7 +672,8 @@ async def handle_update(update):
         except Exception as e:
             log.info("live mirror copy failed: %s", e)
 
-        if modules.enabled(chat.get("id"), "search") and \
+        if not modes.is_leech(chat.get("id")) and \
+                modules.enabled(chat.get("id"), "search") and \
                 str(db.get_settings().get("index_live") or "1") == "1":
             try:
                 indexer.capture_from_message(chat, msg)
@@ -677,7 +723,8 @@ async def handle_update(update):
                 if mbr.get("is_bot"):
                     continue
                 try:
-                    if can_moderate and modules.enabled(chat.get("id"), "captcha") and \
+                    if can_moderate and not modes.is_leech(chat.get("id")) and \
+                            modules.enabled(chat.get("id"), "captcha") and \
                             await security.start_captcha(chat, msg, mbr):
                         security.mark_pending(chat.get("id"), mbr.get("id"), True)
                 except Exception as e:
@@ -685,6 +732,7 @@ async def handle_update(update):
 
         if (ctype in ("group", "supergroup", "channel") and text
                 and is_addressed(msg, text)
+                and not modes.is_leech(chat.get("id"))      # leech chats don't search
                 and modules.enabled(chat.get("id"), "ai")):
             clean = strip_address(text) or text
             try:

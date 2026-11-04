@@ -25,8 +25,8 @@ import tempfile
 import time
 
 from . import (analytics, ask, browse, categorize, db, embed, extras, federation,
-               gitly, keys, memory, ml, modules, ollama, perms, security, skills,
-               stickers, telegram, websearch)
+               gitly, keys, memory, ml, modes, modules, ollama, perms, security,
+               skills, stickers, telegram, websearch)
 
 log = logging.getLogger("rose")
 
@@ -1889,6 +1889,8 @@ COMMANDS = {
     "setup": cmd_setup, "howto": cmd_setup,
     "gitly": gitly.cmd_gitly, "release": gitly.cmd_gitly,
     "releases": gitly.cmd_releases, "apks": gitly.cmd_releases,
+    "leech": gitly.cmd_leech, "track": gitly.cmd_leech,
+    "mode": modes.cmd_mode, "botmode": modes.cmd_mode,
     "oldfiles": gitly.cmd_releases,
     "files": browse.cmd_files, "browse": browse.cmd_files,
     "permissions": cmd_permissions, "perms": cmd_permissions,

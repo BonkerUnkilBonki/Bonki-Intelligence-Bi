@@ -13,6 +13,7 @@ Notes that matter in practice:
   * Polling is used (no GitHub webhook needed). Every 10 minutes by default.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -326,7 +327,13 @@ async def loop():
     await asyncio.sleep(45)
     while True:
         try:
-            if enabled() and channel():
+            if enabled() and routes():
+                n, status = await check_routes()
+                if n:
+                    log.info("leech posted %d release(s)", n)
+                elif status not in ("ok", "no-routes"):
+                    log.info("leech check: %s", status)
+            elif enabled() and channel():
                 n, status = await check()
                 if n:
                     log.info("gitly posted %d release(s)", n)
@@ -742,3 +749,374 @@ async def channel_picker(chat, msg):
         "<i>These are channels I'm already in.</i>",
         chat_id=chat.get("id"), reply_to=msg.get("message_id"),
         reply_markup={"inline_keyboard": rows})
+
+
+# ------------------------------------------------------- leech routes --------
+# repo -> where its releases go. Each route is a channel + an optional topic
+# (forum thread), so one repo can feed the "releases" topic and another the
+# "updates" topic.
+def routes():
+    try:
+        data = json.loads(db.get_settings().get("leech_routes") or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_routes(rows):
+    db.set_settings({"leech_routes": json.dumps(rows)[:8000]})
+
+
+def add_route(repo_name, chat_id, thread_id=None, prerelease=True, event="release"):
+    rows = routes()
+    event = event if event in EVENTS else "release"
+    key = (repo_name.lower(), str(chat_id), str(thread_id or ""), event)
+    for r in rows:
+        if (str(r.get("repo", "")).lower(), str(r.get("chat_id")),
+                str(r.get("thread_id") or ""), str(r.get("event") or "release")) == key:
+            r["prerelease"] = prerelease
+            _save_routes(rows)
+            return False
+    rows.append({"repo": repo_name, "chat_id": str(chat_id),
+                 "thread_id": str(thread_id) if thread_id else "",
+                 "prerelease": bool(prerelease), "event": event})
+    _save_routes(rows)
+    return True
+
+
+def remove_route(repo_name=None, chat_id=None):
+    rows = routes()
+    keep = []
+    for r in rows:
+        if repo_name and str(r.get("repo", "")).lower() == repo_name.lower() and \
+                (chat_id is None or str(r.get("chat_id")) == str(chat_id)):
+            continue
+        keep.append(r)
+    _save_routes(keep)
+    return len(rows) - len(keep)
+
+
+def _seen_key(rid, route):
+    return f"{rid}:{route.get('chat_id')}:{route.get('thread_id') or ''}"
+
+
+def post_release_to(rel, route):
+    """Post one release into one route (channel + topic). One post per release."""
+    if rel.get("draft"):
+        return "draft"
+    if rel.get("prerelease") and not route.get("prerelease", True):
+        return "prerelease"
+    rid = rel.get("id") or rel.get("tag_name")
+    if not _mark_seen(_seen_key(rid, route)):
+        return "already"
+
+    chat_id = route.get("chat_id")
+    thread = route.get("thread_id") or None
+    apk = pick_apk(rel.get("assets"))
+    caption = build_caption(rel)
+
+    if not apk:
+        try:
+            telegram.send_message(caption, chat_id=chat_id, thread_id=thread)
+        except Exception as e:
+            log.warning("leech post failed: %s", e)
+            db.set_settings({"gitly_last_error": str(e)[:160]})
+            return "post-failed"
+        return "no-apk"
+
+    size = int(apk.get("size") or 0)
+    name = apk.get("name") or "release.apk"
+    if size > UPLOAD_LIMIT:
+        mb = size / (1024 * 1024)
+        try:
+            telegram.send_message(
+                caption + f"\n\n⚠️ {telegram.esc(name)} is {mb:.1f} MB — over "
+                          f"Telegram's 50 MB limit.\n"
+                          f"Download: {apk.get('browser_download_url','')}",
+                chat_id=chat_id, thread_id=thread)
+        except Exception as e:
+            log.warning("leech oversize failed: %s", e)
+        return "too-big"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, name)
+        try:
+            download_asset(apk, dest)
+            telegram.send_document(dest, name, caption, chat_id, thread_id=thread)
+            return "sent"
+        except Exception as e:
+            log.warning("leech apk failed: %s", e)
+            return "apk-failed"
+
+
+async def check_routes(force=False):
+    """Post new activity for every configured route, grouped by repo and event."""
+    rows = routes()
+    if not rows:
+        return 0, "no-routes"
+    posted = 0
+    errors = []
+    for repo_name in {r.get("repo") for r in rows}:
+        mine = [r for r in rows if r.get("repo") == repo_name]
+        for event in {str(r.get("event") or "release") for r in mine}:
+            targets = [r for r in mine if str(r.get("event") or "release") == event]
+            try:
+                if event == "release":
+                    items = await asyncio.to_thread(fetch_releases, repo_name, 15)
+                elif event == "commit":
+                    items = await asyncio.to_thread(fetch_commits, repo_name, 10)
+                else:
+                    items = await asyncio.to_thread(fetch_issues, repo_name, 10)
+            except Exception as e:
+                errors.append(f"{repo_name}/{event}: {e}")
+                continue
+            if not items:
+                continue
+            for route in targets:
+                for item in reversed(items):
+                    try:
+                        if event == "release":
+                            st = await asyncio.to_thread(post_release_to, item, route)
+                            ok = st in ("sent", "too-big", "no-apk")
+                        else:
+                            st = await asyncio.to_thread(post_event_to, repo_name,
+                                                         event, item, route)
+                            ok = st == "sent"
+                        if ok:
+                            posted += 1
+                    except Exception as e:
+                        log.warning("route post failed: %s", e)
+    db.set_settings({"gitly_last_check": str(int(time.time())),
+                     "gitly_last_error": "; ".join(errors)[:200]})
+    return posted, ("ok" if not errors else "; ".join(errors))
+
+
+async def cmd_leech(chat, msg, user, args):
+    """Configure the leech bot: which repo, and which topic it feeds."""
+    from . import approval, modes, rose
+    cid = chat.get("id")
+    parts = (args or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    owner = approval.is_owner((user or {}).get("id"))
+    admin = owner or await rose._is_admin(cid, (user or {}).get("id"))
+    if not admin:
+        return await rose._reply(chat, msg, "Admins only.")
+
+    if sub in ("repo", "watch"):
+        if "/" not in rest:
+            return await rose._reply(chat, msg,
+                                     "Usage: <code>/leech repo owner/name</code>")
+        name = rest.strip().strip("/")
+        try:
+            rels = await asyncio.to_thread(fetch_releases, name, 3)
+            n = len(rels or [])
+        except Exception as e:
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+        db.set_settings({"leech_repo": name, "gitly_on": "1"})
+        await asyncio.to_thread(db.flush, True)
+        modes.set_mode(cid, modes.LEECH)
+        return await rose._reply(
+            chat, msg,
+            f"📦 Watching <code>{telegram.esc(name)}</code> — {n} release(s) visible.\n\n"
+            f"Now open the <b>topic</b> you want releases in and send "
+            f"<code>/leech here</code>.")
+
+    if sub in ("here", "topic"):
+        repo_name = (db.get_settings().get("leech_repo") or repo()).strip()
+        # which kind of activity? default = releases
+        want = (rest or "release").strip().lower()
+        want = {"releases": "release", "commits": "commit", "push": "commit",
+                "issues": "issue", "prs": "issue", "pull": "issue",
+                "everything": "release"}.get(want, want)
+        if want not in EVENTS:
+            return await rose._reply(
+                chat, msg,
+                f"Unknown type <code>{telegram.esc(rest)}</code>.\n"
+                f"Use: <code>/leech here release</code>, "
+                f"<code>/leech here commit</code> or <code>/leech here issue</code>")
+        thread = msg.get("message_thread_id")
+        is_topic = bool(thread)
+        added = add_route(repo_name, cid, thread, include_prereleases(), event=want)
+        db.set_settings({"gitly_on": "1"})      # a route implies you want it live
+        await asyncio.to_thread(db.flush, True)
+        modes.set_mode(cid, modes.LEECH)
+        where = (f"topic <code>{thread}</code>" if is_topic
+                 else "the main channel (not a topic)")
+        return await rose._reply(
+            chat, msg,
+            ("✅ " if added else "♻️ Already set: ") +
+            f"<b>{EVENTS[want]}</b> from <code>{telegram.esc(repo_name)}</code> "
+            f"will be posted to {where}.\n\n"
+            f"<i>Run this inside each topic you want a different kind of update in — "
+            f"releases in one topic, commits in another.</i>")
+
+    if sub in ("remove", "rm", "stop"):
+        n = remove_route(rest or None, cid if not rest else None)
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(chat, msg,
+                                 f"🗑 Removed {n} route(s)." if n else "Nothing to remove.")
+
+    if sub in ("on", "off"):
+        db.set_settings({"gitly_on": "1" if sub == "on" else "0"})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(chat, msg,
+                                 "✅ Leeching on." if sub == "on" else "⏹ Leeching off.")
+
+    # status
+    rows = routes()
+    lines = ["📦 <b>Bonki Leech</b>", ""]
+    cur = (db.get_settings().get("leech_repo") or "").strip()
+    lines.append(f"• repo being configured: "
+                 f"{'<code>' + telegram.esc(cur) + '</code>' if cur else 'none'}")
+    lines.append(f"• watcher: {'✅ on' if enabled() else '⏹ off'}")
+    if not rows:
+        lines.append("")
+        lines.append("No routes yet. Three steps:")
+        lines.append("1. <code>/leech repo owner/name</code>")
+        lines.append("2. open the topic you want the updates in")
+        lines.append("3. <code>/leech here release</code> — or <code>commit</code> / "
+                     "<code>issue</code>")
+    else:
+        lines.append("")
+        lines.append("<b>Routes</b>")
+        for r in rows:
+            g = db.get_group_by_chat(r.get("chat_id"))
+            title = (g or {}).get("title") or r.get("chat_id")
+            topic = f"topic {r['thread_id']}" if r.get("thread_id") else "main"
+            pre = " + pre-releases" if r.get("prerelease") else ""
+            ev = EVENTS.get(str(r.get("event") or "release"), "🚀 Releases")
+            lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
+                         f" → {telegram.esc(title)} · {topic}{pre}")
+    await rose._reply(chat, msg, "\n".join(lines))
+
+
+# ------------------------------------------------- repo activity (events) ----
+# A repo produces more than releases. Each route picks WHICH activity it wants,
+# so "releases" can go to one topic and "commits" or "issues" to another.
+EVENTS = {
+    "release": "🚀 Releases",
+    "commit": "🔨 Commits",
+    "issue": "🐞 Issues & PRs",
+}
+
+
+def _etags():
+    try:
+        return json.loads(db.get_settings().get("gitly_etags") or "{}")
+    except Exception:
+        return {}
+
+
+def _save_etags(d):
+    # keep it small: 40 entries is plenty for a few repos x a few endpoints
+    items = list(d.items())[-40:]
+    db.set_settings({"gitly_etags": json.dumps(dict(items))})
+
+
+def fetch_json(path):
+    """GET an API path with a per-URL ETag. Returns None when unchanged."""
+    url = path if path.startswith("http") else f"{API}{path}"
+    etags = _etags()
+    headers = _headers()
+    if etags.get(url):
+        headers["If-None-Match"] = etags[url]
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+    except Exception as e:
+        raise RuntimeError(f"network error ({type(e).__name__})") from e
+    if r.status_code == 304:
+        return None
+    if r.status_code == 404:
+        raise RuntimeError("not found (private repo, or wrong name)")
+    if r.status_code == 403:
+        raise RuntimeError("GitHub rate limit reached")
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    tag = r.headers.get("ETag")
+    if tag:
+        etags[url] = tag
+        _save_etags(etags)
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def fetch_commits(repo_name, limit=5):
+    data = fetch_json(f"/repos/{repo_name}/commits?per_page={limit}")
+    if data is None:
+        return None
+    out = []
+    for c in (data or []):
+        commit = c.get("commit") or {}
+        out.append({
+            "id": c.get("sha"),
+            "short": (c.get("sha") or "")[:7],
+            "message": (commit.get("message") or "").split("\n")[0][:200],
+            "author": ((commit.get("author") or {}).get("name") or "unknown"),
+            "url": c.get("html_url") or "",
+            "date": ((commit.get("author") or {}).get("date") or ""),
+        })
+    return out
+
+
+def fetch_issues(repo_name, limit=5):
+    data = fetch_json(f"/repos/{repo_name}/issues?state=all&per_page={limit}"
+                      f"&sort=created&direction=desc")
+    if data is None:
+        return None
+    out = []
+    for i in (data or []):
+        if i.get("pull_request"):
+            kind = "PR"
+        else:
+            kind = "issue"
+        out.append({
+            "id": i.get("id"),
+            "number": i.get("number"),
+            "title": (i.get("title") or "")[:200],
+            "body": (i.get("body") or "")[:600],
+            "state": i.get("state") or "open",
+            "kind": kind,
+            "user": ((i.get("user") or {}).get("login") or ""),
+            "url": i.get("html_url") or "",
+        })
+    return out
+
+
+def format_commit(repo_name, c):
+    return (f"🔨 <b>New commit</b> in <code>{telegram.esc(repo_name)}</code>\n"
+            f"<code>{telegram.esc(c['short'])}</code> — {telegram.esc(c['message'])}\n"
+            f"by {telegram.esc(c['author'])}\n{c['url']}")
+
+
+def format_issue(repo_name, i):
+    icon = "🟢" if i["state"] == "open" else "🔴"
+    label = "PR" if i["kind"] == "PR" else "Issue"
+    text = (f"{icon} <b>{label} #{i['number']}</b> · {i['state']} in "
+            f"<code>{telegram.esc(repo_name)}</code>\n"
+            f"<b>{telegram.esc(i['title'])}</b>")
+    if i.get("body"):
+        text += f"\n\n{telegram.esc(i['body'][:400])}"
+    if i.get("user"):
+        text += f"\n\nby {telegram.esc(i['user'])}"
+    return text + f"\n{i['url']}"
+
+
+def post_event_to(repo_name, event, item, route):
+    """Post one commit/issue into one route."""
+    key = f"{event}:{item.get('id')}:{route.get('chat_id')}:{route.get('thread_id') or ''}"
+    if not _mark_seen(key):
+        return "already"
+    text = (format_commit(repo_name, item) if event == "commit"
+            else format_issue(repo_name, item))
+    try:
+        telegram.send_message(text[:3800], chat_id=route.get("chat_id"),
+                              thread_id=route.get("thread_id") or None)
+        return "sent"
+    except Exception as e:
+        log.warning("event post failed: %s", e)
+        db.set_settings({"gitly_last_error": str(e)[:160]})
+        return "post-failed"
