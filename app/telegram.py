@@ -207,10 +207,11 @@ def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
     """Upload a local file as a document, optionally as a reply."""
     data = {
         "chat_id": chat_id,
-        "caption": (caption or "")[:MAX_CAPTION],
         "parse_mode": "HTML",
         "disable_notification": bool(silent),
     }
+    if caption:                      # omit entirely - an empty caption is not sent
+        data["caption"] = caption[:MAX_CAPTION]
     if reply_to:
         data["reply_to_message_id"] = reply_to
         data["allow_sending_without_reply"] = True

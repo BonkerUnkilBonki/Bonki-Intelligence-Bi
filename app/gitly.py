@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05p"   # bump when the leech code changes
+BUILD = "leech-2026-11-05q"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -1065,6 +1065,37 @@ async def _check_routes_inner(force=False):
             if not items:
                 continue
             for route in targets:
+                boot_key = ("__boot__:" + str(route.get("chat_id")) + ":"
+                            + str(route.get("thread_id") or "") + ":"
+                            + event + ":" + str(repo_name))
+                _st = _rstate()
+                if boot_key not in _st:
+                    # First sight of this repo for this route. Do NOT dump history
+                    # into the channel - mark it as already handled and report it.
+                    names = []
+                    for item in items:
+                        if event == "release":
+                            k2 = _state_key(route, item.get("id") or item.get("tag_name"))
+                            _st[k2] = {"sig": asset_sig(item.get("assets") or []),
+                                       "body": (item.get("body") or "").strip(),
+                                       "done": {}, "msg_ids": [], "text_ids": [],
+                                       "skipped": True, "t": int(time.time())}
+                            names.append(str(item.get("tag_name")))
+                        else:
+                            _mark_seen(_seen_key(item.get("id"), route))
+                            names.append(str(item.get("short") or item.get("number") or ""))
+                    _st[boot_key] = {"t": int(time.time())}
+                    _save_rstate(_st)
+                    try:
+                        db.flush(force=True)
+                    except Exception:
+                        pass
+                    log.info("leech: first run for %s/%s - %d existing item(s) "
+                             "recorded, nothing posted", repo_name, event, len(names))
+                    await asyncio.to_thread(_notify_first_run, repo_name, event,
+                                            route, names)
+                    continue
+
                 for item in reversed(items):
                     try:
                         if event == "release":
@@ -1765,8 +1796,7 @@ def _send_asset(rel, asset, route, index, total):
     size = int(asset.get("size") or 0)
     chat_id = route.get("chat_id")
     thread = route.get("thread_id") or None
-    caption = f"📎 <b>{telegram.esc(name)}</b>"
-    caption = f"📎 <b>{telegram.esc(name)}</b>"
+    caption = ""          # NO caption on the files, as asked
 
     use_account = upload_via_account()
     if size > UPLOAD_LIMIT and not use_account:
@@ -1800,6 +1830,27 @@ def _send_asset(rel, asset, route, index, total):
             if tr:
                 tr.failed(e)
             raise
+
+
+def _notify_first_run(repo_name, event, route, names):
+    """Tell the owner what already existed, instead of posting it publicly."""
+    try:
+        from . import approval
+        owner = approval.owner_id()
+        if not owner:
+            return
+        label = EVENTS.get(event, event)
+        shown = ", ".join(n for n in names[:12] if n)
+        more = f" (+{len(names) - 12} more)" if len(names) > 12 else ""
+        telegram.send_message(
+            f"👀 <b>Watching {telegram.esc(str(repo_name))}</b>\n\n"
+            f"{label}: found <b>{len(names)}</b> existing item(s).\n"
+            f"{telegram.esc(shown)}{telegram.esc(more)}\n\n"
+            f"<i>These were not posted to the channel — only NEW ones will be.</i>\n"
+            f"Use <code>/leech resync</code> if you want them posted too.",
+            chat_id=owner)
+    except Exception as e:
+        log.info("first-run notice failed: %s", e)
 
 
 def _post_changelog(rel, route, repo_name=""):
@@ -1857,6 +1908,11 @@ def sync_release(rel, route):
         return "sent-text"
 
     # ---- a rebuilt record has no signature: adopt it if every file is known ----
+    # A release that existed BEFORE the route was set up is recorded as skipped:
+    # it belongs in the DM summary, not in the channel.
+    if entry and entry.get("skipped") and entry.get("sig") == sig:
+        return "skipped"
+
     if entry and entry.get("sig") == "" and sig:
         known = {k for k in (entry.get("done") or {})}
         current = {a.get("name") for a in assets if a.get("name")}
@@ -2073,22 +2129,47 @@ def fetch_assets_web(repo_name, tag):
 
 
 def fetch_releases_web(repo_name, limit=10):
-    """Releases from the public Atom feed — no API, no rate limit."""
+    """Releases from the public releases PAGE - the list a visitor sees.
+
+    The atom feed is not authoritative: it can still list a release that has been
+    deleted or is a draft (a "V1" that no longer exists on the page showed up
+    there and got posted). The page is what the repo actually shows, so tags come
+    from there, and the atom feed is used only to enrich them with the changelog.
+    """
     repo_name = normalize_repo(repo_name)
-    xml = _web_get(f"https://github.com/{repo_name}/releases.atom")
-    entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)
+    page = _web_get(f"https://github.com/{repo_name}/releases")
+
+    tags = []
+    for m in re.finditer(r'/releases/tag/([^"?#]+)"', page):
+        tag = m.group(1)
+        if tag not in tags:
+            tags.append(tag)
+    tags = tags[:limit]
+
+    # changelog / title / date, by tag, from the feed
+    meta = {}
+    try:
+        xml = _web_get(f"https://github.com/{repo_name}/releases.atom")
+        for e in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
+            tm = re.search(r"/releases/tag/([^\"]+)\"", e)
+            if not tm:
+                continue
+            content = (re.search(r"<content[^>]*>(.*?)</content>", e, re.S) or [None, ""])[1]
+            meta[tm.group(1)] = {
+                "body": _unescape_html(content),
+                "title": _unescape_html((re.search(r"<title>(.*?)</title>", e, re.S)
+                                         or [None, ""])[1]),
+                "updated": (re.search(r"<updated>(.*?)</updated>", e) or [None, ""])[1],
+            }
+    except Exception as ex:
+        log.info("release feed unavailable (%s) - page tags only", ex)
+
     out = []
-    for e in entries[:limit]:
-        tag_m = re.search(r"/releases/tag/([^\"]+)\"", e)
-        tag = tag_m.group(1) if tag_m else ""
-        if not tag:
-            continue
-        title = _unescape_html((re.search(r"<title>(.*?)</title>", e, re.S) or [None, tag])[1])
-        content = (re.search(r"<content[^>]*>(.*?)</content>", e, re.S) or [None, ""])[1]
-        body = _unescape_html(content)
-        updated = (re.search(r"<updated>(.*?)</updated>", e) or [None, ""])[1]
-        link = f"https://github.com/{repo_name}/releases/tag/{tag}"
-        pre = bool(re.search(r"(alpha|beta|rc|preview|pre-?release|nightly|dev)",
+    for tag in tags:
+        info = meta.get(tag) or {}
+        title = info.get("title") or tag
+        body = info.get("body") or ""
+        pre = bool(re.search(r"(alpha|beta|rc|preview|pre-release|nightly|dev)",
                              f"{tag} {title}", re.I))
         try:
             assets = fetch_assets_web(repo_name, tag)
@@ -2100,10 +2181,10 @@ def fetch_releases_web(repo_name, limit=10):
             "tag_name": tag,
             "name": title or tag,
             "body": body,
-            "html_url": link,
+            "html_url": f"https://github.com/{repo_name}/releases/tag/{tag}",
             "draft": False,
             "prerelease": pre,
-            "updated_at": updated,
+            "updated_at": info.get("updated", ""),
             "assets": assets,
         })
     return out

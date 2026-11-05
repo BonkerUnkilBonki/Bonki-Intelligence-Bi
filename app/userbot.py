@@ -224,8 +224,10 @@ async def send_file(handle, path, caption="", thread_id=None, tracker=None):
     if _client is None:
         raise RuntimeError("user account is not connected")
     entity = await _entity(handle)
-    kwargs = {"caption": (caption or "")[:1024], "parse_mode": "html",
-              "force_document": True}
+    kwargs = {"force_document": True}
+    if caption:                      # no caption at all when empty
+        kwargs["caption"] = caption[:1024]
+        kwargs["parse_mode"] = "html"
     if thread_id:
         kwargs["reply_to"] = int(thread_id)
     if tracker is not None:

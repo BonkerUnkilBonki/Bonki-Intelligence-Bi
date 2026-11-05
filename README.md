@@ -945,6 +945,29 @@ underscore only — a dot ends the tag, so `#Gitly_v7.0.2` would highlight as
 The exact tag is still shown as text on the line below (`v7.0.2 · 🟢 Stable`), so
 nothing is lost.
 
+### Where the release list comes from
+
+**The releases page, not the atom feed.** The feed can still list a release that has
+been deleted — a "V1" that no longer exists on the page appeared there and got
+posted to the channel. Tags are now read from `/releases` (what a visitor sees), and
+the feed is used only to supply each release's changelog text.
+
+Verified: the feed lists two entries, the page lists one, and only **v7.0.2** is
+fetched.
+
+**First run posts nothing to the channel.** When a repo is first watched, existing
+releases are recorded as already handled and you get a DM instead:
+
+```
+👀 Watching SwitchToMonk-Stm/Gitly
+
+🚀 Releases: found 2 existing item(s).
+V1, v7.0.2
+
+These were not posted to the channel — only NEW ones will be.
+Use /leech resync if you want them posted too.
+```
+
 ### How a release is posted
 
 Exactly the shape you asked for — the changelog gets its own message because a file
