@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05d"   # bump when the leech code changes
+BUILD = "leech-2026-11-05f"   # bump when the leech code changes
 
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gitly"
@@ -875,16 +875,35 @@ def post_release_to(rel, route):
             return "apk-failed"
 
 
-async def check_routes(force=False):
-    """Post new activity for every configured route, grouped by repo and event.
+_SYNC_LOCK = None          # created lazily on the running loop
 
-    force=True ignores the rate-limit backoff - used by the manual /leech check.
+
+def _lock():
+    global _SYNC_LOCK
+    if _SYNC_LOCK is None:
+        _SYNC_LOCK = asyncio.Lock()
+    return _SYNC_LOCK
+
+
+async def check_routes(force=False):
+    """Run one sync cycle, never two at once.
+
+    The background loop and a manual /leech check (or resync) used to overlap and
+    both upload the same files, which is why every file appeared twice.
     """
+    if not routes():
+        return 0, "no-routes"
+    lk = _lock()
+    if lk.locked():
+        return 0, "busy"
+    async with lk:
+        return await _check_routes_inner(force)
+
+
+async def _check_routes_inner(force=False):
     if force:
         db.set_settings({"gitly_backoff_until": ""})
     rows = routes()
-    if not rows:
-        return 0, "no-routes"
     posted = 0
     errors = []
     for repo_name in {r.get("repo") for r in rows}:
@@ -1064,8 +1083,12 @@ async def cmd_leech(chat, msg, user, args):
             f"♻️ Cleared the record of {had} posted release(s).\n"
             f"Re-checking now — files that were skipped will be uploaded again…")
         n, status = await check_routes(force=True)
-        lines = [f"✅ Re-synced — posted <b>{n}</b> item(s)."
-                 if n else f"⚠️ Nothing posted: {telegram.esc(status)}"]
+        if status == "busy":
+            lines = ["⏳ A check is already running — the files will appear "
+                     "shortly. Nothing was duplicated."]
+        else:
+            lines = [f"✅ Re-synced — posted <b>{n}</b> item(s)."
+                     if n else f"⚠️ Nothing posted: {telegram.esc(status)}"]
         for r in routes():
             g = db.get_group_by_chat(r.get("chat_id"))
             title = (g or {}).get("title") or r.get("chat_id")
@@ -1446,8 +1469,26 @@ def _rstate():
 
 
 def _save_rstate(st):
-    items = list(st.items())[-120:]          # bounded
-    db.set_settings({"leech_state": json.dumps(dict(items))[:60000]})
+    """Persist the per-release state as VALID JSON, trimming only whole entries.
+
+    The old version cut the JSON string at 60000 characters. Once the state grew
+    past that, the text was no longer valid JSON, _rstate() silently returned {},
+    and every release looked new again - so the bot re-uploaded everything on every
+    cycle. That is what caused the repeated uploads.
+    """
+    if not st:
+        db.set_settings({"leech_state": ""})
+        return
+    # newest first, then keep as many whole entries as fit
+    ordered = sorted(st.items(),
+                     key=lambda kv: (kv[1] or {}).get("t", 0) if isinstance(kv[1], dict)
+                     else 0, reverse=True)
+    for keep in (len(ordered), 80, 40, 20, 10, 5, 1):
+        blob = json.dumps(dict(ordered[:keep]))
+        if len(blob) <= 200000:
+            db.set_settings({"leech_state": blob})
+            return
+    db.set_settings({"leech_state": json.dumps(dict(ordered[:1]))})
 
 
 def asset_sig(assets):

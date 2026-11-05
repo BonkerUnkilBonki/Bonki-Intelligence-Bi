@@ -761,6 +761,23 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Only one sync runs at a time
+
+`/leech resync` and `/leech check` ran their own cycle **while the background
+watcher was also mid-cycle**, so both uploaded the same release and every file
+appeared twice in the channel.
+
+A single-flight lock now guards the whole cycle. If a check is already running, the
+manual command says so instead of starting a second one:
+
+```
+⏳ A check is already running (the background watcher).
+Give it a moment — it is uploading now.
+```
+
+Verified: two overlapping checks produced **one** upload, and the second returned
+`busy`.
+
 ### Files: added, renamed, removed
 
 Telegram cannot rename a file inside a message, so Bonki does the only correct
