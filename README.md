@@ -761,6 +761,31 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Stalls are detected and resumed
+
+GitHub sometimes stops sending mid-file. With one blocking read the socket just
+hung, which is what froze the progress bar for minutes at random percentages.
+
+Now every read has a **30-second timeout**, and a stall **resumes from the last
+byte** with an HTTP `Range` request instead of starting over. Up to 8 attempts, with
+backoff. The DM shows it plainly:
+
+```
+⬇️ Downloading Gitly-7.0.2-linux-x64.tar.gz
+████████░░░░ 63%  (64.3 MB / 102.0 MB)
+⚠️ connection stalled — resuming from 64.3 MB (attempt 1)
+```
+
+A **short read** — the server closing the stream early without an error — is treated
+as a stall too. Verified: a download that stopped at 40% resumed with a Range request
+and finished at exactly 100 bytes.
+
+### It runs without the Telegram app
+
+The bot is a **server process**. Closing Telegram, logging out or switching off your
+phone changes nothing — downloads, uploads and posts continue on the host. Only the
+process stopping interrupts it.
+
 ### Only one sync runs at a time
 
 `/leech resync` and `/leech check` ran their own cycle **while the background

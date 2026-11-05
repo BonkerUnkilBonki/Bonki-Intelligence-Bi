@@ -109,6 +109,12 @@ class Tracker:
         self._last_pct = pct
         self._edit(self._render(done, "downloading"))
 
+    def stalled(self, done, attempt=1, err=""):
+        txt = self._render(done, "downloading")
+        txt += (f"\n<i>⚠️ connection stalled — resuming from "
+                f"{human(done)} (attempt {attempt})</i>")
+        self._edit(txt, force=True)
+
     def uploading(self, done=0):
         self._phase = "uploading"
         self._edit(self._render(done, "uploading"), force=True)

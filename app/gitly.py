@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05f"   # bump when the leech code changes
+BUILD = "leech-2026-11-05g"   # bump when the leech code changes
 
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gitly"
@@ -188,34 +188,84 @@ def pick_apk(assets):
     return apks[0] if apks else None
 
 
-def download_asset(asset, dest, progress=None):
-    """Download an asset, optionally reporting bytes as they arrive."""
+def download_asset(asset, dest, progress=None, on_stall=None):
+    """Download an asset with stall detection and resume.
+
+    GitHub occasionally stops sending mid-file. With a single blocking read the
+    socket simply hung - which is what froze the progress bar for minutes at a
+    time. Now each read has a short timeout, and a stall resumes from the last
+    byte using an HTTP Range request instead of starting over.
+    """
     url = asset.get("browser_download_url") or asset.get("url")
-    r = requests.get(url, headers=_headers(), timeout=600, stream=True)
-    if not r.ok:
-        raise RuntimeError(f"download failed: HTTP {r.status_code}")
-    total = int(r.headers.get("Content-Length") or asset.get("size") or 0)
+    if not url:
+        raise RuntimeError("asset has no download url")
+    expect = int(asset.get("size") or 0)
     done = 0
+    stalls = 0
+    max_stalls = 8
+
     with open(dest, "wb") as fh:
-        for chunk in r.iter_content(1 << 16):
-            if not chunk:
-                continue
-            fh.write(chunk)
-            done += len(chunk)
-            if progress:
-                try:
-                    progress(done, total)
-                except Exception:
-                    pass
+        while stalls < max_stalls:
+            headers = dict(_headers())
+            if done:
+                headers["Range"] = f"bytes={done}-"
+            try:
+                # (connect, read) - a dead socket raises within ~30s
+                r = requests.get(url, headers=headers, timeout=(15, 30), stream=True)
+                if r.status_code == 416:            # already complete
+                    break
+                if r.status_code not in (200, 206):
+                    raise RuntimeError(f"download failed: HTTP {r.status_code}")
+                if r.status_code == 200 and done:
+                    # server ignored the range: start clean so the file is not corrupt
+                    done = 0
+                    fh.seek(0)
+                    fh.truncate()
+                total = int(r.headers.get("Content-Length") or 0)
+                if r.status_code == 206:
+                    total = done + total
+                elif not total:
+                    total = expect
+                for chunk in r.iter_content(1 << 16):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        try:
+                            progress(done, total or expect)
+                        except Exception:
+                            pass
+                # The server can close the stream early without raising - treat a
+                # short read as a stall so the next attempt resumes with Range.
+                if expect and done < expect:
+                    raise RuntimeError(f"short read: {done} of {expect} bytes")
+                break                                # finished cleanly
+            except Exception as e:
+                stalls += 1
+                log.warning("download stall %d/%d at %d bytes: %s",
+                            stalls, max_stalls, done, e)
+                if on_stall:
+                    try:
+                        on_stall(done, stalls, e)
+                    except Exception:
+                        pass
+                if stalls >= max_stalls:
+                    raise RuntimeError(
+                        f"download kept stalling after {stalls} attempts "
+                        f"({done} bytes received)") from e
+                time.sleep(min(2 * stalls, 10))      # back off, then resume
+
+    if expect and done < expect:
+        raise RuntimeError(f"incomplete download: {done} of {expect} bytes")
     if progress:
         try:
-            progress(done, total or done)
+            progress(done, done or expect)
         except Exception:
             pass
     return dest
 
 
-# ------------------------------------------------------------------ posting --
 def _header(rel):
     tag = rel.get("tag_name") or "?"
     title = rel.get("name") or tag
@@ -988,7 +1038,11 @@ Repeat in each topic. One repo can feed several topics.
 <code>/mode find</code> — back to the file bot
 
 <i>Releases are read from GitHub's public pages, so there is no API limit.
-Files over 50 MB upload through your user account (up to 2 GB).</i>"""
+Files over 50 MB upload through your user account (up to 2 GB).</i>
+
+<b>It runs on your server</b> — you can close Telegram, log out or switch
+off your phone; downloads and uploads carry on and the posts appear anyway.
+The only thing that stops it is the bot process going down.</i>"""
 
 
 # Everything the leech side stores. Reset wipes exactly these.
@@ -1295,6 +1349,8 @@ async def cmd_leech(chat, msg, user, args):
         lines.append(f"• last automatic check: {ago}s ago")
     if enabled() and rows:
         lines.append(f"• watcher: ✅ <b>automatic</b> — checks every {interval()}s")
+        lines.append("• <i>runs on your server — you can close Telegram and it "
+                     "keeps working</i>")
     elif rows:
         lines.append("• watcher: ⏹ paused — <code>/leech on</code> to resume")
     else:
@@ -1542,7 +1598,8 @@ def _send_asset(rel, asset, route, index, total):
             from . import progress as _pg
             tr = _pg.Tracker(name, size) if _pg.enabled() else None
             try:
-                download_asset(asset, dest, progress=_pg.callback_for(tr))
+                download_asset(asset, dest, progress=_pg.callback_for(tr),
+                               on_stall=(tr.stalled if tr else None))
                 if tr:
                     tr.uploading()
                 caption = build_caption(rel) if index == 0 else (
@@ -1561,7 +1618,8 @@ def _send_asset(rel, asset, route, index, total):
         from . import progress as _pg
         tr = _pg.Tracker(name, size) if _pg.enabled() else None
         try:
-            download_asset(asset, dest, progress=_pg.callback_for(tr))
+            download_asset(asset, dest, progress=_pg.callback_for(tr),
+                           on_stall=(tr.stalled if tr else None))
             if tr:
                 tr.uploading()
             caption = build_caption(rel) if index == 0 else (
