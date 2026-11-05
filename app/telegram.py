@@ -203,7 +203,7 @@ def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
 
 
 def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
-                  thread_id=None, silent=False):
+                  thread_id=None, silent=False, tracker=None):
     """Upload a local file as a document, optionally as a reply."""
     data = {
         "chat_id": chat_id,
@@ -216,9 +216,21 @@ def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
         data["allow_sending_without_reply"] = True
     if thread_id:
         data["message_thread_id"] = thread_id
-    with open(file_path, "rb") as f:
-        files = {"document": (filename, f, "application/octet-stream")}
-        r = requests.post(_url("sendDocument"), data=data, files=files, timeout=3600)
+    if tracker is not None:
+        # wrap the file so upload progress can be measured as requests reads it
+        from .progress import ProgressFile
+        pf = ProgressFile(file_path, tracker)
+        try:
+            files = {"document": (filename, pf, "application/octet-stream")}
+            r = requests.post(_url("sendDocument"), data=data, files=files,
+                              timeout=3600)
+        finally:
+            pf.close()
+    else:
+        with open(file_path, "rb") as f:
+            files = {"document": (filename, f, "application/octet-stream")}
+            r = requests.post(_url("sendDocument"), data=data, files=files,
+                              timeout=3600)
     if not r.ok:
         raise RuntimeError(f"sendDocument failed: {r.status_code} {r.text[:300]}")
     return r.json()

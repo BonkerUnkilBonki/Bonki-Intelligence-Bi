@@ -26,6 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
+BUILD = "leech-2026-11-05c"   # bump when the leech code changes
 
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gitly"
@@ -187,15 +188,30 @@ def pick_apk(assets):
     return apks[0] if apks else None
 
 
-def download_asset(asset, dest):
+def download_asset(asset, dest, progress=None):
+    """Download an asset, optionally reporting bytes as they arrive."""
     url = asset.get("browser_download_url") or asset.get("url")
-    r = requests.get(url, headers=_headers(), timeout=300, stream=True)
+    r = requests.get(url, headers=_headers(), timeout=600, stream=True)
     if not r.ok:
         raise RuntimeError(f"download failed: HTTP {r.status_code}")
+    total = int(r.headers.get("Content-Length") or asset.get("size") or 0)
+    done = 0
     with open(dest, "wb") as fh:
         for chunk in r.iter_content(1 << 16):
-            if chunk:
-                fh.write(chunk)
+            if not chunk:
+                continue
+            fh.write(chunk)
+            done += len(chunk)
+            if progress:
+                try:
+                    progress(done, total)
+                except Exception:
+                    pass
+    if progress:
+        try:
+            progress(done, total or done)
+        except Exception:
+            pass
     return dest
 
 
@@ -939,6 +955,12 @@ Repeat in each topic. One repo can feed several topics.
 <b>Check right now</b>
 <code>/leech check</code> — forces an immediate look at every repo
 
+<b>Progress</b>
+<code>/leech progress on</code> · <code>off</code> — live download/upload % in DM
+
+<b>Something stuck?</b>
+<code>/leech resync</code> — forget what was posted and upload it all again
+
 <b>Start over</b>
 <code>/leech reset</code> — delete every stored leech setting (asks first)
 
@@ -1030,6 +1052,40 @@ async def cmd_leech(chat, msg, user, args):
     if sub in ("help", "?", "commands"):
         return await rose._reply(chat, msg, LEECH_HELP)
 
+    if sub in ("resync", "repair", "redo", "force"):
+        if not owner and not admin:
+            return await rose._reply(chat, msg, "Admins only.")
+        had = len(_rstate())
+        db.set_settings({"leech_state": "", "gitly_seen": "", "gitly_etags": "",
+                         "gitly_backoff_until": ""})
+        await asyncio.to_thread(db.flush, True)
+        await rose._reply(
+            chat, msg,
+            f"♻️ Cleared the record of {had} posted release(s).\n"
+            f"Re-checking now — files that were skipped will be uploaded again…")
+        n, status = await check_routes(force=True)
+        lines = [f"✅ Re-synced — posted <b>{n}</b> item(s)."
+                 if n else f"⚠️ Nothing posted: {telegram.esc(status)}"]
+        for r in routes():
+            g = db.get_group_by_chat(r.get("chat_id"))
+            title = (g or {}).get("title") or r.get("chat_id")
+            ev = EVENTS.get(str(r.get("event") or "release"), "🚀 Releases")
+            where = f"topic {r['thread_id']}" if r.get("thread_id") else "main feed"
+            lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
+                         f" → {telegram.esc(title)} · {where}")
+        return await rose._reply(chat, msg, "\n".join(lines))
+
+    if sub in ("progress", "verbose"):
+        want = rest.strip().lower()
+        on = want not in ("off", "0", "no", "false")
+        db.set_settings({"leech_progress": "1" if on else "0"})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(
+            chat, msg,
+            "📊 Progress reports <b>on</b> — you'll get a live download/upload "
+            "percentage in this DM for every file."
+            if on else "📊 Progress reports off.")
+
     if sub in ("check", "now", "scan", "sync", "run"):
         if not routes():
             return await rose._reply(
@@ -1041,6 +1097,26 @@ async def cmd_leech(chat, msg, user, args):
                           f"🔎 Checking {len({r.get('repo') for r in routes()})} "
                           f"repo(s) now…")
         lines = []
+        # per-release file state: how many uploaded, how many still missing
+        try:
+            for rp in {r.get("repo") for r in routes()}:
+                rels = await asyncio.to_thread(fetch_releases, rp, 5)
+                st_all = _rstate()
+                for rel in (rels or [])[:3]:
+                    rid = rel.get("id") or rel.get("tag_name")
+                    n_assets = len(rel.get("assets") or [])
+                    if not n_assets:
+                        continue
+                    for route in [x for x in routes() if x.get("repo") == rp]:
+                        ent = st_all.get(_state_key(route, rid)) or {}
+                        done = ent.get("done") or {}
+                        got = len([k for k in done])
+                        mark = "✅" if got >= n_assets else "⏳"
+                        lines.append(f"{mark} <code>{telegram.esc(str(rel.get('tag_name')))}</code>"
+                                     f": {got}/{n_assets} file(s) uploaded")
+        except Exception as e:
+            lines.append(f"⚠️ {telegram.esc(str(e)[:80])}")
+        lines.append("")
         # show what GitHub returned, so an empty fetch is visible
         for rp in {r.get("repo") for r in routes()}:
             try:
@@ -1183,7 +1259,7 @@ async def cmd_leech(chat, msg, user, args):
 
     # status
     rows = routes()
-    lines = ["📦 <b>Bonki Leech</b>", ""]
+    lines = ["📦 <b>Bonki Leech</b>", f"<i>code: {BUILD}</i>", ""]
     cur = (db.get_settings().get("leech_repo") or "").strip()
     lines.append(f"• repo being configured: "
                  f"{'<code>' + telegram.esc(cur) + '</code>' if cur else 'none'}")
@@ -1391,11 +1467,12 @@ def await_userbot_delete(chat_id, message_id):
     return userbot.run_sync(userbot.delete_message(chat_id, message_id), timeout=180)
 
 
-def await_userbot_send(chat_id, path, caption, thread_id):
+def await_userbot_send(chat_id, path, caption, thread_id, tracker=None):
     """Upload through the user account, on the loop Telethon lives on."""
     from . import userbot
     return userbot.run_sync(
-        userbot.send_file(chat_id, path, caption, thread_id), timeout=900)
+        userbot.send_file(chat_id, path, caption, thread_id, tracker=tracker),
+        timeout=3600)
 
 
 def _send_asset(rel, asset, route, index, total):
@@ -1421,19 +1498,42 @@ def _send_asset(rel, asset, route, index, total):
             return None
         with tempfile.TemporaryDirectory() as tmp:
             dest = os.path.join(tmp, name)
-            download_asset(asset, dest)
-            caption = build_caption(rel) if index == 0 else (
-                f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-            r = await_userbot_send(chat_id, dest, caption, thread)
-            return ((r or {}).get("result") or {}).get("message_id")
+            from . import progress as _pg
+            tr = _pg.Tracker(name, size) if _pg.enabled() else None
+            try:
+                download_asset(asset, dest, progress=_pg.callback_for(tr))
+                if tr:
+                    tr.uploading()
+                caption = build_caption(rel) if index == 0 else (
+                    f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
+                r = await_userbot_send(chat_id, dest, caption, thread, tracker=tr)
+                if tr:
+                    tr.done()
+                return ((r or {}).get("result") or {}).get("message_id")
+            except Exception as e:
+                if tr:
+                    tr.failed(e)
+                raise
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, name)
-        download_asset(asset, dest)
-        caption = build_caption(rel) if index == 0 else (
-            f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-        r = telegram.send_document(dest, name, caption, chat_id, thread_id=thread)
-        return ((r or {}).get("result") or {}).get("message_id")
+        from . import progress as _pg
+        tr = _pg.Tracker(name, size) if _pg.enabled() else None
+        try:
+            download_asset(asset, dest, progress=_pg.callback_for(tr))
+            if tr:
+                tr.uploading()
+            caption = build_caption(rel) if index == 0 else (
+                f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
+            r = telegram.send_document(dest, name, caption, chat_id, thread_id=thread,
+                                       tracker=tr)
+            if tr:
+                tr.done()
+            return ((r or {}).get("result") or {}).get("message_id")
+        except Exception as e:
+            if tr:
+                tr.failed(e)
+            raise
 
 
 def sync_release(rel, route):
@@ -1558,6 +1658,34 @@ def sync_release(rel, route):
             pass
         entry["text_id"] = None
 
+    # ---- changelog edited? update the captions in place ----
+    # Compare BEFORE overwriting the stored body, and actually call the edit -
+    # the previous version overwrote it first, so an edited changelog never
+    # reached Telegram.
+    old_body = entry.get("body") or ""
+    edited = 0
+    if not added and not failed and old_body and old_body != body:
+        ids = [m for m in done.values() if m]
+        for n, mid in enumerate(ids):
+            try:
+                if n == 0:
+                    cap = build_caption(rel)
+                else:
+                    nm = assets[n - 1].get("name") if n - 1 < len(assets) else ""
+                    cap = (f"📎 <b>{telegram.esc(nm)}</b>\n{rel.get('html_url') or ''}")
+                telegram.edit_message_caption(route.get("chat_id"), mid, cap)
+                edited += 1
+            except Exception as e:
+                log.info("caption edit %s failed: %s", mid, e)
+        # a text-only post (no files) is edited as text
+        if not ids and entry.get("text_id"):
+            try:
+                telegram.edit_message_text(route.get("chat_id"),
+                                           entry["text_id"], build_caption(rel))
+                edited += 1
+            except Exception as e:
+                log.info("text edit failed: %s", e)
+
     entry["sig"] = sig
     entry["body"] = body
     entry["done"] = done
@@ -1573,581 +1701,10 @@ def sync_release(rel, route):
     if failed:
         return f"partial:{len(failed)}"
     if added:
-        return "sent" if not entry.get("msg_ids") or added == len(assets) else "sent"
-    if entry.get("body") and entry.get("body") != body:
+        return "sent"
+    if edited:
         return "edited"
     return "unchanged"
-
-
-async def check_routes(force=False):
-    """Post new activity for every configured route, grouped by repo and event.
-
-    force=True ignores the rate-limit backoff - used by the manual /leech check.
-    """
-    if force:
-        db.set_settings({"gitly_backoff_until": ""})
-    rows = routes()
-    if not rows:
-        return 0, "no-routes"
-    posted = 0
-    errors = []
-    for repo_name in {r.get("repo") for r in rows}:
-        mine = [r for r in rows if r.get("repo") == repo_name]
-        for event in {str(r.get("event") or "release") for r in mine}:
-            targets = [r for r in mine if str(r.get("event") or "release") == event]
-            try:
-                if event == "release":
-                    items = await asyncio.to_thread(fetch_releases, repo_name, 15)
-                elif event == "commit":
-                    items = await asyncio.to_thread(fetch_commits, repo_name, 10)
-                else:
-                    items = await asyncio.to_thread(fetch_issues, repo_name, 10)
-            except Exception as e:
-                errors.append(f"{repo_name}/{event}: {e}")
-                continue
-            if not items:
-                continue
-            for route in targets:
-                for item in reversed(items):
-                    try:
-                        if event == "release":
-                            st = await asyncio.to_thread(sync_release, item, route)
-                            ok = st in ("sent", "replaced", "edited", "sent-text")
-                        else:
-                            st = await asyncio.to_thread(post_event_to, repo_name,
-                                                         event, item, route)
-                            ok = st == "sent"
-                        if ok:
-                            posted += 1
-                    except Exception as e:
-                        log.warning("route post failed: %s", e)
-    db.set_settings({"gitly_last_check": str(int(time.time())),
-                     "gitly_last_error": "; ".join(errors)[:200]})
-    return posted, ("ok" if not errors else "; ".join(errors))
-
-
-LEECH_HELP = """📦 <b>Bonki Leech — commands</b>
-
-<b>1. Choose the repo</b> (any chat or this DM)
-<code>/leech repo owner/name</code>
-A link works too: <code>/leech repo https://github.com/owner/name</code>
-
-<b>2. Send it to a topic</b> (run INSIDE the channel topic)
-<code>/leech here release</code> — the APK / zip / tar.gz files
-<code>/leech here commit</code> — new commits
-<code>/leech here issue</code> — issues and pull requests
-Repeat in each topic. One repo can feed several topics.
-
-<b>3. Check</b>
-<code>/leech</code> — what is being watched and where
-<code>/gitly debug</code> — what GitHub actually returned
-
-<b>Remove</b>
-<code>/leech remove</code> — everything in THIS chat
-<code>/leech remove owner/name</code> — that repo everywhere
-<code>/leech remove all</code> — every repo, everywhere
-
-<b>Turn on / off</b>
-<code>/leech on</code> · <code>/leech off</code>
-
-<b>Check right now</b>
-<code>/leech check</code> — forces an immediate look at every repo
-
-<b>Start over</b>
-<code>/leech reset</code> — delete every stored leech setting (asks first)
-
-<b>Mode</b>
-<code>/mode leech</code> — this chat becomes a release feed only
-<code>/mode find</code> — back to the file bot
-
-<i>Releases are read from GitHub's public pages, so there is no API limit.
-Files over 50 MB upload through your user account (up to 2 GB).</i>"""
-
-
-# Everything the leech side stores. Reset wipes exactly these.
-LEECH_KEYS = (
-    "leech_routes", "leech_state", "leech_repo",
-    "gitly_repo", "gitly_channel", "gitly_on", "gitly_interval",
-    "gitly_prerelease", "gitly_seen", "gitly_etags", "gitly_etag",
-    "gitly_last_check", "gitly_last_error", "gitly_backoff_until",
-)
-
-
-def reset_all(also_mode=True):
-    """Wipe every stored leech setting. Returns how many keys were cleared."""
-    cleared = 0
-    for k in LEECH_KEYS:
-        try:
-            if db.get_settings().get(k) not in (None, ""):
-                cleared += 1
-            db.set_settings({k: ""})
-        except Exception as e:
-            log.info("reset %s failed: %s", k, e)
-    _CACHE["rels"] = []
-    _CACHE["at"] = 0
-    if also_mode:
-        from . import modes
-        for g in db.list_groups():
-            if modes.get_mode(g.get("chat_id")) == modes.LEECH:
-                modes.set_mode(g.get("chat_id"), modes.FIND)
-    db.flush(force=True)
-    return cleared
-
-
-async def cmd_leech(chat, msg, user, args):
-    """Configure the leech bot: which repo, and which topic it feeds."""
-    from . import approval, modes, rose
-    cid = chat.get("id")
-    parts = (args or "").strip().split(None, 1)
-    sub = parts[0].lower() if parts else ""
-    rest = parts[1].strip() if len(parts) > 1 else ""
-
-    owner = approval.is_owner((user or {}).get("id"))
-    admin = owner or await rose._is_admin(cid, (user or {}).get("id"),
-                                          chat.get("type"))
-    if not admin:
-        return await rose._reply(chat, msg, "Admins only.")
-
-    if sub in ("repo", "watch"):
-        if "/" not in rest:
-            return await rose._reply(chat, msg,
-                                     "Usage: <code>/leech repo owner/name</code>")
-        name = normalize_repo(rest)
-        if "/" not in name:
-            return await rose._reply(chat, msg,
-                                     "That doesn't look like a repo. Send "
-                                     "<code>owner/name</code> or paste the GitHub link.")
-        try:
-            rels = await asyncio.to_thread(fetch_releases, name, 3)
-            n = len(rels or [])
-        except Exception as e:
-            owner, _, short = name.partition("/")
-            near = await asyncio.to_thread(suggest_repos, owner, short)
-            hint = ""
-            if near:
-                hint = ("\n\nDid you mean: " +
-                        " · ".join(f"<code>{telegram.esc(owner + '/' + x)}</code>"
-                                   for x in near))
-            return await rose._reply(
-                chat, msg,
-                f"⚠️ <code>{telegram.esc(name)}</code> — {telegram.esc(str(e))}"
-                f"{hint}")
-        db.set_settings({"leech_repo": name, "gitly_on": "1"})
-        await asyncio.to_thread(db.flush, True)
-        modes.set_mode(cid, modes.LEECH)
-        return await rose._reply(
-            chat, msg,
-            f"📦 Watching <code>{telegram.esc(name)}</code> — {n} release(s) visible.\n\n"
-            f"Now open the <b>topic</b> you want releases in and send "
-            f"<code>/leech here</code>.")
-
-    if sub in ("help", "?", "commands"):
-        return await rose._reply(chat, msg, LEECH_HELP)
-
-    if sub in ("check", "now", "scan", "sync", "run"):
-        if not routes():
-            return await rose._reply(
-                chat, msg,
-                "Nothing is being watched yet.\n"
-                "1. <code>/leech repo owner/name</code>\n"
-                "2. open the topic and send <code>/leech here release</code>")
-        await rose._reply(chat, msg,
-                          f"🔎 Checking {len({r.get('repo') for r in routes()})} "
-                          f"repo(s) now…")
-        lines = []
-        # show what GitHub returned, so an empty fetch is visible
-        for rp in {r.get("repo") for r in routes()}:
-            try:
-                found = await asyncio.to_thread(fetch_releases, rp, 5)
-                cnt = len(found or [])
-                assets = sum(len(x.get("assets") or []) for x in (found or []))
-                lines.append(f"• <code>{telegram.esc(str(rp))}</code>: {cnt} "
-                             f"release(s), {assets} file(s) found")
-            except Exception as e:
-                lines.append(f"• <code>{telegram.esc(str(rp))}</code>: "
-                             f"⚠️ {telegram.esc(str(e)[:80])}")
-        lines.append("")
-        n, status = await check_routes(force=True)
-        if n:
-            lines.append(f"✅ Posted <b>{n}</b> item(s).")
-        elif status == "ok":
-            lines.append("✅ Checked — nothing new since last time.")
-        else:
-            lines.append(f"⚠️ {telegram.esc(status)}")
-        # show what each route points at, so a wrong topic is obvious
-        lines.append("")
-        lines.append("<b>Watching</b>")
-        for r in routes():
-            g = db.get_group_by_chat(r.get("chat_id"))
-            title = (g or {}).get("title") or r.get("chat_id")
-            ev = EVENTS.get(str(r.get("event") or "release"), "🚀 Releases")
-            where = f"topic {r['thread_id']}" if r.get("thread_id") else "main feed"
-            lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
-                         f" → {telegram.esc(title)} · {where}")
-        return await rose._reply(chat, msg, "\n".join(lines))
-
-    if sub in ("reset", "wipe", "factory"):
-        if not owner:
-            return await rose._reply(chat, msg, "🔒 Owner only — this deletes data.")
-        await asyncio.to_thread(
-            telegram.send_message,
-            "🧨 <b>Reset the leech bot?</b>\n\n"
-            "This deletes <b>everything</b> the leech side has stored:\n"
-            "• every watched repo and route\n"
-            "• the record of which releases were already posted\n"
-            "• cached GitHub data and rate-limit state\n"
-            "• all leech settings, and it switches chats back to Find mode\n\n"
-            "Messages already posted in your channel are <b>not</b> deleted — "
-            "Telegram keeps those.\n\n"
-            "<b>This cannot be undone.</b>",
-            chat_id=chat.get("id"), reply_to=msg.get("message_id"),
-            reply_markup={"inline_keyboard": [[
-                {"text": "🧨 Yes, reset everything", "callback_data": "lreset:yes"},
-                {"text": "Cancel", "callback_data": "lreset:no"}]]})
-        return
-
-    if sub in ("here", "topic"):
-        # Anywhere a bot can post is a valid destination: a broadcast channel, a
-        # normal group, or a forum topic inside a group. Only a DM is refused.
-        if str(chat.get("type")) == "private":
-            return await rose._reply(
-                chat, msg,
-                "⚠️ Run <code>/leech here</code> <b>inside the chat or topic</b> "
-                "where the posts should land — a channel, a group, or a forum "
-                "topic.\n\n"
-                "A DM can't receive releases, so it can't be a destination.\n"
-                "Use <code>/leech help</code> for the full steps.")
-        repo_name = (db.get_settings().get("leech_repo") or repo()).strip()
-        # which kind of activity? default = releases
-        want = (rest or "release").strip().lower()
-        want = {"releases": "release", "commits": "commit", "push": "commit",
-                "issues": "issue", "prs": "issue", "pull": "issue",
-                "everything": "release"}.get(want, want)
-        if want not in EVENTS:
-            return await rose._reply(
-                chat, msg,
-                f"Unknown type <code>{telegram.esc(rest)}</code>.\n"
-                f"Use: <code>/leech here release</code>, "
-                f"<code>/leech here commit</code> or <code>/leech here issue</code>")
-        thread = msg.get("message_thread_id")
-        is_topic = bool(thread)
-        added = add_route(repo_name, cid, thread, include_prereleases(), event=want)
-        db.set_settings({"gitly_on": "1"})      # a route implies you want it live
-        await asyncio.to_thread(db.flush, True)
-        modes.set_mode(cid, modes.LEECH)
-        if is_topic:
-            where = f"this topic (<code>{thread}</code>)"
-        elif str(chat.get("type")) == "channel":
-            where = "the channel's main feed (no topic)"
-        else:
-            where = "this group's main feed (no topic)"
-        return await rose._reply(
-            chat, msg,
-            ("✅ " if added else "♻️ Already set: ") +
-            f"<b>{EVENTS[want]}</b> from <code>{telegram.esc(repo_name)}</code> "
-            f"will be posted to {where}.\n\n"
-            f"<i>Run this inside each topic you want a different kind of update in — "
-            f"releases in one topic, commits in another.</i>")
-
-    if sub in ("remove", "rm", "stop", "delete", "unwatch"):
-        target = normalize_repo(rest) if rest else ""
-        rows_before = routes()
-        if target and "/" in target:
-            n = remove_route(target, None)          # that repo, in every chat
-            label = f"<code>{telegram.esc(target)}</code>"
-        elif target.lower() in ("all", "everything"):
-            _save_routes([])
-            n = len(rows_before)
-            label = "all repos"
-        else:
-            n = remove_route(None, cid)             # everything in THIS chat
-            label = "this chat"
-        # clear the "repo being configured" pointer if it is now gone
-        cur = (db.get_settings().get("leech_repo") or "").strip()
-        if cur and (not target or target.lower() == "all" or
-                    normalize_repo(cur).lower() == target.lower()):
-            if not [r for r in routes() if normalize_repo(str(r.get("repo"))).lower()
-                    == normalize_repo(cur).lower()]:
-                db.set_settings({"leech_repo": ""})
-        await asyncio.to_thread(db.flush, True)
-        if not n:
-            return await rose._reply(
-                chat, msg,
-                "Nothing matched.\n<code>/leech</code> shows what is currently "
-                "watched.")
-        left = len(routes())
-        if not left:
-            # nothing left anywhere: switch the watcher off and drop the old
-            # single-channel pointer, so no stale setting can keep it alive
-            db.set_settings({"gitly_on": "0", "gitly_channel": "",
-                             "leech_repo": ""})
-            await asyncio.to_thread(db.flush, True)
-        note = ("\n\nNo routes left — the watcher has nothing to do. "
-                "Use <code>/mode find</code> if you want this chat to be a find "
-                "bot again." if not left else
-                f"\n\n{left} route(s) still active — <code>/leech</code> to see them.")
-        return await rose._reply(chat, msg,
-                                 f"🗑 Removed {n} route(s) for {label}.{note}")
-
-    if sub in ("on", "off"):
-        db.set_settings({"gitly_on": "1" if sub == "on" else "0"})
-        await asyncio.to_thread(db.flush, True)
-        return await rose._reply(chat, msg,
-                                 "✅ Leeching on." if sub == "on" else "⏹ Leeching off.")
-
-    # status
-    rows = routes()
-    lines = ["📦 <b>Bonki Leech</b>", ""]
-    cur = (db.get_settings().get("leech_repo") or "").strip()
-    lines.append(f"• repo being configured: "
-                 f"{'<code>' + telegram.esc(cur) + '</code>' if cur else 'none'}")
-    try:
-        last_loop = int(db.get_settings().get("gitly_loop_last") or 0)
-    except (TypeError, ValueError):
-        last_loop = 0
-    if last_loop:
-        ago = int(time.time()) - last_loop
-        lines.append(f"• last automatic check: {ago}s ago")
-    if enabled() and rows:
-        lines.append(f"• watcher: ✅ <b>automatic</b> — checks every {interval()}s")
-    elif rows:
-        lines.append("• watcher: ⏹ paused — <code>/leech on</code> to resume")
-    else:
-        lines.append("• watcher: idle (nothing configured)")
-    if not rows:
-        lines.append("")
-        lines.append("No routes yet. Three steps:")
-        lines.append("1. <code>/leech repo owner/name</code>")
-        lines.append("2. open the topic you want the updates in")
-        lines.append("3. <code>/leech here release</code> — or <code>commit</code> / "
-                     "<code>issue</code>")
-    else:
-        lines.append("")
-        lines.append("<b>Routes</b>")
-        for r in rows:
-            g = db.get_group_by_chat(r.get("chat_id"))
-            title = (g or {}).get("title") or r.get("chat_id")
-            topic = f"topic {r['thread_id']}" if r.get("thread_id") else "main"
-            pre = " + pre-releases" if r.get("prerelease") else ""
-            ev = EVENTS.get(str(r.get("event") or "release"), "🚀 Releases")
-            lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
-                         f" → {telegram.esc(title)} · {topic}{pre}")
-    await rose._reply(chat, msg, "\n".join(lines))
-
-
-# ------------------------------------------------- repo activity (events) ----
-# A repo produces more than releases. Each route picks WHICH activity it wants,
-# so "releases" can go to one topic and "commits" or "issues" to another.
-EVENTS = {
-    "release": "🚀 Releases",
-    "commit": "🔨 Commits",
-    "issue": "🐞 Issues & PRs",
-}
-
-
-def _etags():
-    try:
-        return json.loads(db.get_settings().get("gitly_etags") or "{}")
-    except Exception:
-        return {}
-
-
-def _save_etags(d):
-    # keep it small: 40 entries is plenty for a few repos x a few endpoints
-    items = list(d.items())[-40:]
-    db.set_settings({"gitly_etags": json.dumps(dict(items))})
-
-
-def fetch_json(path):
-    """GET an API path with a per-URL ETag. Returns None when unchanged."""
-    url = path if path.startswith("http") else f"{API}{path}"
-    etags = _etags()
-    headers = _headers()
-    if etags.get(url):
-        headers["If-None-Match"] = etags[url]
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-    except Exception as e:
-        raise RuntimeError(f"network error ({type(e).__name__})") from e
-    if r.status_code == 304:
-        return None
-    if r.status_code == 404:
-        raise RuntimeError("not found (private repo, or wrong name)")
-    if r.status_code == 403:
-        raise RuntimeError("GitHub rate limit reached")
-    if not r.ok:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    tag = r.headers.get("ETag")
-    if tag:
-        etags[url] = tag
-        _save_etags(etags)
-    try:
-        return r.json()
-    except Exception:
-        return None
-
-
-def fetch_commits(repo_name, limit=5):
-    """Public commits - web feed first, API only as a token-backed fallback."""
-    try:
-        return fetch_commits_web(repo_name, limit)
-    except Exception as e:
-        log.info("commit web feed failed for %s: %s", repo_name, e)
-        if not _headers().get("Authorization"):
-            raise
-    data = fetch_json(f"/repos/{repo_name}/commits?per_page={limit}")
-    if data is None:
-        return None
-    out = []
-    for c in (data or []):
-        commit = c.get("commit") or {}
-        out.append({
-            "id": c.get("sha"),
-            "short": (c.get("sha") or "")[:7],
-            "message": (commit.get("message") or "").split("\n")[0][:200],
-            "author": ((commit.get("author") or {}).get("name") or "unknown"),
-            "url": c.get("html_url") or "",
-            "date": ((commit.get("author") or {}).get("date") or ""),
-        })
-    return out
-
-
-def fetch_issues(repo_name, limit=5):
-    data = fetch_json(f"/repos/{repo_name}/issues?state=all&per_page={limit}"
-                      f"&sort=created&direction=desc")
-    if data is None:
-        return None
-    out = []
-    for i in (data or []):
-        if i.get("pull_request"):
-            kind = "PR"
-        else:
-            kind = "issue"
-        out.append({
-            "id": i.get("id"),
-            "number": i.get("number"),
-            "title": (i.get("title") or "")[:200],
-            "body": (i.get("body") or "")[:600],
-            "state": i.get("state") or "open",
-            "kind": kind,
-            "user": ((i.get("user") or {}).get("login") or ""),
-            "url": i.get("html_url") or "",
-        })
-    return out
-
-
-def format_commit(repo_name, c):
-    return (f"🔨 <b>New commit</b> in <code>{telegram.esc(repo_name)}</code>\n"
-            f"<code>{telegram.esc(c['short'])}</code> — {telegram.esc(c['message'])}\n"
-            f"by {telegram.esc(c['author'])}\n{c['url']}")
-
-
-def format_issue(repo_name, i):
-    icon = "🟢" if i["state"] == "open" else "🔴"
-    label = "PR" if i["kind"] == "PR" else "Issue"
-    text = (f"{icon} <b>{label} #{i['number']}</b> · {i['state']} in "
-            f"<code>{telegram.esc(repo_name)}</code>\n"
-            f"<b>{telegram.esc(i['title'])}</b>")
-    if i.get("body"):
-        text += f"\n\n{telegram.esc(i['body'][:400])}"
-    if i.get("user"):
-        text += f"\n\nby {telegram.esc(i['user'])}"
-    return text + f"\n{i['url']}"
-
-
-def post_event_to(repo_name, event, item, route):
-    """Post one commit/issue into one route."""
-    key = f"{event}:{item.get('id')}:{route.get('chat_id')}:{route.get('thread_id') or ''}"
-    if not _mark_seen(key):
-        return "already"
-    text = (format_commit(repo_name, item) if event == "commit"
-            else format_issue(repo_name, item))
-    try:
-        telegram.send_message(text[:3800], chat_id=route.get("chat_id"),
-                              thread_id=route.get("thread_id") or None)
-        return "sent"
-    except Exception as e:
-        log.warning("event post failed: %s", e)
-        db.set_settings({"gitly_last_error": str(e)[:160]})
-        return "post-failed"
-
-
-# ------------------------------------------------- per-release sync state ----
-# Telegram cannot rename a file inside a message, so when a release's assets
-# change we delete our old posts and upload the new ones. When only the text
-# changes we edit the caption, which keeps the message and its file intact.
-def _rstate():
-    try:
-        return json.loads(db.get_settings().get("leech_state") or "{}")
-    except Exception:
-        return {}
-
-
-def _save_rstate(st):
-    items = list(st.items())[-120:]          # bounded
-    db.set_settings({"leech_state": json.dumps(dict(items))[:60000]})
-
-
-def asset_sig(assets):
-    """A fingerprint of the asset set: any rename/replace changes it."""
-    bits = []
-    for a in sorted((assets or []), key=lambda x: str(x.get("name"))):
-        bits.append(f"{a.get('id') or a.get('name')}:{a.get('name')}:{a.get('size')}")
-    return "|".join(bits)
-
-
-def _state_key(route, rid):
-    return f"{route.get('chat_id')}:{route.get('thread_id') or ''}:{rid}"
-
-
-def await_userbot_delete(chat_id, message_id):
-    from . import userbot
-    return userbot.run_sync(userbot.delete_message(chat_id, message_id), timeout=180)
-
-
-def await_userbot_send(chat_id, path, caption, thread_id):
-    """Upload through the user account, on the loop Telethon lives on."""
-    from . import userbot
-    return userbot.run_sync(
-        userbot.send_file(chat_id, path, caption, thread_id), timeout=900)
-
-
-def _send_asset(rel, asset, route, index, total):
-    """Upload one asset. Returns the message id, or None."""
-    name = asset.get("name") or "file"
-    size = int(asset.get("size") or 0)
-    chat_id = route.get("chat_id")
-    thread = route.get("thread_id") or None
-
-    big = size > UPLOAD_LIMIT
-    if big:
-        # The 50 MB cap is a BOT API limit. The connected user account can upload
-        # 2 GB, so use it rather than degrading to a link.
-        from . import userbot
-        if not userbot.is_running():
-            mb = size / (1024 * 1024)
-            telegram.send_message(
-                build_caption(rel) +
-                f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over the "
-                f"50 MB <b>bot</b> limit, and no user account is connected to lift "
-                f"it.\nDownload: {asset.get('browser_download_url', '')}",
-                chat_id=chat_id, thread_id=thread)
-            return None
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = os.path.join(tmp, name)
-            download_asset(asset, dest)
-            caption = build_caption(rel) if index == 0 else (
-                f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-            r = await_userbot_send(chat_id, dest, caption, thread)
-            return ((r or {}).get("result") or {}).get("message_id")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = os.path.join(tmp, name)
-        download_asset(asset, dest)
-        caption = build_caption(rel) if index == 0 else (
-            f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-        r = telegram.send_document(dest, name, caption, chat_id, thread_id=thread)
-        return ((r or {}).get("result") or {}).get("message_id")
 
 
 def _web_get(url, timeout=25):

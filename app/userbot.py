@@ -211,7 +211,7 @@ def run_sync(coro, timeout=600):
     return fut.result(timeout=timeout)
 
 
-async def send_file(handle, path, caption="", thread_id=None):
+async def send_file(handle, path, caption="", thread_id=None, tracker=None):
     """Upload a file as the USER account - up to 2 GB, not the bot's 50 MB.
 
     The Bot API caps uploads at 50 MB. A connected user account uses MTProto,
@@ -228,6 +228,14 @@ async def send_file(handle, path, caption="", thread_id=None):
               "force_document": True}
     if thread_id:
         kwargs["reply_to"] = int(thread_id)
+    if tracker is not None:
+        # Telethon reports real upload progress
+        def _cb(sent, total):
+            try:
+                tracker.uploaded(sent)
+            except Exception:
+                pass
+        kwargs["progress_callback"] = _cb
     msg = await _client.send_file(entity, path, **kwargs)
     return {"ok": True, "result": {"message_id": getattr(msg, "id", None)}}
 

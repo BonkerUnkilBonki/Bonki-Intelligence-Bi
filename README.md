@@ -761,6 +761,74 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Editing the changelog updates the post
+
+Change the release notes on GitHub and the captions already in Telegram are
+**edited in place** — the files are not re-uploaded, the message keeps its place:
+
+| What you edit | What happens |
+|---|---|
+| changelog / description | captions edited, files kept |
+| a file name or the file set | old posts deleted, new set uploaded |
+| nothing | nothing (no API calls, no edits) |
+
+This had stopped working: my rewrite compared the stored changelog **after**
+overwriting it, so the comparison always matched and the edit never fired. Fixed and
+verified — editing the notes now returns `edited`, both captions update with the new
+text, and running it again returns `unchanged` with zero edits.
+
+### When something is stuck: `/leech resync`
+
+If a release was partly posted and the rest never arrives, `/leech resync` forgets
+what was posted and uploads everything again:
+
+```
+♻️ Cleared the record of 1 posted release(s).
+Re-checking now — files that were skipped will be uploaded again…
+✅ Re-synced — posted 3 item(s).
+```
+
+`/leech check` also now shows the per-release file state, so a stuck release is
+visible instead of silent:
+
+```
+⏳ v7.0.2: 1/3 file(s) uploaded
+• SwitchToMonk-Stm/Gitly: 1 release(s), 3 file(s) found
+✅ Posted 2 item(s).
+```
+
+Verified: a release stuck at 1 of 3 was completed by `/leech check` (the two missing
+files uploaded), and `/leech resync` re-posted all three.
+
+`/leech` also prints a **code marker** (`code: leech-2026-11-05b`) — if that line is
+missing from the reply, the running app is an older build and none of the fixes are
+in effect yet.
+
+### Live progress in your DM
+
+Every file reports itself as it moves — one DM message per file, edited in place:
+
+```
+⬇️ Downloading Gitly-7.0.2-win-x64.zip
+██████░░░░░░ 52%  (55.6 MB / 107.0 MB)
+14s elapsed
+
+⬆️ Uploading Gitly-7.0.2-win-x64.zip
+████████░░░░ 71%  (76.0 MB / 107.0 MB)
+
+✅ Sent Gitly-7.0.2-win-x64.zip
+████████████ 100%  (107.0 MB / 107.0 MB)
+```
+
+- **Download** progress is measured from the real byte stream.
+- **Upload** progress comes from Telethon's own callback for big files, and from a
+  wrapped file object for bot uploads — both are real byte counts, not estimates.
+- Edits are throttled to one every 3 seconds so a large file doesn't mean hundreds
+  of messages.
+- Failures show `⚠️ Failed` with the reason.
+
+Toggle it with `/leech progress on` · `/leech progress off` (on by default).
+
 ### Why a build appeared minutes late
 
 Three things added up, and only one was the poll:
