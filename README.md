@@ -761,6 +761,46 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### `/leech reset` — start completely over
+
+Deletes **everything** the leech side stores, behind a confirmation button:
+
+```
+🧨 Reset the leech bot?
+
+This deletes everything the leech side has stored:
+• every watched repo and route
+• the record of which releases were already posted
+• cached GitHub data and rate-limit state
+• all leech settings, and it switches chats back to Find mode
+
+Messages already posted in your channel are not deleted.
+
+[🧨 Yes, reset everything]  [Cancel]
+```
+
+Clears: `leech_routes`, `leech_state`, `leech_repo`, `gitly_repo`,
+`gitly_channel`, `gitly_on`, `gitly_interval`, `gitly_prerelease`, `gitly_seen`,
+`gitly_etags`, `gitly_last_check`, `gitly_last_error`, `gitly_backoff_until` — plus
+every chat's mode back to **Find**.
+
+Owner only. Verified: the confirm appears before anything is deleted, Cancel leaves
+everything intact, confirming clears all of it and switches the mode back, and a
+non-owner is refused.
+
+### Why a removed repo could keep posting (fixed)
+
+There used to be **two independent posting paths**: the route list, and an older
+single-channel setting (`gitly_channel` + `gitly_repo`). Removing a route cleared
+the first but left the second running, so a repo you had removed kept publishing.
+
+Now there is **one mechanism — routes**. The background loop reads only the route
+list; if that list is empty it does nothing at all, whatever else is saved.
+`/gitly channel` creates a route too, so it can be removed the same way.
+
+Verified: with a route, releases post; after removing it, the loop runs and posts
+**nothing** even though the old channel/repo settings are still present.
+
 ### Removing a repo
 
 ```

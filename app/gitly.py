@@ -328,13 +328,11 @@ async def loop():
                     log.info("leech posted %d release(s)", n)
                 elif status not in ("ok", "no-routes"):
                     log.info("leech check: %s", status)
-            elif enabled() and channel():
-                n, status = await check()
-                if n:
-                    log.info("gitly posted %d release(s)", n)
-                elif status not in ("ok", "off", "no-channel"):
-                    log.info("gitly check: %s", status)
                 await asyncio.to_thread(db.flush)
+            elif enabled() and not routes():
+                # Nothing is configured. Stay silent - a removed repo must not
+                # keep posting through some other saved setting.
+                pass
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -419,6 +417,8 @@ async def cmd_gitly(chat, msg, user, args):
                     f"any post in the channel and run <code>/gitly channel</code> "
                     f"again.")
                 return await channel_picker(chat, msg)
+            # create a real route, so there is only one mechanism to remove
+            add_route(repo(), target, None, include_prereleases(), "release")
             db.set_settings({"gitly_channel": target, "gitly_on": "1"})
             await asyncio.to_thread(db.flush, True)
             await rose._reply(chat, msg,
@@ -899,6 +899,71 @@ async def check_routes(force=False):
     return posted, ("ok" if not errors else "; ".join(errors))
 
 
+LEECH_HELP = """📦 <b>Bonki Leech — commands</b>
+
+<b>1. Choose the repo</b> (any chat or this DM)
+<code>/leech repo owner/name</code>
+A link works too: <code>/leech repo https://github.com/owner/name</code>
+
+<b>2. Send it to a topic</b> (run INSIDE the channel topic)
+<code>/leech here release</code> — the APK / zip / tar.gz files
+<code>/leech here commit</code> — new commits
+<code>/leech here issue</code> — issues and pull requests
+Repeat in each topic. One repo can feed several topics.
+
+<b>3. Check</b>
+<code>/leech</code> — what is being watched and where
+<code>/gitly debug</code> — what GitHub actually returned
+
+<b>Remove</b>
+<code>/leech remove</code> — everything in THIS chat
+<code>/leech remove owner/name</code> — that repo everywhere
+<code>/leech remove all</code> — every repo, everywhere
+
+<b>Turn on / off</b>
+<code>/leech on</code> · <code>/leech off</code>
+
+<b>Start over</b>
+<code>/leech reset</code> — delete every stored leech setting (asks first)
+
+<b>Mode</b>
+<code>/mode leech</code> — this chat becomes a release feed only
+<code>/mode find</code> — back to the file bot
+
+<i>Releases are read from GitHub's public pages, so there is no API limit.
+Files over 50 MB upload through your user account (up to 2 GB).</i>"""
+
+
+# Everything the leech side stores. Reset wipes exactly these.
+LEECH_KEYS = (
+    "leech_routes", "leech_state", "leech_repo",
+    "gitly_repo", "gitly_channel", "gitly_on", "gitly_interval",
+    "gitly_prerelease", "gitly_seen", "gitly_etags", "gitly_etag",
+    "gitly_last_check", "gitly_last_error", "gitly_backoff_until",
+)
+
+
+def reset_all(also_mode=True):
+    """Wipe every stored leech setting. Returns how many keys were cleared."""
+    cleared = 0
+    for k in LEECH_KEYS:
+        try:
+            if db.get_settings().get(k) not in (None, ""):
+                cleared += 1
+            db.set_settings({k: ""})
+        except Exception as e:
+            log.info("reset %s failed: %s", k, e)
+    _CACHE["rels"] = []
+    _CACHE["at"] = 0
+    if also_mode:
+        from . import modes
+        for g in db.list_groups():
+            if modes.get_mode(g.get("chat_id")) == modes.LEECH:
+                modes.set_mode(g.get("chat_id"), modes.FIND)
+    db.flush(force=True)
+    return cleared
+
+
 async def cmd_leech(chat, msg, user, args):
     """Configure the leech bot: which repo, and which topic it feeds."""
     from . import approval, modes, rose
@@ -946,7 +1011,37 @@ async def cmd_leech(chat, msg, user, args):
             f"Now open the <b>topic</b> you want releases in and send "
             f"<code>/leech here</code>.")
 
+    if sub in ("help", "?", "commands"):
+        return await rose._reply(chat, msg, LEECH_HELP)
+
+    if sub in ("reset", "wipe", "factory"):
+        if not owner:
+            return await rose._reply(chat, msg, "🔒 Owner only — this deletes data.")
+        await asyncio.to_thread(
+            telegram.send_message,
+            "🧨 <b>Reset the leech bot?</b>\n\n"
+            "This deletes <b>everything</b> the leech side has stored:\n"
+            "• every watched repo and route\n"
+            "• the record of which releases were already posted\n"
+            "• cached GitHub data and rate-limit state\n"
+            "• all leech settings, and it switches chats back to Find mode\n\n"
+            "Messages already posted in your channel are <b>not</b> deleted — "
+            "Telegram keeps those.\n\n"
+            "<b>This cannot be undone.</b>",
+            chat_id=chat.get("id"), reply_to=msg.get("message_id"),
+            reply_markup={"inline_keyboard": [[
+                {"text": "🧨 Yes, reset everything", "callback_data": "lreset:yes"},
+                {"text": "Cancel", "callback_data": "lreset:no"}]]})
+        return
+
     if sub in ("here", "topic"):
+        if str(chat.get("type")) != "channel":
+            return await rose._reply(
+                chat, msg,
+                "⚠️ Run <code>/leech here</code> <b>inside your channel</b> "
+                "(in the topic you want the posts to land in).\n\n"
+                "A DM can't receive releases, so it can't be a destination.\n"
+                "Use <code>/leech help</code> for the full steps.")
         repo_name = (db.get_settings().get("leech_repo") or repo()).strip()
         # which kind of activity? default = releases
         want = (rest or "release").strip().lower()
@@ -1002,6 +1097,12 @@ async def cmd_leech(chat, msg, user, args):
                 "Nothing matched.\n<code>/leech</code> shows what is currently "
                 "watched.")
         left = len(routes())
+        if not left:
+            # nothing left anywhere: switch the watcher off and drop the old
+            # single-channel pointer, so no stale setting can keep it alive
+            db.set_settings({"gitly_on": "0", "gitly_channel": "",
+                             "leech_repo": ""})
+            await asyncio.to_thread(db.flush, True)
         note = ("\n\nNo routes left — the watcher has nothing to do. "
                 "Use <code>/mode find</code> if you want this chat to be a find "
                 "bot again." if not left else

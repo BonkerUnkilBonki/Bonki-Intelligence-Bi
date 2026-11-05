@@ -389,6 +389,43 @@ async def _handle_callback(cq):
         await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"), "")
         return
 
+    if data.startswith("lreset:"):
+        m = cq.get("message") or {}
+        chat = m.get("chat") or {}
+        presser = (cq.get("from") or {}).get("id")
+        if not approval.is_owner(presser):
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Owner only.", True)
+            return
+        if data[7:] != "yes":
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Cancelled — nothing was deleted.")
+            try:
+                await asyncio.to_thread(telegram.edit_message_text, chat.get("id"),
+                                        m.get("message_id"),
+                                        "✅ Cancelled. Nothing was deleted.")
+            except Exception:
+                pass
+            return
+        try:
+            from . import gitly
+            n = gitly.reset_all(also_mode=True)
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    "Reset done")
+            await asyncio.to_thread(
+                telegram.edit_message_text, chat.get("id"), m.get("message_id"),
+                f"🧨 <b>Leech bot reset.</b>\n\n"
+                f"• {n} stored setting(s) cleared\n"
+                f"• routes, post history and caches deleted\n"
+                f"• chats switched back to <b>Find</b> mode\n\n"
+                f"Start again with <code>/leech repo owner/name</code>.\n"
+                f"<i>Messages already posted stay in the channel.</i>")
+        except Exception as e:
+            log.warning("leech reset failed: %s", e)
+            await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
+                                    f"Reset failed: {e}", True)
+        return
+
     if data.startswith("mode:"):
         want = data[5:]
         m = cq.get("message") or {}
