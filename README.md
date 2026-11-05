@@ -809,6 +809,29 @@ code: leech-2026-11-05h · instance 4f2a9c
 If that changes between checks while you did not redeploy, something is restarting
 or duplicating the process. Run **one** instance with **one** worker.
 
+### "Incomplete download" that never succeeds (fixed)
+
+The release page shows a **rounded** size — "107 MB" — while the real file is
+112,108,743 bytes, not 112,197,632. The completeness check compared against the
+rounded figure, so every download of that file was declared incomplete and retried
+forever:
+
+```
+⚠️ Failed Gitly-7.0.2-win-x64.zip
+incomplete download: 112108743 of 112197632 bytes
+```
+
+Always the same 88,889-byte gap — which is the rounding, not a network fault.
+
+**Fixed:** the server's own `Content-Length` is authoritative. The page label is only
+a sanity check, and only fails the download when the body is **more than 5% short** of
+it — which catches a genuine error page while allowing normal rounding.
+
+Verified both ways: a rounded label with a complete file is **accepted**; a body a
+quarter of the labelled size is **still rejected**.
+
+A full disk now also stops immediately instead of retrying eight times.
+
 ### Stalls are detected and resumed
 
 GitHub sometimes stops sending mid-file. With one blocking read the socket just
@@ -865,6 +888,47 @@ thing: **deletes its old posts and uploads the new set**.
 
 Verified all four: adding a third file deleted the two old posts and uploaded three;
 renaming one deleted and re-uploaded; removing one left only the remaining file.
+
+### How a release is posted
+
+Exactly the shape you asked for — the changelog gets its own message because a file
+caption cannot hold it (Telegram caps captions at 1024 characters):
+
+```
+#Gitly_v702
+Gitly · v7.0.2 · 🟢 Stable
+
+What's New
+New Features
+
+- Added Hall of Fame with dedicated profiles, contribution details…
+- Added GitHub and Telegram profile integration with avatars…
+
+Improvements
+
+- Improved repository, user, and global search.
+…
+
+https://github.com/SwitchToMonk-Stm/Gitly/releases/tag/v7.0.2
+```
+
+then each file with a **short caption and no link**:
+
+```
+📎 Gitly.apk
+📎 Gitly-7.0.2-win-x64.zip
+📎 Gitly-7.0.2-linux-x64.tar.gz
+```
+
+- **The whole changelog** is posted, split across messages at line boundaries if it
+  exceeds 4096 characters — nothing is cut.
+- **Spacing matches GitHub**: closing tags used to add a newline on top of the ones
+  already in the text, which is why every line had a blank line under it. Blank lines
+  are now collapsed.
+- **Everything uploads through your user account**, small files included — so posts
+  come from you, not the bot, and nothing hits the 50 MB ceiling.
+  `/leech upload bot` switches back.
+- No GitHub link in the file captions.
 
 ### Editing the changelog updates the post
 

@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05k"   # bump when the leech code changes
+BUILD = "leech-2026-11-05m"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -200,10 +200,11 @@ def download_asset(asset, dest, progress=None, on_stall=None):
     url = asset.get("browser_download_url") or asset.get("url")
     if not url:
         raise RuntimeError("asset has no download url")
-    expect = int(asset.get("size") or 0)
+    expect = int(asset.get("size") or 0)      # rounded page label - a hint only
     done = 0
     stalls = 0
     max_stalls = 8
+    confirmed = False                          # server told us the exact length
 
     with open(dest, "wb") as fh:
         while stalls < max_stalls:
@@ -222,11 +223,12 @@ def download_asset(asset, dest, progress=None, on_stall=None):
                     done = 0
                     fh.seek(0)
                     fh.truncate()
-                total = int(r.headers.get("Content-Length") or 0)
+                clen = int(r.headers.get("Content-Length") or 0)
+                total = clen
                 if r.status_code == 206:
-                    total = done + total
+                    total = done + clen
                 elif not total:
-                    total = expect
+                    total = expect          # display only - never used to judge success
                 for chunk in r.iter_content(1 << 16):
                     if not chunk:
                         continue
@@ -237,12 +239,21 @@ def download_asset(asset, dest, progress=None, on_stall=None):
                             progress(done, total or expect)
                         except Exception:
                             pass
-                # The server can close the stream early without raising - treat a
-                # short read as a stall so the next attempt resumes with Range.
-                if expect and done < expect:
-                    raise RuntimeError(f"short read: {done} of {expect} bytes")
+                # Judge completeness against what the SERVER said it would send.
+                # The size shown on the release page is rounded ("107 MB"), so
+                # comparing with it declared finished downloads incomplete and
+                # retried them forever - 88,889 bytes short every single time.
+                if clen and done < clen:
+                    raise RuntimeError(f"short read: {done} of {clen} bytes")
+                confirmed = True                     # length satisfied (or unknown)
                 break                                # finished cleanly
             except Exception as e:
+                # A full disk will never succeed - stop immediately instead of
+                # retrying eight times and filling the log.
+                if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+                    raise RuntimeError(
+                        "no space left on device while downloading - free some "
+                        "disk and try again") from e
                 stalls += 1
                 log.warning("download stall %d/%d at %d bytes: %s",
                             stalls, max_stalls, done, e)
@@ -257,8 +268,12 @@ def download_asset(asset, dest, progress=None, on_stall=None):
                         f"({done} bytes received)") from e
                 time.sleep(min(2 * stalls, 10))      # back off, then resume
 
-    if expect and done < expect:
-        raise RuntimeError(f"incomplete download: {done} of {expect} bytes")
+    # The page label is rounded, so a few bytes short of it is fine - but a body
+    # that is wildly smaller than the label means the server sent a partial or an
+    # error page, even if its own Content-Length agreed.
+    if expect and done < expect * 0.95:
+        raise RuntimeError(
+            f"incomplete download: {done} of about {expect} bytes")
     if progress:
         try:
             progress(done, done or expect)
@@ -279,6 +294,49 @@ def _header(rel):
 
 
 CAPTION_LIMIT = 1024        # Telegram's hard limit for a file caption
+
+
+def release_hashtag(rel, repo_name=""):
+    """A Telegram-safe hashtag: #Repo_v702 (dots and dashes are not allowed)."""
+    name = str(repo_name or repo()).split("/")[-1]
+    tag = rel.get("tag_name") or ""
+    clean = re.sub(r"[^0-9A-Za-z_]", "", tag) or "release"
+    base = re.sub(r"[^0-9A-Za-z_]", "", name) or "bonki"
+    return f"#{base}_{clean}"
+
+
+def build_changelog_text(rel, repo_name=""):
+    """The FULL changelog as a message: hashtag, release name, notes, link."""
+    tag = rel.get("tag_name") or ""
+    title = rel.get("name") or tag
+    kind = "🟠 Pre-Release" if rel.get("prerelease") else "🟢 Stable"
+    head = (f"{release_hashtag(rel, repo_name)}\n"
+            f"<b>{telegram.esc(title)}</b> · <code>{telegram.esc(tag)}</code> · {kind}")
+    body = (rel.get("body") or "").strip()
+    url = rel.get("html_url") or ""
+    parts = [head]
+    if body:
+        parts.append(body)
+    if url:
+        parts.append(url)
+    return "\n\n".join(parts)
+
+
+def chunk_text(text, limit=3900):
+    """Split a long message on line boundaries so nothing is cut mid-word."""
+    out, cur = [], ""
+    for line in (text or "").split("\n"):
+        while len(line) > limit:                     # a single huge line
+            if cur:
+                out.append(cur); cur = ""
+            out.append(line[:limit]); line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            out.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out or [""]
 
 
 def build_caption(rel):
@@ -1040,6 +1098,9 @@ Repeat in each topic. One repo can feed several topics.
 <b>Progress</b>
 <code>/leech progress on</code> · <code>off</code> — live download/upload % in DM
 
+<b>Who uploads</b>
+<code>/leech upload account</code> · <code>bot</code>
+
 <b>Something stuck?</b>
 <code>/leech resync</code> — forget what was posted and upload it all again
 <code>/leech rebuild</code> — rebuild the record from the channel (after a restart)
@@ -1183,6 +1244,23 @@ async def cmd_leech(chat, msg, user, args):
             lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
                          f" → {telegram.esc(title)} · {where}")
         return await rose._reply(chat, msg, "\n".join(lines))
+
+    if sub in ("upload", "sender", "via"):
+        want = rest.strip().lower()
+        if want not in ("account", "bot"):
+            return await rose._reply(
+                chat, msg,
+                f"Now uploading as: <b>{'your account' if upload_via_account() else 'the bot'}</b>\n\n"
+                "<code>/leech upload account</code> — everything through your user "
+                "account (2 GB, no 50 MB cap)\n"
+                "<code>/leech upload bot</code> — through the bot (50 MB max)")
+        db.set_settings({"leech_upload_via": want})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(
+            chat, msg,
+            "✅ Files will upload through <b>your account</b>."
+            if want == "account" else
+            "✅ Files will upload through <b>the bot</b> (50 MB limit applies).")
 
     if sub in ("progress", "verbose"):
         want = rest.strip().lower()
@@ -1644,51 +1722,44 @@ def _check_space(asset):
         pass
 
 
+def upload_via_account():
+    """Upload through the user account for EVERY file, not just the big ones.
+
+    The bot has a 50 MB ceiling; the account has 2 GB and sends the file as you
+    rather than as the bot. On by default, /leech upload bot to use the bot.
+    """
+    want = str(db.get_settings().get("leech_upload_via") or "account").lower()
+    if want == "bot":
+        return False
+    try:
+        from . import userbot
+        return userbot.is_running()
+    except Exception:
+        return False
+
+
 def _send_asset(rel, asset, route, index, total):
-    """Upload one asset. Returns the message id, or None."""
+    """Upload one asset with a SHORT caption (name only, no link)."""
     name = asset.get("name") or "file"
     size = int(asset.get("size") or 0)
     chat_id = route.get("chat_id")
     thread = route.get("thread_id") or None
+    caption = f"📎 <b>{telegram.esc(name)}</b>"
+    caption = f"📎 <b>{telegram.esc(name)}</b>"
 
-    big = size > UPLOAD_LIMIT
-    if big:
-        # The 50 MB cap is a BOT API limit. The connected user account can upload
-        # 2 GB, so use it rather than degrading to a link.
-        from . import userbot
-        if not userbot.is_running():
-            mb = size / (1024 * 1024)
-            telegram.send_message(
-                build_caption(rel) +
-                f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over the "
-                f"50 MB <b>bot</b> limit, and no user account is connected to lift "
-                f"it.\nDownload: {asset.get('browser_download_url', '')}",
-                chat_id=chat_id, thread_id=thread)
-            return None
-        with _disk_tmp() as tmp:
-            dest = os.path.join(tmp, name)
-            from . import progress as _pg
-            tr = _pg.Tracker(name, size) if _pg.enabled() else None
-            try:
-                _check_space(asset)
-                download_asset(asset, dest, progress=_pg.callback_for(tr),
-                               on_stall=(tr.stalled if tr else None))
-                if tr:
-                    tr.uploading()
-                caption = build_caption(rel) if index == 0 else (
-                    f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-                r = await_userbot_send(chat_id, dest, caption, thread, tracker=tr)
-                if tr:
-                    tr.done()
-                return ((r or {}).get("result") or {}).get("message_id")
-            except Exception as e:
-                if tr:
-                    tr.failed(e)
-                raise
+    use_account = upload_via_account()
+    if size > UPLOAD_LIMIT and not use_account:
+        mb = size / (1024 * 1024)
+        telegram.send_message(
+            f"⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over the 50 MB "
+            f"<b>bot</b> limit and no user account is connected.\n"
+            f"Download: {asset.get('browser_download_url', '')}",
+            chat_id=chat_id, thread_id=thread)
+        return None
 
+    from . import progress as _pg
     with _disk_tmp() as tmp:
         dest = os.path.join(tmp, name)
-        from . import progress as _pg
         tr = _pg.Tracker(name, size) if _pg.enabled() else None
         try:
             _check_space(asset)
@@ -1696,10 +1767,11 @@ def _send_asset(rel, asset, route, index, total):
                            on_stall=(tr.stalled if tr else None))
             if tr:
                 tr.uploading()
-            caption = build_caption(rel) if index == 0 else (
-                f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
-            r = telegram.send_document(dest, name, caption, chat_id, thread_id=thread,
-                                       tracker=tr)
+            if use_account:
+                r = await_userbot_send(chat_id, dest, caption, thread, tracker=tr)
+            else:
+                r = telegram.send_document(dest, name, caption, chat_id,
+                                           thread_id=thread, tracker=tr)
             if tr:
                 tr.done()
             return ((r or {}).get("result") or {}).get("message_id")
@@ -1709,17 +1781,26 @@ def _send_asset(rel, asset, route, index, total):
             raise
 
 
+def _post_changelog(rel, route, repo_name=""):
+    """Post the FULL changelog as text message(s). Returns their message ids."""
+    text = build_changelog_text(rel, repo_name)
+    ids = []
+    for part in chunk_text(text):
+        r = telegram.send_message(part, chat_id=route.get("chat_id"),
+                                  thread_id=route.get("thread_id") or None)
+        mid = ((r or {}).get("result") or {}).get("message_id")
+        if mid:
+            ids.append(mid)
+    return ids
+
+
 def sync_release(rel, route):
-    """Make Telegram match the release, one file at a time.
+    """Keep Telegram in step with one release.
 
-    Each asset is tracked individually, so a file that fails (a big upload timing
-    out, a flood wait) is retried on the NEXT poll instead of being lost. That was
-    the bug that posted only the first of three files.
-
-    first sight      -> upload every asset, recording each success
-    some missing     -> retry only the missing ones
-    assets changed   -> delete our posts, upload the new set
-    only text edited -> edit the captions, keep the files
+    Layout, exactly as asked for:
+        #hashtag + release name + type
+        the WHOLE changelog (its own message - a caption cannot hold it)
+        each file, short caption, no links
     """
     if rel.get("draft"):
         return "draft"
@@ -1730,11 +1811,12 @@ def sync_release(rel, route):
     assets = rel.get("assets") or []
     sig = asset_sig(assets)
     body = (rel.get("body") or "").strip()
+    repo_name = str(route.get("repo") or "")
     st = _rstate()
     key = _state_key(route, rid)
     entry = st.get(key)
 
-    # ---- no files yet: wait a little, then post the changelog alone ----
+    # ---- nothing yet: wait briefly for files, then post the changelog alone ----
     if not entry and not assets:
         first = st.get(key + ":first")
         if not first:
@@ -1743,54 +1825,53 @@ def sync_release(rel, route):
             return "waiting"
         if time.time() - int(first) < 90:
             return "waiting"
-        try:
-            r = telegram.send_message(build_caption(rel) +
-                                      "\n\n<i>No files attached yet — I'll add "
-                                      "them here when they appear.</i>",
-                                      chat_id=route.get("chat_id"),
-                                      thread_id=route.get("thread_id") or None)
-            mid = ((r or {}).get("result") or {}).get("message_id")
-        except Exception as e:
-            log.warning("text-only post failed: %s", e)
-            return "post-failed"
-        st[key] = {"sig": "", "body": body, "done": {}, "text_id": mid,
-                   "msg_ids": [mid] if mid else [], "t": int(time.time())}
+        ids = _post_changelog(rel, route, repo_name)
+        st[key] = {"sig": "", "body": body, "done": {}, "msg_ids": [],
+                   "text_ids": ids, "t": int(time.time())}
         _save_rstate(st)
+        try:
+            db.flush(force=True)
+        except Exception:
+            pass
         return "sent-text"
 
-    # ---- the file set changed: remove what we posted, start again ----
-    # A record rebuilt from the channel has no signature. If it already lists every
-    # file that is on the release, adopt this signature instead of deleting and
-    # re-uploading everything.
+    # ---- a rebuilt record has no signature: adopt it if every file is known ----
     if entry and entry.get("sig") == "" and sig:
-        done_names = {k for k in (entry.get("done") or {})}
+        known = {k for k in (entry.get("done") or {})}
         current = {a.get("name") for a in assets if a.get("name")}
-        if current and current <= done_names:
+        if current and current <= known:
             entry["sig"] = sig
+
+    # ---- the file set changed: drop our file posts, upload the new set ----
     if entry and entry.get("sig") != sig:
-        for mid in (entry.get("msg_ids") or list((entry.get("done") or {}).values())):
+        for mid in (entry.get("msg_ids") or []):
             try:
                 telegram.delete_message(route.get("chat_id"), mid)
-            except Exception as e:
+            except Exception:
                 try:
                     from . import userbot
                     if userbot.is_running():
                         await_userbot_delete(route.get("chat_id"), mid)
-                except Exception as e2:
-                    log.info("delete %s failed: %s / %s", mid, e, e2)
-        entry = {"sig": sig, "body": body, "done": {}, "msg_ids": []}
+                except Exception:
+                    pass
+        entry = {"sig": sig, "body": entry.get("body") or body, "done": {},
+                 "msg_ids": [], "text_ids": entry.get("text_ids") or [],
+                 "t": int(time.time())}
 
     if not entry:
-        entry = {"sig": sig, "body": body, "done": {}, "msg_ids": []}
+        entry = {"sig": sig, "body": body, "done": {}, "msg_ids": [],
+                 "text_ids": [], "t": int(time.time())}
 
     done = entry.get("done") or {}
     if not isinstance(done, dict):
         done = {}
 
-    # ---- upload whatever is not there yet ----
-    # Files are sent CONCURRENTLY. Downloading then uploading three 100 MB builds
-    # one after another is what made a release appear minutes late; in parallel the
-    # wait is roughly the slowest single file instead of the sum.
+    # ---- the changelog goes FIRST so it sits above the files ----
+    text_ids = entry.get("text_ids") or []
+    if not text_ids:
+        text_ids = _post_changelog(rel, route, repo_name)
+
+    # ---- upload whatever is missing ----
     pending = [(i, a) for i, a in enumerate(assets)
                if (a.get("name") or f"file{i}") not in done]
     added, failed = 0, []
@@ -1800,82 +1881,54 @@ def sync_release(rel, route):
         results = {}
 
         def _one(i, asset):
-            name = asset.get("name") or f"file{i}"
+            nm = asset.get("name") or f"file{i}"
             for attempt in range(2):
                 try:
                     mid = _send_asset(rel, asset, route, i, len(assets))
                     with lock:
-                        done[name] = mid
-                        results[name] = True
+                        done[nm] = mid
+                        results[nm] = True
                     return
                 except Exception as e:
-                    log.warning("asset %s attempt %d failed: %s", name, attempt + 1, e)
+                    log.warning("asset %s attempt %d failed: %s", nm, attempt + 1, e)
                     if attempt == 0:
                         time.sleep(3)
             with lock:
-                results[name] = False
+                results[nm] = False
 
         try:
             from . import lowmem
-            _w = 1 if lowmem.is_low() else 3
+            workers = 1 if lowmem.is_low() else min(3, len(pending))
         except Exception:
-            _w = 3
-        workers = min(_w, len(pending))      # one at a time on a small container
+            workers = min(3, len(pending))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_one, i, a) for i, a in pending]
-            for f in futures:
+            futs = [pool.submit(_one, i, a) for i, a in pending]
+            for f in futs:
                 try:
                     f.result(timeout=1800)
                 except Exception as e:
                     log.warning("upload worker failed: %s", e)
-
         for i, a in pending:
-            name = a.get("name") or f"file{i}"
-            if results.get(name):
-                added += 1
-            else:
-                failed.append(name)
+            nm = a.get("name") or f"file{i}"
+            (added := added + 1) if results.get(nm) else failed.append(nm)
 
-    # drop the placeholder text post once real files are in
-    if assets and entry.get("text_id"):
-        try:
-            telegram.delete_message(route.get("chat_id"), entry["text_id"])
-        except Exception:
-            pass
-        entry["text_id"] = None
-
-    # ---- changelog edited? update the captions in place ----
-    # Compare BEFORE overwriting the stored body, and actually call the edit -
-    # the previous version overwrote it first, so an edited changelog never
-    # reached Telegram.
-    old_body = entry.get("body") or ""
+    # ---- changelog edited? re-post it (captions cannot be edited to fit) ----
     edited = 0
+    old_body = entry.get("body") or ""
     if not added and not failed and old_body and old_body != body:
-        ids = [m for m in done.values() if m]
-        for n, mid in enumerate(ids):
+        for mid in text_ids:
             try:
-                if n == 0:
-                    cap = build_caption(rel)
-                else:
-                    nm = assets[n - 1].get("name") if n - 1 < len(assets) else ""
-                    cap = (f"📎 <b>{telegram.esc(nm)}</b>\n{rel.get('html_url') or ''}")
-                telegram.edit_message_caption(route.get("chat_id"), mid, cap)
-                edited += 1
-            except Exception as e:
-                log.info("caption edit %s failed: %s", mid, e)
-        # a text-only post (no files) is edited as text
-        if not ids and entry.get("text_id"):
-            try:
-                telegram.edit_message_text(route.get("chat_id"),
-                                           entry["text_id"], build_caption(rel))
-                edited += 1
-            except Exception as e:
-                log.info("text edit failed: %s", e)
+                telegram.delete_message(route.get("chat_id"), mid)
+            except Exception:
+                pass
+        text_ids = _post_changelog(rel, route, repo_name)
+        edited = 1
 
     entry["sig"] = sig
     entry["body"] = body
     entry["done"] = done
     entry["msg_ids"] = [m for m in done.values() if m]
+    entry["text_ids"] = text_ids
     entry["t"] = int(time.time())
     if failed:
         entry["failed"] = failed
@@ -1883,16 +1936,13 @@ def sync_release(rel, route):
         entry.pop("failed", None)
     st[key] = entry
     _save_rstate(st)
-    # Write it out NOW. The state file is debounced, so a restart (or a second
-    # instance) would otherwise not know these files were already posted - which is
-    # what made the same release upload again after every restart.
     try:
         db.flush(force=True)
-    except Exception as e:
-        log.info("state flush failed: %s", e)
+    except Exception:
+        pass
     try:
         import gc
-        gc.collect()                      # give the RAM back after big files
+        gc.collect()
     except Exception:
         pass
 
@@ -1905,10 +1955,6 @@ def sync_release(rel, route):
     return "unchanged"
 
 
-WEB_UA = {"User-Agent": "Mozilla/5.0 (compatible; Bonki-Intelligence/1.0)"}
-_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
-
-
 def _web_get(url, timeout=25):
     r = requests.get(url, headers=WEB_UA, timeout=timeout)
     if r.status_code == 404:
@@ -1919,12 +1965,20 @@ def _web_get(url, timeout=25):
 
 
 def _unescape_html(s):
+    """HTML from the feed -> plain text that looks like the original.
+
+    Closing tags used to add a newline on top of the newlines already in the
+    source, so every line was followed by a blank line. Collapse all runs of
+    blank lines to a single newline: the list then reads like GitHub shows it.
+    """
     import html as _h
     txt = _h.unescape(s or "")
     txt = re.sub(r"<br\s*/?>", "\n", txt, flags=re.I)
-    txt = re.sub(r"</p>|</li>|</h\d>", "\n", txt, flags=re.I)
+    txt = re.sub(r"</p>|</li>|</h\d>|</div>", "\n", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", "", txt)
-    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+    txt = re.sub(r"[ \t]+\n", "\n", txt)          # trailing spaces
+    txt = re.sub(r"\n{2,}", "\n", txt)              # no blank lines at all
+    return txt.strip()
 
 
 def _parse_size(text):
