@@ -761,6 +761,39 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### All files, and edits that reach Telegram
+
+Three real bugs lived here:
+
+1. **Only the first `.apk` was sent.** A release with `Gitly.apk`, `gitly-linux.gz`
+   and `gitly-win.zip` produced one upload — or none at all if there was no `.apk`.
+   Now **every asset** is uploaded: apk, zip, gz, tar, anything.
+2. **A release published before its files were attached was marked "seen"** and
+   skipped forever. Now an asset-less release is **not** marked done — it waits and
+   retries every poll until the files appear.
+3. **Edits never reached Telegram.** Renaming or replacing a file, or changing the
+   changelog, did nothing.
+
+**Telegram cannot rename a file inside a message** — there is no API for it — so
+Bonki does the closest correct thing automatically:
+
+| What you changed on GitHub | What happens in Telegram |
+|---|---|
+| Added files to an existing release | the new files are uploaded |
+| Renamed / replaced an asset | **old posts deleted**, the new set uploaded |
+| Edited only the changelog | **captions edited in place** — files kept |
+
+Each release keeps its own record (asset fingerprint + message ids), so a rename is
+detected as a change rather than ignored, and an unchanged release costs nothing.
+
+Verified: empty release → `waiting`; files added → **all three uploaded**; no change
+→ nothing; rename → old messages deleted and all three re-uploaded; changelog edit →
+captions updated with no re-upload.
+
+**One limitation to know:** a bot can delete its own messages freely for 48 hours;
+older ones need the *Delete messages* admin right. Bonki has that as an admin, but if
+you ever remove it, an old post may remain beside the new one.
+
 ### Pasting a repo link works
 
 `/leech repo` accepts anything you paste — a browser link, a clone URL, or a bare

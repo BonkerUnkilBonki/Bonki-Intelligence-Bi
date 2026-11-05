@@ -230,65 +230,10 @@ def build_caption(rel):
 
 
 def post_release(rel, target):
-    """Post changelog + APK for one release. Returns a short status string."""
-    if rel.get("draft"):
-        return "draft"
-    if rel.get("prerelease") and not include_prereleases():
-        return "prerelease"
-    rid = rel.get("id") or rel.get("tag_name")
-    if not _mark_seen(rid):
-        return "already"
-    db.flush(force=False)
-
-    header = _header(rel)
-    body = (rel.get("body") or "").strip()
-    apk = pick_apk(rel.get("assets"))
-
-    # With an APK, everything goes in ONE post: the file with the changelog as its
-    # caption. A separate text message first is what made two posts.
-    if not apk:
-        try:
-            telegram.send_message(f"{header}\n\n{body}" if body else header,
-                                  chat_id=target)
-        except Exception as e:
-            db.set_settings({"gitly_last_error": f"posting to {target}: {str(e)[:160]}"})
-            log.warning("gitly changelog failed: %s", e)
-            return "post-failed"
-        return "no-apk"
-
-    size = int(apk.get("size") or 0)
-    name = apk.get("name") or "release.apk"
-    if size > UPLOAD_LIMIT:
-        mb = size / (1024 * 1024)
-        try:
-            telegram.send_message(
-                build_caption(rel) +
-                f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over Telegram's "
-                f"50 MB bot limit, so it can't be attached.\n"
-                f"Download: {apk.get('browser_download_url', '')}",
-                chat_id=target)
-        except Exception as e:
-            log.warning("gitly oversize notice failed: %s", e)
-        return "too-big"
-
-    caption = build_caption(rel)
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = os.path.join(tmp, name)
-        try:
-            download_asset(apk, dest)
-            telegram.send_document(dest, name, caption, target)
-            return "sent"
-        except Exception as e:
-            log.warning("gitly apk failed: %s", e)
-            try:
-                telegram.send_message(
-                    f"{header}\n\n⚠️ Couldn't attach <b>{telegram.esc(name)}</b>: "
-                    f"{telegram.esc(str(e)[:120])}\n"
-                    f"Download: {apk.get('browser_download_url', '')}",
-                    chat_id=target)
-            except Exception:
-                pass
-            return "apk-failed"
+    """Single-channel path - same behaviour as a route, all assets included."""
+    return sync_release(rel, {"chat_id": target, "thread_id": "",
+                              "prerelease": include_prereleases(),
+                              "event": "release"})
 
 
 async def check(force=False, target=None):
@@ -914,8 +859,8 @@ async def check_routes(force=False):
                 for item in reversed(items):
                     try:
                         if event == "release":
-                            st = await asyncio.to_thread(post_release_to, item, route)
-                            ok = st in ("sent", "too-big", "no-apk")
+                            st = await asyncio.to_thread(sync_release, item, route)
+                            ok = st in ("sent", "replaced", "edited")
                         else:
                             st = await asyncio.to_thread(post_event_to, repo_name,
                                                          event, item, route)
@@ -1173,3 +1118,132 @@ def post_event_to(repo_name, event, item, route):
         log.warning("event post failed: %s", e)
         db.set_settings({"gitly_last_error": str(e)[:160]})
         return "post-failed"
+
+
+# ------------------------------------------------- per-release sync state ----
+# Telegram cannot rename a file inside a message, so when a release's assets
+# change we delete our old posts and upload the new ones. When only the text
+# changes we edit the caption, which keeps the message and its file intact.
+def _rstate():
+    try:
+        return json.loads(db.get_settings().get("leech_state") or "{}")
+    except Exception:
+        return {}
+
+
+def _save_rstate(st):
+    items = list(st.items())[-120:]          # bounded
+    db.set_settings({"leech_state": json.dumps(dict(items))[:60000]})
+
+
+def asset_sig(assets):
+    """A fingerprint of the asset set: any rename/replace changes it."""
+    bits = []
+    for a in sorted((assets or []), key=lambda x: str(x.get("name"))):
+        bits.append(f"{a.get('id') or a.get('name')}:{a.get('name')}:{a.get('size')}")
+    return "|".join(bits)
+
+
+def _state_key(route, rid):
+    return f"{route.get('chat_id')}:{route.get('thread_id') or ''}:{rid}"
+
+
+def _send_asset(rel, asset, route, index, total):
+    """Upload one asset. Returns the message id, or None."""
+    name = asset.get("name") or "file"
+    size = int(asset.get("size") or 0)
+    chat_id = route.get("chat_id")
+    thread = route.get("thread_id") or None
+
+    if size > UPLOAD_LIMIT:
+        mb = size / (1024 * 1024)
+        telegram.send_message(
+            build_caption(rel) +
+            f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over Telegram's "
+            f"50 MB bot limit.\nDownload: {asset.get('browser_download_url', '')}",
+            chat_id=chat_id, thread_id=thread)
+        return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, name)
+        download_asset(asset, dest)
+        caption = build_caption(rel) if index == 0 else (
+            f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
+        r = telegram.send_document(dest, name, caption, chat_id, thread_id=thread)
+        return ((r or {}).get("result") or {}).get("message_id")
+
+
+def sync_release(rel, route):
+    """Make Telegram match the release. Returns a short status.
+
+    Handles the three real cases:
+      first sight      -> upload EVERY asset (apk, zip, gz, anything)
+      assets changed   -> delete the old posts, upload the new set
+      only text edited -> edit the captions, keep the files
+    """
+    if rel.get("draft"):
+        return "draft"
+    if rel.get("prerelease") and not route.get("prerelease", True):
+        return "prerelease"
+
+    rid = rel.get("id") or rel.get("tag_name")
+    assets = rel.get("assets") or []
+    sig = asset_sig(assets)
+    body = (rel.get("body") or "").strip()
+    st = _rstate()
+    key = _state_key(route, rid)
+    entry = st.get(key)
+
+    if not entry:
+        if not assets:
+            return "waiting"        # not marked seen: retried until files appear
+        ids = []
+        for i, a in enumerate(assets):
+            try:
+                mid = _send_asset(rel, a, route, i, len(assets))
+                if mid:
+                    ids.append(mid)
+            except Exception as e:
+                log.warning("asset %s failed: %s", a.get("name"), e)
+        st[key] = {"sig": sig, "body": body, "msg_ids": ids, "t": int(time.time())}
+        _save_rstate(st)
+        return "sent" if ids else "apk-failed"
+
+    if entry.get("sig") == sig and entry.get("body") == body:
+        return "unchanged"
+
+    if entry.get("sig") != sig:
+        # files were added, renamed or replaced - Telegram can't rename a file,
+        # so remove our old posts and upload the new set
+        for mid in entry.get("msg_ids") or []:
+            try:
+                telegram.delete_message(route.get("chat_id"), mid)
+            except Exception as e:
+                log.info("delete old post %s failed: %s", mid, e)
+        ids = []
+        for i, a in enumerate(assets):
+            try:
+                mid = _send_asset(rel, a, route, i, len(assets))
+                if mid:
+                    ids.append(mid)
+            except Exception as e:
+                log.warning("asset %s failed: %s", a.get("name"), e)
+        st[key] = {"sig": sig, "body": body, "msg_ids": ids, "t": int(time.time())}
+        _save_rstate(st)
+        return "replaced"
+
+    # only the text changed: edit captions, keep the files
+    edited = 0
+    for n, mid in enumerate(entry.get("msg_ids") or []):
+        try:
+            cap = build_caption(rel) if n == 0 else (
+                f"📎 <b>{telegram.esc(assets[n-1].get('name'))}</b>\n"
+                f"{rel.get('html_url') or ''}" if n - 1 < len(assets) else "")
+            telegram.edit_message_caption(route.get("chat_id"), mid, cap)
+            edited += 1
+        except Exception as e:
+            log.info("caption edit %s failed: %s", mid, e)
+    st[key] = {"sig": sig, "body": body,
+               "msg_ids": entry.get("msg_ids") or [], "t": int(time.time())}
+    _save_rstate(st)
+    return "edited" if edited else "unchanged"
