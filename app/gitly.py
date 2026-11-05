@@ -783,11 +783,21 @@ def add_route(repo_name, chat_id, thread_id=None, prerelease=True, event="releas
 
 
 def remove_route(repo_name=None, chat_id=None):
+    """Remove matching routes.
+
+    repo_name only -> that repo in every chat
+    chat_id only   -> every route in that chat
+    both           -> just that pair
+    """
     rows = routes()
     keep = []
     for r in rows:
-        if repo_name and str(r.get("repo", "")).lower() == repo_name.lower() and \
-                (chat_id is None or str(r.get("chat_id")) == str(chat_id)):
+        match = True
+        if repo_name:
+            match = match and str(r.get("repo", "")).lower() == str(repo_name).lower()
+        if chat_id is not None:
+            match = match and str(r.get("chat_id")) == str(chat_id)
+        if match:
             continue
         keep.append(r)
     _save_routes(keep)
@@ -965,11 +975,39 @@ async def cmd_leech(chat, msg, user, args):
             f"<i>Run this inside each topic you want a different kind of update in — "
             f"releases in one topic, commits in another.</i>")
 
-    if sub in ("remove", "rm", "stop"):
-        n = remove_route(rest or None, cid if not rest else None)
+    if sub in ("remove", "rm", "stop", "delete", "unwatch"):
+        target = normalize_repo(rest) if rest else ""
+        rows_before = routes()
+        if target and "/" in target:
+            n = remove_route(target, None)          # that repo, in every chat
+            label = f"<code>{telegram.esc(target)}</code>"
+        elif target.lower() in ("all", "everything"):
+            _save_routes([])
+            n = len(rows_before)
+            label = "all repos"
+        else:
+            n = remove_route(None, cid)             # everything in THIS chat
+            label = "this chat"
+        # clear the "repo being configured" pointer if it is now gone
+        cur = (db.get_settings().get("leech_repo") or "").strip()
+        if cur and (not target or target.lower() == "all" or
+                    normalize_repo(cur).lower() == target.lower()):
+            if not [r for r in routes() if normalize_repo(str(r.get("repo"))).lower()
+                    == normalize_repo(cur).lower()]:
+                db.set_settings({"leech_repo": ""})
         await asyncio.to_thread(db.flush, True)
+        if not n:
+            return await rose._reply(
+                chat, msg,
+                "Nothing matched.\n<code>/leech</code> shows what is currently "
+                "watched.")
+        left = len(routes())
+        note = ("\n\nNo routes left — the watcher has nothing to do. "
+                "Use <code>/mode find</code> if you want this chat to be a find "
+                "bot again." if not left else
+                f"\n\n{left} route(s) still active — <code>/leech</code> to see them.")
         return await rose._reply(chat, msg,
-                                 f"🗑 Removed {n} route(s)." if n else "Nothing to remove.")
+                                 f"🗑 Removed {n} route(s) for {label}.{note}")
 
     if sub in ("on", "off"):
         db.set_settings({"gitly_on": "1" if sub == "on" else "0"})

@@ -761,6 +761,23 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Removing a repo
+
+```
+/leech                     see what is being watched
+/leech remove              remove everything in THIS chat
+/leech remove owner/name   remove that repo everywhere
+/leech remove all          wipe every route
+```
+
+A repo link works here too (`/leech remove https://github.com/owner/name`). The
+reply tells you what is left, and when nothing remains it says the watcher has
+nothing to do and points at `/mode find` if you want the chat to be a find bot
+again.
+
+Verified: removing by chat clears only that chat's routes, removing by name clears
+that repo everywhere, and the confirmation reports the remaining count.
+
 ### No API, no rate limit — it reads the public pages
 
 GitHub publishes releases as ordinary web pages, so Bonki no longer calls the API
