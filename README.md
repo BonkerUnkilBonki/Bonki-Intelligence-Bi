@@ -761,6 +761,21 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Files: added, renamed, removed
+
+Telegram cannot rename a file inside a message, so Bonki does the only correct
+thing: **deletes its old posts and uploads the new set**.
+
+| You change on GitHub | What happens in Telegram |
+|---|---|
+| add a file | old posts removed, the full new set uploaded |
+| rename a file | old posts removed, the full new set uploaded |
+| remove a file | old posts removed, only the remaining files uploaded |
+| nothing | nothing |
+
+Verified all four: adding a third file deleted the two old posts and uploaded three;
+renaming one deleted and re-uploaded; removing one left only the remaining file.
+
 ### Editing the changelog updates the post
 
 Change the release notes on GitHub and the captions already in Telegram are

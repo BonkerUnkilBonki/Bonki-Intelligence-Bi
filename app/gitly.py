@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05c"   # bump when the leech code changes
+BUILD = "leech-2026-11-05d"   # bump when the leech code changes
 
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gitly"
@@ -1705,6 +1705,10 @@ def sync_release(rel, route):
     if edited:
         return "edited"
     return "unchanged"
+
+
+WEB_UA = {"User-Agent": "Mozilla/5.0 (compatible; Bonki-Intelligence/1.0)"}
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
 
 
 def _web_get(url, timeout=25):
