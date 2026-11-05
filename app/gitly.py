@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05n"   # bump when the leech code changes
+BUILD = "leech-2026-11-05p"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -297,10 +297,17 @@ CAPTION_LIMIT = 1024        # Telegram's hard limit for a file caption
 
 
 def release_hashtag(rel, repo_name=""):
-    """A Telegram-safe hashtag: #Repo_v702 (dots and dashes are not allowed)."""
+    """A Telegram-safe hashtag that still reads as the version.
+
+    Telegram hashtags allow letters, digits and underscore only - a dot ends the
+    tag, so "#Gitly_v7.0.2" would highlight as "#Gitly_v7". Dots become
+    underscores instead of being dropped, so the version stays recognisable:
+        v7.0.2  ->  #Gitly_v7_0_2
+    """
     name = str(repo_name or repo()).split("/")[-1]
     tag = rel.get("tag_name") or ""
-    clean = re.sub(r"[^0-9A-Za-z_]", "", tag) or "release"
+    clean = re.sub(r"[.\-]+", "_", tag)
+    clean = re.sub(r"[^0-9A-Za-z_]", "", clean).strip("_") or "release"
     base = re.sub(r"[^0-9A-Za-z_]", "", name) or "bonki"
     return f"#{base}_{clean}"
 
@@ -310,8 +317,11 @@ def build_changelog_text(rel, repo_name=""):
     tag = rel.get("tag_name") or ""
     title = rel.get("name") or tag
     kind = "🟠 Pre-Release" if rel.get("prerelease") else "🟢 Stable"
-    head = (f"{release_hashtag(rel, repo_name)}\n"
-            f"<b>{telegram.esc(title)}</b> · <code>{telegram.esc(tag)}</code> · {kind}")
+    if title.strip().lower() == tag.strip().lower():
+        line = f"<b>{telegram.esc(tag)}</b> · {kind}"
+    else:
+        line = f"<b>{telegram.esc(title)}</b> · <code>{telegram.esc(tag)}</code> · {kind}"
+    head = f"{release_hashtag(rel, repo_name)}\n{line}"
     body = (rel.get("body") or "").strip()
     url = rel.get("html_url") or ""
     parts = [head]
@@ -447,17 +457,28 @@ async def loop():
     log.info("gitly release watcher started (repo=%s)", repo())
     await asyncio.sleep(5)
     # After a restart the state store may be empty (ephemeral disk). Read the
-    # channel instead of re-posting everything.
-    try:
-        if routes():
-            n_routes, n_entries = await asyncio.to_thread(rebuild_from_channel)
-            if n_entries:
-                log.info("leech: rebuilt %d record(s) from the channel across %d "
-                         "route(s) - nothing will be re-posted", n_entries, n_routes)
-            elif n_routes:
-                log.info("leech: no existing posts found to rebuild from")
-    except Exception as e:
-        log.info("leech rebuild skipped: %s", e)
+    # channel instead of re-posting everything. The user account often finishes
+    # connecting a little later than the bot, so retry for up to two minutes -
+    # and do NOT run the first check until this has been settled, or a slow
+    # connection would let the first cycle re-post everything.
+    if routes():
+        settled = False
+        for attempt in range(9):
+            try:
+                from . import userbot
+                if userbot.is_running():
+                    n_routes, n_entries = await asyncio.to_thread(rebuild_from_channel)
+                    log.info("leech: rebuilt %d record(s) from %d route(s) - "
+                             "nothing will be re-posted", n_entries, n_routes)
+                    settled = True
+                    break
+            except Exception as e:
+                log.info("leech rebuild attempt %d failed: %s", attempt + 1, e)
+            await asyncio.sleep(15)
+        if not settled:
+            log.warning("leech: could not read the channel to rebuild the record "
+                        "(user account not connected?) - the first check may post "
+                        "already-sent releases again")
     while True:
         try:
             db.set_settings({"gitly_loop_last": str(int(time.time()))})
@@ -1971,19 +1992,41 @@ def _web_get(url, timeout=25):
 
 
 def _unescape_html(s):
-    """HTML from the feed -> plain text that looks like the original.
+    """GitHub release HTML -> text that reads like the original page.
 
-    Closing tags used to add a newline on top of the newlines already in the
-    source, so every line was followed by a blank line. Collapse all runs of
-    blank lines to a single newline: the list then reads like GitHub shows it.
+    Three things the naive version got wrong:
+      * <li> items carry NO dash in the source - GitHub's renderer draws the
+        bullet - so a plain tag strip produced a wall of lines with no bullets;
+      * closing </p> needs a paragraph break, not a single newline, or every
+        section runs together;
+      * collapsing ALL blank lines removed the separation between sections.
     """
     import html as _h
     txt = _h.unescape(s or "")
     txt = re.sub(r"<br\s*/?>", "\n", txt, flags=re.I)
-    txt = re.sub(r"</p>|</li>|</h\d>|</div>", "\n", txt, flags=re.I)
+    txt = re.sub(r"<li[^>]*>", "\n- ", txt, flags=re.I)      # bullet, as rendered
+    txt = re.sub(r"</li>", "", txt, flags=re.I)
+    txt = re.sub(r"</p>|</h\d>", "\n\n", txt, flags=re.I)   # paragraph break
+    txt = re.sub(r"</?(ul|ol|div)[^>]*>", "", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", "", txt)
-    txt = re.sub(r"[ \t]+\n", "\n", txt)          # trailing spaces
-    txt = re.sub(r"\n{2,}", "\n", txt)              # no blank lines at all
+    txt = re.sub(r"[ \t]+\n", "\n", txt)                    # trailing spaces
+    txt = re.sub(r"\n{3,}", "\n\n", txt)                    # one blank line max
+    txt = re.sub(r"\n- \n", "\n", txt)                      # empty bullets
+
+    # Drop a blank line ONLY between two bullets. The blank line before the first
+    # bullet of a list is part of the original formatting and must stay.
+    out = []
+    lines = txt.split("\n")
+    for i, line in enumerate(lines):
+        if (line.strip() == "" and i + 1 < len(lines)
+                and lines[i + 1].startswith("- ")):
+            j = len(out) - 1
+            while j >= 0 and out[j].strip() == "":
+                j -= 1
+            if j >= 0 and out[j].startswith("- "):
+                continue
+        out.append(line)
+    txt = "\n".join(out)
     return txt.strip()
 
 

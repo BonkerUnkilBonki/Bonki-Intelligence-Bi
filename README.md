@@ -761,6 +761,27 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### A restart never wipes and re-posts
+
+Three guarantees, all verified:
+
+1. **Nothing deletes the record on boot.** The only deletions are intentional: a
+   changed file set, an edited changelog, or `/leech resync` you ran yourself. The
+   temp folder is cleared on boot — downloads only, never state.
+2. **The record is written immediately** after each release, so a crash loses at most
+   the release in flight.
+3. **On boot the record is rebuilt from the channel**, and the first check now
+   **waits** for that: the user account often connects a few seconds after the bot,
+   and previously the first cycle could run before the rebuild and re-post
+   everything. It retries for up to two minutes before giving up, and logs a warning
+   if it never managed it.
+
+`/leech` shows what the record holds, so "will it re-post?" is answerable:
+
+```
+• record: 3 release(s), 9 file(s) remembered
+```
+
 ### Restart-proof: it reads the channel, not just its memory
 
 If the host's disk is ephemeral, a restart wipes the record and every release looks
@@ -910,6 +931,19 @@ catches a missing constant. Verified by deleting `WEB_UA` on purpose:
 FAIL: SMOKE gitly: AttributeError: module 'app.gitly' has no attribute 'WEB_UA'
 1 problem(s) — do NOT ship this build.
 ```
+
+**The hashtag keeps the version readable.** Telegram allows letters, digits and
+underscore only — a dot ends the tag, so `#Gitly_v7.0.2` would highlight as
+`#Gitly_v7`. Dots become underscores rather than being dropped:
+
+| Tag | Hashtag |
+|---|---|
+| `v7.0.2` | `#Gitly_v7_0_2` |
+| `0.20.2-beta.3` | `#Gitly_0_20_2_beta_3` |
+| `V1` | `#Gitly_V1` |
+
+The exact tag is still shown as text on the line below (`v7.0.2 · 🟢 Stable`), so
+nothing is lost.
 
 ### How a release is posted
 
