@@ -761,6 +761,54 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### Restart-proof: it reads the channel, not just its memory
+
+If the host's disk is ephemeral, a restart wipes the record and every release looks
+new. So on boot — and on demand with `/leech rebuild` — Bonki **reads the channel
+itself** and treats whatever is already posted as done.
+
+That needs the **user account**, because a bot cannot read channel history. It
+matches files to a release by the tag in the caption, and attributes the follow-up
+files of a release to the tag above them.
+
+Verified by simulating a restart with an empty record: the three posted files were
+found in the channel, rebuilt into the record, and the next sync returned
+**`unchanged` with zero uploads**.
+
+`/leech` also warns when the storage is not durable:
+
+```
+⚠️ storage is not durable — a restart wipes my memory. I rebuild it from the
+   channel on boot, but setting GITHUB_TOKEN (state gist) is safer.
+```
+
+### Why the same release could upload again
+
+Three causes were found and fixed, all of which made a release look "new" again:
+
+1. **The record was truncated mid-JSON** once it grew past 60,000 characters, so it
+   could not be read back at all. Now it is trimmed by whole entries and is always
+   valid JSON.
+2. **The record was never written out immediately** — the state file is debounced,
+   so a restart lost it. Since your bot has restarted 23+ times, that alone explains
+   repeats. It is now flushed the moment a release is handled.
+3. **A corrupt record failed silently.** It now logs an error naming the problem
+   instead of quietly treating everything as new.
+
+Verified by simulating a restart: post → wipe memory → reload from disk → **0**
+re-posts.
+
+**One cause no code can fix: two instances running.** If the host runs more than one
+copy (two deployments, or `uvicorn --workers 4`), each has its own memory and each
+posts. `/leech` now shows an **instance id**:
+
+```
+code: leech-2026-11-05h · instance 4f2a9c
+```
+
+If that changes between checks while you did not redeploy, something is restarting
+or duplicating the process. Run **one** instance with **one** worker.
+
 ### Stalls are detected and resumed
 
 GitHub sometimes stops sending mid-file. With one blocking read the socket just
@@ -2000,6 +2048,33 @@ Bonki, scan this group and tag apple music apk
 ```
 
 ---
+
+## Running in 256 MB (low-memory mode)
+
+A 256 MB container was OOM-killing the process every ~72 seconds. That looked like
+"the bot restarts and re-posts everything", but the cause was simply not enough RAM
+for what was being loaded.
+
+**It is detected automatically** — if the container's memory limit is under 400 MB,
+or `LOW_MEMORY=1` is set, the bot switches to low-memory mode.
+
+What it turns off, and why it costs nothing in practice:
+
+| Off in low-memory mode | Effect |
+|---|---|
+| numpy-backed ML (intent net, categoriser, ranker, LSA vectors) | **~43 MB saved**; fuzzy + TF-IDF search still works |
+| analytics snapshots, scheduled skills, federation sync, learn-loop | background extras, not needed to run |
+| parallel uploads (3 → 1) | slower on 3 files, far less RAM |
+
+`numpy` was being imported at startup by the vector module even when never used.
+It is now imported lazily, which is where the bulk of the saving comes from:
+**101 MB → 58 MB** at import.
+
+`/diag` shows the mode (`low-memory (256 MB limit)`), and the startup log says which
+loops were skipped.
+
+**What is still on:** Telegram polling, the leech watcher, downloads/uploads,
+search, moderation, and the user account.
 
 ## Surviving a restart, redeploy or server renewal
 

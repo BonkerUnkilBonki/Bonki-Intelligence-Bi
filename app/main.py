@@ -18,9 +18,10 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.templating import Jinja2Templates
 
-from . import (agent, analytics, approval, db, federation, gitly, handlers,
-               health, indexer, learn, learnloop, llm, ollama, outbox, skills,
-               telegram, userbot)
+from . import (agent, approval, db, gitly, handlers, health, indexer, learn,
+               llm, lowmem, ollama, outbox, telegram, userbot)
+if not lowmem.is_low():
+    from . import analytics, federation, learnloop, skills
 from .config import SECRET_KEYS
 
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +84,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(gitly.loop())
     try:
         st = db.storage_info()
-        log.info("startup: storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",
+        log.info("startup: mem=%s storage=%s, groups=%d, files=%d, brain=%s, userbot=%s",
+                 lowmem.describe(),
                  st["mode"], len(db.list_groups()), db.count_files(),
                  llm.describe(), "on" if userbot.configured() else "off")
         if st["mode"] == "local":
@@ -125,10 +127,14 @@ async def lifespan(app: FastAPI):
 
     # background schedulers: /skill tasks and analytics snapshots
     try:
-        asyncio.create_task(skills.loop())
-        asyncio.create_task(analytics.snapshot_loop())
-        asyncio.create_task(federation.sync_loop())
-        asyncio.create_task(learnloop.loop())
+        if lowmem.is_low():
+            log.info("low-memory mode: analytics, skills, federation sync and the "
+                     "learning loop are OFF (they cost RAM a 256 MB box does not have)")
+        else:
+            asyncio.create_task(skills.loop())
+            asyncio.create_task(analytics.snapshot_loop())
+            asyncio.create_task(federation.sync_loop())
+            asyncio.create_task(learnloop.loop())
     except Exception as e:
         log.warning("background loops not started: %s", e)
     yield

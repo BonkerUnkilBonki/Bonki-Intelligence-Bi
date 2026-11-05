@@ -24,9 +24,41 @@ import re
 import tempfile
 import time
 
-from . import (analytics, ask, browse, categorize, db, embed, extras, federation,
-               gitly, keys, memory, ml, modes, modules, ollama, perms, security,
-               skills, stickers, telegram, websearch)
+from . import (analytics, ask, browse, db, extras, federation, gitly, keys, memory,
+               modes, modules, ollama, perms, security, skills, stickers, telegram,
+               websearch)
+
+# numpy-backed helpers cost ~30 MB; skip them on a small container.
+try:
+    from . import lowmem
+    _LOW = lowmem.is_low()
+except Exception:
+    _LOW = False
+
+if not _LOW:
+    from . import categorize, embed, ml
+else:
+    class _MLOff:
+        @staticmethod
+        def status(chat_id=None):
+            return {"brain": "low-memory mode", "files": 0, "rows": []}
+
+        @staticmethod
+        def explain(q, chat_id=None, limit=5):
+            return {"query": q, "rows": []}
+
+    ml = _MLOff()
+
+    class _Off:
+        @staticmethod
+        def enabled():
+            return False
+
+        @staticmethod
+        def available():
+            return False
+
+    categorize = embed = _Off()
 
 log = logging.getLogger("rose")
 
@@ -1056,6 +1088,11 @@ async def cmd_diag(chat, msg, user, args):
     # 4. modules
     off = [modules.MODULES[n][0] for n in modules.MODULES if not modules.enabled(cid, n)]
     lines.append("• modules off: " + (", ".join(off) if off else "none"))
+    try:
+        from . import lowmem as _lm
+        lines.append(f"• memory mode: {telegram.esc(_lm.describe())}")
+    except Exception:
+        pass
     try:
         from . import perms as _p
         lines.append("• mode: " + ("✅ full (admin)" if await _p.bot_admin(cid)

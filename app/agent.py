@@ -27,8 +27,50 @@ import re
 import tempfile
 import time
 
-from . import (approval, categorize, db, embed, indexer, learn, llm, nn,
-               ranker, rose, telegram, userbot, webscan)
+from . import approval, db, indexer, learn, llm, rose, telegram, userbot, webscan
+
+# The numpy-backed layers (intent net, categoriser, ranker, embeddings) cost real
+# memory. On a 256 MB container that alone got the process OOM-killed, so they are
+# imported only when there is room. Fuzzy + TF-IDF search works either way.
+try:
+    from . import lowmem
+    _LOW = lowmem.is_low()
+except Exception:
+    _LOW = False
+
+if not _LOW:
+    from . import categorize, embed, nn, ranker
+else:                                     # tiny stand-ins, same interface
+    class _Off:
+        @staticmethod
+        def enabled():
+            return False
+
+        @staticmethod
+        def available():
+            return False
+
+        @staticmethod
+        def rerank(ranked, *a, **k):
+            return ranked
+
+        @staticmethod
+        def classify(*a, **k):
+            return (None, 0.0, {})
+
+        @staticmethod
+        def features(*a, **k):
+            return {}
+
+        @staticmethod
+        def train(*a, **k):
+            return None
+
+        @staticmethod
+        def embed_many(*a, **k):
+            return {}
+
+    categorize = embed = nn = ranker = _Off()
 
 log = logging.getLogger("agent")
 

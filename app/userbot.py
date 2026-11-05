@@ -325,6 +325,36 @@ async def list_participants(handle, limit=1000):
     return out
 
 
+async def recent_documents(handle, limit=100, thread_id=None):
+    """Recent messages in a chat/topic that carry a file.
+
+    Used to rebuild the leech record after a restart when the state store is
+    ephemeral: whatever is already in the channel counts as posted.
+    """
+    if _client is None:
+        raise RuntimeError("user account is not connected")
+    entity = await _entity(handle)
+    kwargs = {"limit": limit}
+    if thread_id:
+        kwargs["reply_to"] = int(thread_id)
+    out = []
+    async for msg in _client.iter_messages(entity, **kwargs):
+        doc = getattr(msg, "document", None)
+        if doc is None:
+            continue
+        name = None
+        for attr in getattr(doc, "attributes", []) or []:
+            fn = getattr(attr, "file_name", None)
+            if fn:
+                name = fn
+                break
+        if not name:
+            continue
+        out.append({"id": getattr(msg, "id", None), "name": name,
+                    "caption": getattr(msg, "message", "") or ""})
+    return out
+
+
 async def list_dialogs(limit=200):
     """Groups/channels the account is a member of - for the dashboard picker."""
     if _client is None:

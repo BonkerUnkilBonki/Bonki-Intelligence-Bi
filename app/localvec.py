@@ -21,10 +21,22 @@ import logging
 import math
 import re
 
-try:
-    import numpy as np
-except Exception:                                    # pragma: no cover
-    np = None
+# numpy is imported LAZILY. Importing it costs ~30 MB, which is enough to get the
+# process OOM-killed on a 256 MB container even when the vectors are never used.
+np = None
+_np_tried = False
+
+
+def _np():
+    global np, _np_tried
+    if np is None and not _np_tried:
+        _np_tried = True
+        try:
+            import numpy as _numpy
+            np = _numpy
+        except Exception:                            # pragma: no cover
+            np = None
+    return np
 
 log = logging.getLogger("localvec")
 
@@ -83,6 +95,9 @@ def _corpus_key(texts):
 
 
 def fit(texts):
+    np = _np()
+    if np is None:
+        return None
     """Learn IDF (and LSA when the corpus allows) from these texts."""
     if np is None:
         return None
@@ -114,6 +129,9 @@ def fit(texts):
 
 
 def _model_for(texts):
+    np = _np()
+    if np is None:
+        return None
     key = _corpus_key(texts)
     if _cache["key"] == key and _cache["model"] is not None:
         return _cache["model"]
@@ -123,6 +141,9 @@ def _model_for(texts):
 
 
 def _vec(model, text):
+    np = _np()
+    if np is None:
+        return None
     if model is None or np is None:
         return None
     v = np.array(_sparse(text, model["idf"]))
@@ -148,7 +169,10 @@ def embed_many(texts, corpus=None):
 
 
 def available():
-    return np is not None
+    from . import lowmem
+    if lowmem.is_low():
+        return False            # never pull numpy in on a small container
+    return _np() is not None
 
 
 def describe():

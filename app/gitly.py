@@ -26,7 +26,8 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05g"   # bump when the leech code changes
+BUILD = "leech-2026-11-05j"   # bump when the leech code changes
+INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
 DEFAULT_REPO = "SwitchToMonk/Gitly"
@@ -387,6 +388,18 @@ async def check(force=False, target=None):
 async def loop():
     log.info("gitly release watcher started (repo=%s)", repo())
     await asyncio.sleep(5)
+    # After a restart the state store may be empty (ephemeral disk). Read the
+    # channel instead of re-posting everything.
+    try:
+        if routes():
+            n_routes, n_entries = await asyncio.to_thread(rebuild_from_channel)
+            if n_entries:
+                log.info("leech: rebuilt %d record(s) from the channel across %d "
+                         "route(s) - nothing will be re-posted", n_entries, n_routes)
+            elif n_routes:
+                log.info("leech: no existing posts found to rebuild from")
+    except Exception as e:
+        log.info("leech rebuild skipped: %s", e)
     while True:
         try:
             db.set_settings({"gitly_loop_last": str(int(time.time()))})
@@ -1029,6 +1042,7 @@ Repeat in each topic. One repo can feed several topics.
 
 <b>Something stuck?</b>
 <code>/leech resync</code> — forget what was posted and upload it all again
+<code>/leech rebuild</code> — rebuild the record from the channel (after a restart)
 
 <b>Start over</b>
 <code>/leech reset</code> — delete every stored leech setting (asks first)
@@ -1124,6 +1138,24 @@ async def cmd_leech(chat, msg, user, args):
 
     if sub in ("help", "?", "commands"):
         return await rose._reply(chat, msg, LEECH_HELP)
+
+    if sub in ("rebuild", "restore", "scanchannel"):
+        if not owner and not admin:
+            return await rose._reply(chat, msg, "Admins only.")
+        await rose._reply(chat, msg, "🔎 Reading the channel to rebuild the record…")
+        try:
+            n_routes, n_entries = await asyncio.to_thread(rebuild_from_channel, 200)
+        except Exception as e:
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+        if not n_entries:
+            return await rose._reply(
+                chat, msg,
+                "Nothing found to rebuild.\n<i>This needs the user account "
+                "connected — a bot cannot read channel history.</i>")
+        return await rose._reply(
+            chat, msg,
+            f"✅ Rebuilt {n_entries} record(s) from {n_routes} route(s).\n"
+            f"Files already in the channel will not be posted again.")
 
     if sub in ("resync", "repair", "redo", "force"):
         if not owner and not admin:
@@ -1336,10 +1368,18 @@ async def cmd_leech(chat, msg, user, args):
 
     # status
     rows = routes()
-    lines = ["📦 <b>Bonki Leech</b>", f"<i>code: {BUILD}</i>", ""]
+    lines = ["📦 <b>Bonki Leech</b>", f"<i>code: {BUILD} · instance {INSTANCE}</i>", ""]
     cur = (db.get_settings().get("leech_repo") or "").strip()
     lines.append(f"• repo being configured: "
                  f"{'<code>' + telegram.esc(cur) + '</code>' if cur else 'none'}")
+    try:
+        st_info = db.storage_info()
+        if not st_info.get("durable"):
+            lines.append("• ⚠️ <b>storage is not durable</b> — a restart wipes my "
+                         "memory. I rebuild it from the channel on boot, but "
+                         "setting GITHUB_TOKEN (state gist) is safer.")
+    except Exception:
+        pass
     try:
         last_loop = int(db.get_settings().get("gitly_loop_last") or 0)
     except (TypeError, ValueError):
@@ -1518,9 +1558,14 @@ def post_event_to(repo_name, event, item, route):
 # change we delete our old posts and upload the new ones. When only the text
 # changes we edit the caption, which keeps the message and its file intact.
 def _rstate():
+    raw = db.get_settings().get("leech_state") or "{}"
     try:
-        return json.loads(db.get_settings().get("leech_state") or "{}")
-    except Exception:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        if raw and raw not in ("", "{}"):
+            log.error("leech_state is corrupt (%s) - %d chars lost. Every release "
+                      "will look new until /leech resync clears it.", e, len(raw))
         return {}
 
 
@@ -1685,6 +1730,14 @@ def sync_release(rel, route):
         return "sent-text"
 
     # ---- the file set changed: remove what we posted, start again ----
+    # A record rebuilt from the channel has no signature. If it already lists every
+    # file that is on the release, adopt this signature instead of deleting and
+    # re-uploading everything.
+    if entry and entry.get("sig") == "" and sig:
+        done_names = {k for k in (entry.get("done") or {})}
+        current = {a.get("name") for a in assets if a.get("name")}
+        if current and current <= done_names:
+            entry["sig"] = sig
     if entry and entry.get("sig") != sig:
         for mid in (entry.get("msg_ids") or list((entry.get("done") or {}).values())):
             try:
@@ -1733,7 +1786,12 @@ def sync_release(rel, route):
             with lock:
                 results[name] = False
 
-        workers = min(3, len(pending))       # 3 at a time: fast, but not abusive
+        try:
+            from . import lowmem
+            _w = 1 if lowmem.is_low() else 3
+        except Exception:
+            _w = 3
+        workers = min(_w, len(pending))      # one at a time on a small container
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_one, i, a) for i, a in pending]
             for f in futures:
@@ -1796,6 +1854,18 @@ def sync_release(rel, route):
         entry.pop("failed", None)
     st[key] = entry
     _save_rstate(st)
+    # Write it out NOW. The state file is debounced, so a restart (or a second
+    # instance) would otherwise not know these files were already posted - which is
+    # what made the same release upload again after every restart.
+    try:
+        db.flush(force=True)
+    except Exception as e:
+        log.info("state flush failed: %s", e)
+    try:
+        import gc
+        gc.collect()                      # give the RAM back after big files
+    except Exception:
+        pass
 
     if failed:
         return f"partial:{len(failed)}"
@@ -1921,3 +1991,69 @@ def fetch_commits_web(repo_name, limit=10):
         out.append({"id": sha, "short": sha[:7], "message": title,
                     "author": _unescape_html(author), "url": link, "date": ""})
     return out
+
+
+# ------------------------------------------- rebuild after a restart --------
+# The state file can be wiped by a restart on hosts with ephemeral disks. Rather
+# than re-posting everything, read what is ALREADY in the channel and treat those
+# files as done. This needs the user account, because a bot cannot read history.
+_TAG_RE = re.compile(r"Tag:\s*<code>([^<]+)</code>")
+_URL_TAG_RE = re.compile(r"/releases/tag/([^/\s<]+)")
+
+
+def _tag_of(caption):
+    m = _TAG_RE.search(caption or "") or _URL_TAG_RE.search(caption or "")
+    return m.group(1).strip() if m else ""
+
+
+def rebuild_from_channel(limit=100):
+    """Rebuild the posted-record from the channel's own messages.
+
+    Returns (routes_checked, entries_rebuilt).
+    """
+    from . import userbot
+    if not userbot.is_running():
+        return 0, 0
+    st = _rstate()
+    checked = rebuilt = 0
+    for route in routes():
+        checked += 1
+        try:
+            msgs = userbot.run_sync(
+                userbot.recent_documents(route.get("chat_id"), limit,
+                                         route.get("thread_id")), timeout=180)
+        except Exception as e:
+            log.info("rebuild: could not read %s: %s", route.get("chat_id"), e)
+            continue
+        repo_name = str(route.get("repo") or "")
+        # messages come newest-first; walk oldest-first and remember the last
+        # release tag seen, so the follow-up files of that release are attributed
+        # to it (their captions only carry the file name)
+        current_tag = ""
+        for m in reversed(msgs or []):
+            tag = _tag_of(m.get("caption"))
+            if tag:
+                current_tag = tag
+            elif not current_tag:
+                continue
+            tag = tag or current_tag
+            if not tag:
+                continue
+            rid = f"{repo_name}@{tag}"
+            key = _state_key(route, rid)
+            ent = st.get(key) or {"sig": "", "body": "", "done": {}, "msg_ids": []}
+            done = ent.get("done") or {}
+            if m.get("name") and m["name"] not in done:
+                done[m["name"]] = m.get("id")
+            ent["done"] = done
+            ent["msg_ids"] = [v for v in done.values() if v]
+            ent.setdefault("t", int(time.time()))
+            st[key] = ent
+            rebuilt += 1
+    if rebuilt:
+        _save_rstate(st)
+        try:
+            db.flush(force=True)
+        except Exception:
+            pass
+    return checked, rebuilt
