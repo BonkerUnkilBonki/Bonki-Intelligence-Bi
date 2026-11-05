@@ -22,6 +22,7 @@ from . import db
 log = logging.getLogger("userbot")
 
 _client = None
+MAIN_LOOP = None          # the loop the Telethon client is bound to
 _pending = {}
 
 # Telegram document attribute names that carry a file name
@@ -195,6 +196,48 @@ async def forward(handle, message_id, dest_chat, reply_to=None, caption=None):
         except Exception as e:
             log.warning("couldn't set caption on forwarded file: %s", e)
     return new
+
+
+def run_sync(coro, timeout=600):
+    """Run a userbot coroutine from a worker thread, on the CLIENT'S loop.
+
+    Telethon binds to the event loop it was created on. Calling it from another
+    thread's loop raises "attached to a different loop", so hop back to the right
+    one instead of creating a new loop.
+    """
+    if MAIN_LOOP is None or not MAIN_LOOP.is_running():
+        raise RuntimeError("user account loop is not running")
+    fut = asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP)
+    return fut.result(timeout=timeout)
+
+
+async def send_file(handle, path, caption="", thread_id=None):
+    """Upload a file as the USER account - up to 2 GB, not the bot's 50 MB.
+
+    The Bot API caps uploads at 50 MB. A connected user account uses MTProto,
+    which allows 2 GB, so big release assets go out this way instead of being
+    reduced to a download link.
+
+    Trade-off worth knowing: the message is sent by your account, not by the bot,
+    so it shows your name rather than "Bonki".
+    """
+    if _client is None:
+        raise RuntimeError("user account is not connected")
+    entity = await _entity(handle)
+    kwargs = {"caption": (caption or "")[:1024], "parse_mode": "html",
+              "force_document": True}
+    if thread_id:
+        kwargs["reply_to"] = int(thread_id)
+    msg = await _client.send_file(entity, path, **kwargs)
+    return {"ok": True, "result": {"message_id": getattr(msg, "id", None)}}
+
+
+async def delete_message(handle, message_id):
+    """Delete a message as the user account (needed for files it uploaded)."""
+    if _client is None:
+        raise RuntimeError("user account is not connected")
+    entity = await _entity(handle)
+    return await _client.delete_messages(entity, [int(message_id)])
 
 
 async def ask(target, command, wait=8.0):
@@ -414,7 +457,8 @@ async def verify_login(code, password=None):
 
 async def run():
     """Background task: keep a connected client alive for scanning."""
-    global _client
+    global _client, MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()   # every userbot call hops back here
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession

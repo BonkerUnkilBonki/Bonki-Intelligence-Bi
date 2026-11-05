@@ -129,6 +129,21 @@ def _headers():
 
 
 def fetch_releases(repo_full=None, limit=10):
+    """Public releases. Reads the public web pages first - no API, no rate limit.
+
+    Only if that fails AND a token is configured does it fall back to the API.
+    """
+    name = normalize_repo(repo_full or repo())
+    try:
+        return fetch_releases_web(name, limit)
+    except Exception as web_err:
+        log.info("web scrape failed for %s (%s) - trying the API", name, web_err)
+        if not _headers().get("Authorization"):
+            raise RuntimeError(str(web_err)) from web_err
+    return fetch_releases_api(repo_full, limit)
+
+
+def fetch_releases_api(repo_full=None, limit=10):
     """Newest releases first. Returns None when nothing changed (HTTP 304).
 
     A public repo needs NO token. To keep well inside GitHub's 60 requests/hour
@@ -1043,6 +1058,13 @@ def fetch_json(path):
 
 
 def fetch_commits(repo_name, limit=5):
+    """Public commits - web feed first, API only as a token-backed fallback."""
+    try:
+        return fetch_commits_web(repo_name, limit)
+    except Exception as e:
+        log.info("commit web feed failed for %s: %s", repo_name, e)
+        if not _headers().get("Authorization"):
+            raise
     data = fetch_json(f"/repos/{repo_name}/commits?per_page={limit}")
     if data is None:
         return None
@@ -1148,6 +1170,18 @@ def _state_key(route, rid):
     return f"{route.get('chat_id')}:{route.get('thread_id') or ''}:{rid}"
 
 
+def await_userbot_delete(chat_id, message_id):
+    from . import userbot
+    return userbot.run_sync(userbot.delete_message(chat_id, message_id), timeout=180)
+
+
+def await_userbot_send(chat_id, path, caption, thread_id):
+    """Upload through the user account, on the loop Telethon lives on."""
+    from . import userbot
+    return userbot.run_sync(
+        userbot.send_file(chat_id, path, caption, thread_id), timeout=900)
+
+
 def _send_asset(rel, asset, route, index, total):
     """Upload one asset. Returns the message id, or None."""
     name = asset.get("name") or "file"
@@ -1155,14 +1189,27 @@ def _send_asset(rel, asset, route, index, total):
     chat_id = route.get("chat_id")
     thread = route.get("thread_id") or None
 
-    if size > UPLOAD_LIMIT:
-        mb = size / (1024 * 1024)
-        telegram.send_message(
-            build_caption(rel) +
-            f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over Telegram's "
-            f"50 MB bot limit.\nDownload: {asset.get('browser_download_url', '')}",
-            chat_id=chat_id, thread_id=thread)
-        return None
+    big = size > UPLOAD_LIMIT
+    if big:
+        # The 50 MB cap is a BOT API limit. The connected user account can upload
+        # 2 GB, so use it rather than degrading to a link.
+        from . import userbot
+        if not userbot.is_running():
+            mb = size / (1024 * 1024)
+            telegram.send_message(
+                build_caption(rel) +
+                f"\n\n⚠️ <b>{telegram.esc(name)}</b> is {mb:.1f} MB — over the "
+                f"50 MB <b>bot</b> limit, and no user account is connected to lift "
+                f"it.\nDownload: {asset.get('browser_download_url', '')}",
+                chat_id=chat_id, thread_id=thread)
+            return None
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, name)
+            download_asset(asset, dest)
+            caption = build_caption(rel) if index == 0 else (
+                f"📎 <b>{telegram.esc(name)}</b>\n{rel.get('html_url') or ''}")
+            r = await_userbot_send(chat_id, dest, caption, thread)
+            return ((r or {}).get("result") or {}).get("message_id")
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, name)
@@ -1219,7 +1266,13 @@ def sync_release(rel, route):
             try:
                 telegram.delete_message(route.get("chat_id"), mid)
             except Exception as e:
-                log.info("delete old post %s failed: %s", mid, e)
+                # a file uploaded by the user account can only be removed by it
+                try:
+                    from . import userbot
+                    if userbot.is_running():
+                        await_userbot_delete(route.get("chat_id"), mid)
+                except Exception as e2:
+                    log.info("delete old post %s failed: %s / %s", mid, e, e2)
         ids = []
         for i, a in enumerate(assets):
             try:
@@ -1247,3 +1300,126 @@ def sync_release(rel, route):
                "msg_ids": entry.get("msg_ids") or [], "t": int(time.time())}
     _save_rstate(st)
     return "edited" if edited else "unchanged"
+
+
+# --------------------------------------------------- web scraping (no API) ---
+# GitHub publishes releases as ordinary public pages, so none of this needs the
+# API and none of it counts against any rate limit:
+#   /OWNER/REPO/releases.atom                  -> the release list
+#   /OWNER/REPO/releases/expanded_assets/TAG   -> the files of one release
+#   /OWNER/REPO/releases/download/TAG/FILE     -> the file itself
+WEB_UA = {"User-Agent": "Mozilla/5.0 (compatible; Bonki-Intelligence/1.0)"}
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
+
+
+def _web_get(url, timeout=25):
+    r = requests.get(url, headers=WEB_UA, timeout=timeout)
+    if r.status_code == 404:
+        raise RuntimeError("not found — check the repo name")
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.text
+
+
+def _unescape_html(s):
+    import html as _h
+    txt = _h.unescape(s or "")
+    txt = re.sub(r"<br\s*/?>", "\n", txt, flags=re.I)
+    txt = re.sub(r"</p>|</li>|</h\d>", "\n", txt, flags=re.I)
+    txt = re.sub(r"<[^>]+>", "", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+def _parse_size(text):
+    # Strip the sha256 digest first: "...12502974be6af..." otherwise matches as
+    # "12502974 B" and every size comes out wrong.
+    t = re.sub(r"sha256:[0-9a-fA-F]{32,}", " ", text or "")
+    m = re.search(r"([\d.]+)\s*(B|KB|MB|GB)\b", t, re.I)
+    if not m:
+        return 0
+    try:
+        return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).upper()])
+    except Exception:
+        return 0
+
+
+def fetch_assets_web(repo_name, tag):
+    """Files of one release, straight from the public assets panel."""
+    url = f"https://github.com/{repo_name}/releases/expanded_assets/{tag}"
+    html = _web_get(url)
+    out = []
+    # each asset row carries the download link and a size a little further along,
+    # so measure from this link up to the NEXT one (not a fixed window)
+    hits = list(re.finditer(r'href="(/[^"]+/releases/download/[^"]+)"', html))
+    for i, m in enumerate(hits):
+        href = m.group(1)
+        name = href.rsplit("/", 1)[-1]
+        end = hits[i + 1].start() if i + 1 < len(hits) else min(len(html), m.end() + 3000)
+        row = re.sub(r"<[^>]+>", " ", html[m.end():end])
+        size = _parse_size(row)
+        out.append({
+            "id": f"{tag}/{name}",
+            "name": name,
+            "size": size,
+            "browser_download_url": "https://github.com" + href,
+        })
+    seen, uniq = set(), []
+    for a in out:
+        if a["name"] in seen:
+            continue
+        seen.add(a["name"])
+        uniq.append(a)
+    return uniq
+
+
+def fetch_releases_web(repo_name, limit=10):
+    """Releases from the public Atom feed — no API, no rate limit."""
+    repo_name = normalize_repo(repo_name)
+    xml = _web_get(f"https://github.com/{repo_name}/releases.atom")
+    entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)
+    out = []
+    for e in entries[:limit]:
+        tag_m = re.search(r"/releases/tag/([^\"]+)\"", e)
+        tag = tag_m.group(1) if tag_m else ""
+        if not tag:
+            continue
+        title = _unescape_html((re.search(r"<title>(.*?)</title>", e, re.S) or [None, tag])[1])
+        content = (re.search(r"<content[^>]*>(.*?)</content>", e, re.S) or [None, ""])[1]
+        body = _unescape_html(content)
+        updated = (re.search(r"<updated>(.*?)</updated>", e) or [None, ""])[1]
+        link = f"https://github.com/{repo_name}/releases/tag/{tag}"
+        pre = bool(re.search(r"(alpha|beta|rc|preview|pre-?release|nightly|dev)",
+                             f"{tag} {title}", re.I))
+        try:
+            assets = fetch_assets_web(repo_name, tag)
+        except Exception as ex:
+            log.info("assets for %s failed: %s", tag, ex)
+            assets = []
+        out.append({
+            "id": f"{repo_name}@{tag}",
+            "tag_name": tag,
+            "name": title or tag,
+            "body": body,
+            "html_url": link,
+            "draft": False,
+            "prerelease": pre,
+            "updated_at": updated,
+            "assets": assets,
+        })
+    return out
+
+
+def fetch_commits_web(repo_name, limit=10):
+    """Recent commits from the public Atom feed (default branch)."""
+    repo_name = normalize_repo(repo_name)
+    xml = _web_get(f"https://github.com/{repo_name}/commits.atom")
+    entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)
+    out = []
+    for e in entries[:limit]:
+        link = (re.search(r'<link[^>]+href="([^"]+)"', e) or [None, ""])[1]
+        title = _unescape_html((re.search(r"<title>(.*?)</title>", e, re.S) or [None, ""])[1])
+        author = (re.search(r"<name>(.*?)</name>", e, re.S) or [None, "unknown"])[1]
+        sha = link.rsplit("/", 1)[-1] if link else title[:7]
+        out.append({"id": sha, "short": sha[:7], "message": title,
+                    "author": _unescape_html(author), "url": link, "date": ""})
+    return out

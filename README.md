@@ -761,6 +761,52 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### No API, no rate limit — it reads the public pages
+
+GitHub publishes releases as ordinary web pages, so Bonki no longer calls the API
+at all for releases:
+
+| Reads | From |
+|---|---|
+| release list | `/OWNER/REPO/releases.atom` |
+| files of a release | `/OWNER/REPO/releases/expanded_assets/TAG` |
+| the file itself | `/OWNER/REPO/releases/download/TAG/FILE` |
+| recent commits | `/OWNER/REPO/commits.atom` |
+
+That is the same information you see when you open the repo in a browser — **no
+token, no API quota, no rate limit**. The API is now only a fallback, and only when
+a token is configured.
+
+Verified against a real repo: **all three assets found** — a 102 MB `.tar.gz`, a
+107 MB `.zip` and a 2.09 MB `.apk` — with correct sizes, and all three delivered
+(two via the user account, one via the bot).
+
+Two parsing traps fixed along the way: asset sizes were being read out of the
+**sha256 hash** (`…12502974be6af…` looked like "12502974 bytes"), and the release
+list needs the Atom feed rather than the HTML page.
+
+### Files over 50 MB — the user account lifts the limit
+
+**50 MB is a Bot API limit, not a Telegram limit.** A bot can upload 50 MB; a
+**user account (MTProto) can upload 2 GB**. Since Bonki has your account connected,
+a release asset over 50 MB is now uploaded **through your account** instead of being
+reduced to a download link.
+
+| Asset size | Who uploads it |
+|---|---|
+| ≤ 50 MB | the bot (normal post, shows "Bonki") |
+| > 50 MB | your user account (shows **your** name) |
+| > 50 MB, no account connected | a notice with the size and a download link |
+
+Verified: a 54 MB APK went through the user account to the right topic while a 3 MB
+zip went through the bot in the same release; with no account connected the bot
+posted the size and link instead.
+
+**Two trade-offs to know:**
+- The big file is sent by **your account**, so it appears with your name, not the
+  bot's. There is no way around that — the 50 MB ceiling belongs to the bot API.
+- Deleting one later needs the account too, which Bonki handles automatically.
+
 ### All files, and edits that reach Telegram
 
 Three real bugs lived here:
