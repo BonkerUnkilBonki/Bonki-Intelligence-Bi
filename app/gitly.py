@@ -1035,11 +1035,14 @@ async def cmd_leech(chat, msg, user, args):
         return
 
     if sub in ("here", "topic"):
-        if str(chat.get("type")) != "channel":
+        # Anywhere a bot can post is a valid destination: a broadcast channel, a
+        # normal group, or a forum topic inside a group. Only a DM is refused.
+        if str(chat.get("type")) == "private":
             return await rose._reply(
                 chat, msg,
-                "⚠️ Run <code>/leech here</code> <b>inside your channel</b> "
-                "(in the topic you want the posts to land in).\n\n"
+                "⚠️ Run <code>/leech here</code> <b>inside the chat or topic</b> "
+                "where the posts should land — a channel, a group, or a forum "
+                "topic.\n\n"
                 "A DM can't receive releases, so it can't be a destination.\n"
                 "Use <code>/leech help</code> for the full steps.")
         repo_name = (db.get_settings().get("leech_repo") or repo()).strip()
@@ -1060,8 +1063,12 @@ async def cmd_leech(chat, msg, user, args):
         db.set_settings({"gitly_on": "1"})      # a route implies you want it live
         await asyncio.to_thread(db.flush, True)
         modes.set_mode(cid, modes.LEECH)
-        where = (f"topic <code>{thread}</code>" if is_topic
-                 else "the main channel (not a topic)")
+        if is_topic:
+            where = f"this topic (<code>{thread}</code>)"
+        elif str(chat.get("type")) == "channel":
+            where = "the channel's main feed (no topic)"
+        else:
+            where = "this group's main feed (no topic)"
         return await rose._reply(
             chat, msg,
             ("✅ " if added else "♻️ Already set: ") +
