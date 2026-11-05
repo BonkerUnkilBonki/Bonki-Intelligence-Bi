@@ -761,6 +761,66 @@ A bot **must** be an admin with *Post messages* to send anything in a channel.
 That is a Telegram rule, not a Bonki limitation — no bot can post in a channel as
 a plain member. `/setup` says so plainly when run inside a channel.
 
+### A release with no files is no longer invisible
+
+Publishing a release and attaching files a minute later used to post **nothing** —
+the bot waited for assets that never came in time. Now it waits **90 seconds**, then
+posts the changelog on its own with a note, and when the files appear it **replaces**
+that text post with the real uploads.
+
+Verified: no files → waiting; after the grace → the changelog posts; files added
+later → `replaced`, the text post is deleted and the APK goes up.
+
+### Diagnosing "nothing arrives"
+
+`/leech` now shows a heartbeat, so a dead loop is obvious:
+
+```
+• last automatic check: 12s ago
+• watcher: ✅ automatic — checks every 60s
+```
+
+If that number keeps growing past ~70s, the background loop is not running — restart
+the app and check the logs for `gitly loop error`.
+
+`/leech check` also reports what GitHub actually returned:
+
+```
+• SwitchToMonk-Stm/Gitly: 3 release(s), 9 file(s) found
+
+✅ Posted 2 item(s).
+
+Watching
+• 🚀 Releases · SwitchToMonk-Stm/Gitly → Gitly Support · topic 42
+```
+
+Zero releases or an error there names the problem immediately.
+
+### Auto, and a manual check
+
+**Auto is on by default.** `/leech repo` and `/leech here` both switch the watcher
+on, and it checks every **60 seconds** with no further commands. `/leech` says so
+plainly:
+
+```
+• watcher: ✅ automatic — checks every 60s
+• watcher: ⏹ paused — /leech on to resume
+• watcher: idle (nothing configured)
+```
+
+**`/leech check`** forces a check right now, ignoring the interval and any
+rate-limit backoff, then shows what it did and where everything points:
+
+```
+✅ Posted 1 item(s).
+
+Watching
+• 🚀 Releases · SwitchToMonk-Stm/Gitly → Gitly Support · topic 42
+```
+
+With nothing configured it says so and gives the two setup steps instead of failing
+quietly.
+
 ### `/leech reset` — start completely over
 
 Deletes **everything** the leech side stores, behind a confirmation button:

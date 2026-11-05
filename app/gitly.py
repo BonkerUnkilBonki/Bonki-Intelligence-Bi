@@ -319,9 +319,10 @@ async def check(force=False, target=None):
 
 async def loop():
     log.info("gitly release watcher started (repo=%s)", repo())
-    await asyncio.sleep(45)
+    await asyncio.sleep(5)
     while True:
         try:
+            db.set_settings({"gitly_loop_last": str(int(time.time()))})
             if enabled() and routes():
                 n, status = await check_routes()
                 if n:
@@ -858,7 +859,12 @@ def post_release_to(rel, route):
 
 
 async def check_routes(force=False):
-    """Post new activity for every configured route, grouped by repo and event."""
+    """Post new activity for every configured route, grouped by repo and event.
+
+    force=True ignores the rate-limit backoff - used by the manual /leech check.
+    """
+    if force:
+        db.set_settings({"gitly_backoff_until": ""})
     rows = routes()
     if not rows:
         return 0, "no-routes"
@@ -885,7 +891,7 @@ async def check_routes(force=False):
                     try:
                         if event == "release":
                             st = await asyncio.to_thread(sync_release, item, route)
-                            ok = st in ("sent", "replaced", "edited")
+                            ok = st in ("sent", "replaced", "edited", "sent-text")
                         else:
                             st = await asyncio.to_thread(post_event_to, repo_name,
                                                          event, item, route)
@@ -922,6 +928,9 @@ Repeat in each topic. One repo can feed several topics.
 
 <b>Turn on / off</b>
 <code>/leech on</code> · <code>/leech off</code>
+
+<b>Check right now</b>
+<code>/leech check</code> — forces an immediate look at every repo
 
 <b>Start over</b>
 <code>/leech reset</code> — delete every stored leech setting (asks first)
@@ -1013,6 +1022,48 @@ async def cmd_leech(chat, msg, user, args):
 
     if sub in ("help", "?", "commands"):
         return await rose._reply(chat, msg, LEECH_HELP)
+
+    if sub in ("check", "now", "scan", "sync", "run"):
+        if not routes():
+            return await rose._reply(
+                chat, msg,
+                "Nothing is being watched yet.\n"
+                "1. <code>/leech repo owner/name</code>\n"
+                "2. open the topic and send <code>/leech here release</code>")
+        await rose._reply(chat, msg,
+                          f"🔎 Checking {len({r.get('repo') for r in routes()})} "
+                          f"repo(s) now…")
+        lines = []
+        # show what GitHub returned, so an empty fetch is visible
+        for rp in {r.get("repo") for r in routes()}:
+            try:
+                found = await asyncio.to_thread(fetch_releases, rp, 5)
+                cnt = len(found or [])
+                assets = sum(len(x.get("assets") or []) for x in (found or []))
+                lines.append(f"• <code>{telegram.esc(str(rp))}</code>: {cnt} "
+                             f"release(s), {assets} file(s) found")
+            except Exception as e:
+                lines.append(f"• <code>{telegram.esc(str(rp))}</code>: "
+                             f"⚠️ {telegram.esc(str(e)[:80])}")
+        lines.append("")
+        n, status = await check_routes(force=True)
+        if n:
+            lines.append(f"✅ Posted <b>{n}</b> item(s).")
+        elif status == "ok":
+            lines.append("✅ Checked — nothing new since last time.")
+        else:
+            lines.append(f"⚠️ {telegram.esc(status)}")
+        # show what each route points at, so a wrong topic is obvious
+        lines.append("")
+        lines.append("<b>Watching</b>")
+        for r in routes():
+            g = db.get_group_by_chat(r.get("chat_id"))
+            title = (g or {}).get("title") or r.get("chat_id")
+            ev = EVENTS.get(str(r.get("event") or "release"), "🚀 Releases")
+            where = f"topic {r['thread_id']}" if r.get("thread_id") else "main feed"
+            lines.append(f"• {ev} · <code>{telegram.esc(str(r.get('repo')))}</code>"
+                         f" → {telegram.esc(title)} · {where}")
+        return await rose._reply(chat, msg, "\n".join(lines))
 
     if sub in ("reset", "wipe", "factory"):
         if not owner:
@@ -1129,7 +1180,19 @@ async def cmd_leech(chat, msg, user, args):
     cur = (db.get_settings().get("leech_repo") or "").strip()
     lines.append(f"• repo being configured: "
                  f"{'<code>' + telegram.esc(cur) + '</code>' if cur else 'none'}")
-    lines.append(f"• watcher: {'✅ on' if enabled() else '⏹ off'}")
+    try:
+        last_loop = int(db.get_settings().get("gitly_loop_last") or 0)
+    except (TypeError, ValueError):
+        last_loop = 0
+    if last_loop:
+        ago = int(time.time()) - last_loop
+        lines.append(f"• last automatic check: {ago}s ago")
+    if enabled() and rows:
+        lines.append(f"• watcher: ✅ <b>automatic</b> — checks every {interval()}s")
+    elif rows:
+        lines.append("• watcher: ⏹ paused — <code>/leech on</code> to resume")
+    else:
+        lines.append("• watcher: idle (nothing configured)")
     if not rows:
         lines.append("")
         lines.append("No routes yet. Three steps:")
@@ -1389,7 +1452,29 @@ def sync_release(rel, route):
 
     if not entry:
         if not assets:
-            return "waiting"        # not marked seen: retried until files appear
+            # Files often get attached a minute after publishing. Wait a little,
+            # then post the changelog on its own so the release is not invisible.
+            first = st.get(key + ":first")
+            if not first:
+                st[key + ":first"] = int(time.time())
+                _save_rstate(st)
+                return "waiting"
+            if time.time() - int(first) < 90:
+                return "waiting"
+            try:
+                r = telegram.send_message(build_caption(rel) +
+                                          "\n\n<i>No files attached yet — I'll add "
+                                          "them here when they appear.</i>",
+                                          chat_id=route.get("chat_id"),
+                                          thread_id=route.get("thread_id") or None)
+                mid = ((r or {}).get("result") or {}).get("message_id")
+            except Exception as e:
+                log.warning("text-only post failed: %s", e)
+                return "post-failed"
+            st[key] = {"sig": "", "body": body,
+                       "msg_ids": [mid] if mid else [], "t": int(time.time())}
+            _save_rstate(st)
+            return "sent-text"
         ids = []
         for i, a in enumerate(assets):
             try:
