@@ -889,6 +889,28 @@ thing: **deletes its old posts and uploads the new set**.
 Verified all four: adding a third file deleted the two old posts and uploaded three;
 renaming one deleted and re-uploaded; removing one left only the remaining file.
 
+### `tools/selfcheck.py` — run before every build
+
+Two classes of bug have shipped from hand-editing this project, both invisible to a
+syntax check and both only failing on the live host:
+
+1. **a function defined twice**, where the older copy silently wins;
+2. **a module-level name used but no longer defined**, because a bulk edit removed
+   the assignment along with a function body (`WEB_UA is not defined`).
+
+```
+python tools/selfcheck.py
+```
+
+It compiles every module, flags duplicate definitions, checks imports, and — most
+importantly — **runs the GitHub scraper against a fake HTTP layer**, which is what
+catches a missing constant. Verified by deleting `WEB_UA` on purpose:
+
+```
+FAIL: SMOKE gitly: AttributeError: module 'app.gitly' has no attribute 'WEB_UA'
+1 problem(s) — do NOT ship this build.
+```
+
 ### How a release is posted
 
 Exactly the shape you asked for — the changelog gets its own message because a file

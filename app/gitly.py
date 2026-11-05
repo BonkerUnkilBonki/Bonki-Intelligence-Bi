@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05m"   # bump when the leech code changes
+BUILD = "leech-2026-11-05n"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -1953,6 +1953,12 @@ def sync_release(rel, route):
     if edited:
         return "edited"
     return "unchanged"
+
+
+# Module-level constants used by the scraper. (These live OUTSIDE the function
+# bodies so a bad edit cannot remove them along with a function.)
+WEB_UA = {"User-Agent": "Mozilla/5.0 (compatible; Bonki-Intelligence/1.0)"}
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
 
 
 def _web_get(url, timeout=25):
