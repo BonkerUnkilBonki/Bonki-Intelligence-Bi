@@ -1091,6 +1091,9 @@ async def cmd_diag(chat, msg, user, args):
     try:
         from . import lowmem as _lm
         lines.append(f"• memory mode: {telegram.esc(_lm.describe())}")
+        _wd = _lm.work_dir() or "/tmp"
+        lines.append(f"• disk free: {_lm.free_mb(_wd)} MB (temp in "
+                     f"<code>{telegram.esc(_wd)}</code>)")
     except Exception:
         pass
     try:

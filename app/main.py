@@ -40,6 +40,21 @@ def _mask(v):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # clear any half-downloaded files from a previous run (disk is tight)
+    try:
+        import shutil
+        from . import lowmem as _lm
+        _tmp = _lm.work_dir()
+        if _tmp:
+            for name in os.listdir(_tmp):
+                p_ = os.path.join(_tmp, name)
+                try:
+                    shutil.rmtree(p_) if os.path.isdir(p_) else os.unlink(p_)
+                except Exception:
+                    pass
+            log.info("startup: cleared temp downloads in %s", _tmp)
+    except Exception as e:
+        log.info("startup temp cleanup skipped: %s", e)
     threading_start_userbot()
     await handlers.init_identity()
     _ensure_webhook_secret()

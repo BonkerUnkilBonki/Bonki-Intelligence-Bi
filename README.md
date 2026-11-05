@@ -2049,6 +2049,27 @@ Bonki, scan this group and tag apple music apk
 
 ---
 
+## Tight disk (512 MB)
+
+Two things matter on a small disk, and one of them is a trap:
+
+**`/tmp` is often RAM.** On many containers `/tmp` is a `tmpfs`, so downloading a
+102 MB asset there consumes **RAM**, not disk — which then gets the process
+OOM-killed. Downloads now go to `data/tmp` on the real filesystem, falling back only
+if that is not writable. Set `BONKI_TMP` to choose the location yourself.
+
+**Space is checked before every download.** If there isn't room for the file plus
+15% slack, it says so instead of failing halfway:
+
+```
+not enough disk: need about 115 MB, only 40 MB free.
+Free some space or the download cannot start.
+```
+
+Also: temp files are removed immediately after each upload, and the temp folder is
+cleared on every boot, so a crashed download cannot leave 200 MB stranded. `/diag`
+shows free disk and which folder is used.
+
 ## Running in 256 MB (low-memory mode)
 
 A 256 MB container was OOM-killing the process every ~72 seconds. That looked like

@@ -26,7 +26,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05j"   # bump when the leech code changes
+BUILD = "leech-2026-11-05k"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -736,7 +736,7 @@ async def send_release(cq, rid, to_channel=False):
 
     await asyncio.to_thread(telegram.answer_callback_query, cq.get("id"),
                             "Downloading…")
-    with tempfile.TemporaryDirectory() as tmp:
+    with _disk_tmp() as tmp:
         dest = os.path.join(tmp, apk.get("name") or "release.apk")
         try:
             await asyncio.to_thread(download_asset, apk, dest)
@@ -927,7 +927,7 @@ def post_release_to(rel, route):
             log.warning("leech oversize failed: %s", e)
         return "too-big"
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with _disk_tmp() as tmp:
         dest = os.path.join(tmp, name)
         try:
             download_asset(apk, dest)
@@ -1617,6 +1617,33 @@ def await_userbot_send(chat_id, path, caption, thread_id, tracker=None):
         timeout=3600)
 
 
+def _disk_tmp():
+    """TemporaryDirectory on a real disk (never a RAM-backed /tmp)."""
+    try:
+        from . import lowmem
+        where = lowmem.work_dir()
+        if where:
+            return tempfile.TemporaryDirectory(dir=where)
+    except Exception:
+        pass
+    return tempfile.TemporaryDirectory()
+
+
+def _check_space(asset):
+    """Refuse early (with a clear reason) when the disk cannot hold the file."""
+    try:
+        from . import lowmem
+        ok, have, need = lowmem.can_download(asset.get("size"))
+        if not ok:
+            raise RuntimeError(
+                f"not enough disk: need about {need} MB, only {have} MB free. "
+                f"Free some space or the download cannot start.")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
+
 def _send_asset(rel, asset, route, index, total):
     """Upload one asset. Returns the message id, or None."""
     name = asset.get("name") or "file"
@@ -1638,11 +1665,12 @@ def _send_asset(rel, asset, route, index, total):
                 f"it.\nDownload: {asset.get('browser_download_url', '')}",
                 chat_id=chat_id, thread_id=thread)
             return None
-        with tempfile.TemporaryDirectory() as tmp:
+        with _disk_tmp() as tmp:
             dest = os.path.join(tmp, name)
             from . import progress as _pg
             tr = _pg.Tracker(name, size) if _pg.enabled() else None
             try:
+                _check_space(asset)
                 download_asset(asset, dest, progress=_pg.callback_for(tr),
                                on_stall=(tr.stalled if tr else None))
                 if tr:
@@ -1658,11 +1686,12 @@ def _send_asset(rel, asset, route, index, total):
                     tr.failed(e)
                 raise
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with _disk_tmp() as tmp:
         dest = os.path.join(tmp, name)
         from . import progress as _pg
         tr = _pg.Tracker(name, size) if _pg.enabled() else None
         try:
+            _check_space(asset)
             download_asset(asset, dest, progress=_pg.callback_for(tr),
                            on_stall=(tr.stalled if tr else None))
             if tr:
