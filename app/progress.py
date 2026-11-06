@@ -27,6 +27,29 @@ def enabled():
     return str(db.get_settings().get("leech_progress") or "1") == "1"
 
 
+def where():
+    """dm (default) | channel | both | off."""
+    val = str(db.get_settings().get("leech_progress_where") or "dm").lower()
+    if not enabled():
+        return "off"
+    return val if val in ("dm", "channel", "both", "off") else "dm"
+
+
+def targets(route=None):
+    """Where a progress message should go for this file."""
+    mode = where()
+    out = []
+    if mode in ("dm", "both"):
+        o = _owner()
+        if o:
+            out.append({"chat_id": o, "thread_id": None, "kind": "dm"})
+    if mode in ("channel", "both") and route:
+        out.append({"chat_id": route.get("chat_id"),
+                    "thread_id": route.get("thread_id") or None,
+                    "kind": "channel"})
+    return out
+
+
 def human(n):
     try:
         n = float(n or 0)
@@ -48,18 +71,24 @@ def bar(frac, width=12):
 class Tracker:
     """One file's journey: download -> upload -> done."""
 
-    def __init__(self, name, size=0, chat_title=""):
+    def __init__(self, name, size=0, chat_title="", route=None):
         self.name = name
         self.size = int(size or 0)
         self.chat_title = chat_title
-        self.msg_id = None
         self.dm = _owner()
         self.t0 = time.time()
         self._last_edit = 0.0
         self._last_pct = -1
         self._phase = "start"
-        if self.dm and enabled():
-            self._post(self._render(0, "downloading"))
+        # one message per destination (DM and/or the channel topic)
+        self.slots = []
+        for t in targets(route):
+            slot = dict(t)
+            slot["msg_id"] = None
+            slot["last_edit"] = 0.0
+            self.slots.append(slot)
+        for slot in self.slots:
+            self._post(slot, self._render(0, "downloading"))
 
     # ---------------------------------------------------------------- text --
     def _render(self, done, phase):
@@ -79,25 +108,27 @@ class Tracker:
             line += f"\n<i>{el}s elapsed</i>"
         return line
 
-    def _post(self, text):
+    def _post(self, slot, text):
         try:
-            r = telegram.send_message(text, chat_id=self.dm)
-            self.msg_id = ((r or {}).get("result") or {}).get("message_id")
+            r = telegram.send_message(text, chat_id=slot["chat_id"],
+                                      thread_id=slot.get("thread_id"))
+            slot["msg_id"] = ((r or {}).get("result") or {}).get("message_id")
         except Exception as e:
-            log.info("progress post failed: %s", e)
-            self.dm = None
+            log.info("progress post failed (%s): %s", slot.get("kind"), e)
+            slot["msg_id"] = None
 
     def _edit(self, text, force=False):
-        if not self.dm or not self.msg_id:
-            return
         now = time.time()
-        if not force and (now - self._last_edit) < EDIT_EVERY:
-            return
-        self._last_edit = now
-        try:
-            telegram.edit_message_text(self.dm, self.msg_id, text)
-        except Exception as e:
-            log.info("progress edit failed: %s", e)
+        for slot in self.slots:
+            if not slot.get("msg_id"):
+                continue
+            if not force and (now - slot["last_edit"]) < EDIT_EVERY:
+                continue
+            slot["last_edit"] = now
+            try:
+                telegram.edit_message_text(slot["chat_id"], slot["msg_id"], text)
+            except Exception as e:
+                log.info("progress edit failed (%s): %s", slot.get("kind"), e)
 
     # -------------------------------------------------------------- events --
     def downloading(self, done, total=None):

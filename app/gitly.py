@@ -13,6 +13,7 @@ Notes that matter in practice:
   * Polling is used (no GitHub webhook needed). Every 10 minutes by default.
 """
 import asyncio
+import io
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
@@ -26,7 +27,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-05q"   # bump when the leech code changes
+BUILD = "leech-2026-11-06c"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -1148,7 +1149,13 @@ Repeat in each topic. One repo can feed several topics.
 <code>/leech check</code> — forces an immediate look at every repo
 
 <b>Progress</b>
-<code>/leech progress on</code> · <code>off</code> — live download/upload % in DM
+<code>/leech progress channel</code> — live % in this topic
+<code>/leech progress dm</code> · <code>both</code> · <code>off</code>
+
+<b>Speed</b>
+<code>/leech best</code> — apply the fastest settings in one command
+<code>/leech stream on</code> · <code>off</code> — upload while downloading
+<code>/leech chunk 512</code> — MTProto part size (max 512 KB, fastest)
 
 <b>Who uploads</b>
 <code>/leech upload account</code> · <code>bot</code>
@@ -1156,6 +1163,11 @@ Repeat in each topic. One repo can feed several topics.
 <b>Something stuck?</b>
 <code>/leech resync</code> — forget what was posted and upload it all again
 <code>/leech rebuild</code> — rebuild the record from the channel (after a restart)
+
+<b>Repo info & stars</b>
+<code>/leech info</code> — stars, watchers, forks, releases of every watched repo
+<code>/leech info owner/name</code> — one repo
+<code>/leech stars [username]</code> — repos that user has starred
 
 <b>Start over</b>
 <code>/leech reset</code> — delete every stored leech setting (asks first)
@@ -1249,8 +1261,65 @@ async def cmd_leech(chat, msg, user, args):
             f"Now open the <b>topic</b> you want releases in and send "
             f"<code>/leech here</code>.")
 
-    if sub in ("help", "?", "commands"):
+    if sub in ("help", "?", "commands", "cmd", "cmds"):
         return await rose._reply(chat, msg, LEECH_HELP)
+
+    if sub in ("stars", "starred"):
+        who = rest.strip() or repo().split("/")[0]
+        await rose._reply(chat, msg, f"⭐ Reading <code>{telegram.esc(who)}</code>'s "
+                                     f"starred repos…")
+        try:
+            names = await asyncio.to_thread(starred_repos, who, 25)
+        except Exception as e:
+            return await rose._reply(chat, msg, f"⚠️ {telegram.esc(str(e))}")
+        if not names:
+            return await rose._reply(chat, msg, "No public stars found.")
+        lines = [f"⭐ <b>Starred by {telegram.esc(who)}</b> · {len(names)} repo(s)", ""]
+        for n in names:
+            try:
+                st = await asyncio.to_thread(repo_stats, n)
+                extra = (f" ⭐{st['stars']}" + (f" · {st['language']}"
+                                               if st.get("language") else ""))
+                desc = (st.get("description") or "")[:80]
+            except Exception:
+                extra, desc = "", ""
+            lines.append(f"• <a href=\"https://github.com/{n}\">{telegram.esc(n)}</a>"
+                         f"{extra}")
+            if desc:
+                lines.append(f"   <i>{telegram.esc(desc)}</i>")
+        return await rose._reply(chat, msg, "\n".join(lines)[:3900])
+
+    if sub in ("info", "stats", "about"):
+        target = normalize_repo(rest) if rest else ""
+        names = [target] if target else sorted({str(r.get("repo"))
+                                                for r in routes() if r.get("repo")})
+        if not names:
+            return await rose._reply(
+                chat, msg,
+                "Nothing watched yet — <code>/leech repo owner/name</code>, "
+                "or ask for one: <code>/leech info owner/name</code>")
+        await rose._reply(chat, msg, "🔎 Reading repository info…")
+        lines = ["📊 <b>Repository info</b>", ""]
+        for n in names[:10]:
+            try:
+                st = await asyncio.to_thread(repo_stats, n)
+            except Exception as e:
+                lines.append(f"• <code>{telegram.esc(n)}</code> — ⚠️ "
+                             f"{telegram.esc(str(e)[:60])}")
+                continue
+            watched = " · 👀 watching" if any(
+                str(r.get("repo")) == n for r in routes()) else ""
+            lines.append(f"• <a href=\"https://github.com/{n}\">"
+                         f"<b>{telegram.esc(n)}</b></a>{watched}")
+            bits = [f"⭐ {st['stars']} stars", f"👁 {st['watchers']} watching",
+                    f"🍴 {st['forks']} forks", f"🚀 {st['releases']} releases"]
+            if st.get("language"):
+                bits.append(f"💻 {st['language']}")
+            lines.append("   " + " · ".join(bits))
+            if st.get("description"):
+                lines.append(f"   <i>{telegram.esc(st['description'][:140])}</i>")
+            lines.append("")
+        return await rose._reply(chat, msg, "\n".join(lines)[:3900])
 
     if sub in ("rebuild", "restore", "scanchannel"):
         if not owner and not admin:
@@ -1316,14 +1385,75 @@ async def cmd_leech(chat, msg, user, args):
 
     if sub in ("progress", "verbose"):
         want = rest.strip().lower()
+        if want in ("channel", "here", "topic", "both", "dm", "off"):
+            db.set_settings({"leech_progress_where":
+                             "off" if want == "off" else want,
+                             "leech_progress": "0" if want == "off" else "1"})
+            await asyncio.to_thread(db.flush, True)
+            desc = {"channel": "in this channel/topic",
+                    "here": "in this channel/topic",
+                    "topic": "in this channel/topic",
+                    "both": "in the DM <b>and</b> the channel",
+                    "dm": "in your DM",
+                    "off": "off"}[want]
+            return await rose._reply(chat, msg, f"📊 Progress reports: {desc}.")
         on = want not in ("off", "0", "no", "false")
         db.set_settings({"leech_progress": "1" if on else "0"})
         await asyncio.to_thread(db.flush, True)
         return await rose._reply(
             chat, msg,
-            "📊 Progress reports <b>on</b> — you'll get a live download/upload "
-            "percentage in this DM for every file."
+            "📊 Progress reports <b>on</b>.\n"
+            "<code>/leech progress channel</code> · <code>dm</code> · "
+            "<code>both</code> · <code>off</code>"
             if on else "📊 Progress reports off.")
+
+    if sub in ("best", "turbo", "fastest", "max"):
+        db.set_settings({"leech_stream": "1", "leech_part_kb": "512",
+                         "leech_upload_via": "account", "gitly_interval": "60"})
+        await asyncio.to_thread(db.flush, True)
+        from . import userbot as _ub
+        acct = _ub.is_running()
+        return await rose._reply(
+            chat, msg,
+            "⚡ <b>Fastest settings applied</b>\n\n"
+            "• streaming upload: <b>on</b> — uploads while downloading\n"
+            "• part size: <b>512 KB</b> (Telegram's maximum)\n"
+            f"• sender: <b>{'your user account' if acct else 'the bot'}</b>"
+            + ("" if acct else "\n  <i>(account not connected — using the bot, "
+                               "which cannot stream as fast)</i>") +
+            "\n• check interval: <b>60s</b>\n\n"
+            "<i>These are already the defaults. Nothing here costs RAM or disk.</i>")
+
+    if sub in ("chunk", "parts", "partsize"):
+        try:
+            kb = int(rest.strip() or 0)
+        except ValueError:
+            kb = 0
+        if not kb:
+            return await rose._reply(
+                chat, msg,
+                f"MTProto part size: <b>{__import__('app.userbot', fromlist=['x'])._part_size()} KB</b>"
+                f"\n\n<code>/leech chunk 512</code> — 512 is the maximum Telegram allows"
+                f" and the fastest. Lower it only if uploads fail.")
+        kb = max(32, min(512, kb))
+        db.set_settings({"leech_part_kb": str(kb)})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(
+            chat, msg,
+            f"⚡ Part size set to <b>{kb} KB</b>.\n"
+            f"<i>Larger parts mean fewer round-trips. 512 is the maximum.</i>")
+
+    if sub in ("stream", "speed", "fast"):
+        want = rest.strip().lower()
+        on = want not in ("off", "0", "no", "false")
+        db.set_settings({"leech_stream": "1" if on else "0"})
+        await asyncio.to_thread(db.flush, True)
+        return await rose._reply(
+            chat, msg,
+            "⚡ <b>Streaming upload on</b> — files upload while they download, "
+            "so no 107 MB temp file and roughly half the wait."
+            if on else
+            "🐢 Streaming off — files download fully, then upload.")
 
     if sub in ("check", "now", "scan", "sync", "run"):
         if not routes():
@@ -1517,6 +1647,17 @@ async def cmd_leech(chat, msg, user, args):
     if last_loop:
         ago = int(time.time()) - last_loop
         lines.append(f"• last automatic check: {ago}s ago")
+    try:
+        from . import userbot as _ub
+        _acct = _ub.is_running() and str(
+            db.get_settings().get("leech_upload_via") or "account").lower() != "bot"
+        _stream = str(db.get_settings().get("leech_stream") or "1") == "1"
+        _part = db.get_settings().get("leech_part_kb") or 512
+        lines.append(f"• speed: stream {'✅' if _stream else '⭕'} · "
+                     f"{_part} KB parts · via "
+                     f"{'account' if _acct else 'bot'}")
+    except Exception:
+        pass
     if enabled() and rows:
         lines.append(f"• watcher: ✅ <b>automatic</b> — checks every {interval()}s")
         lines.append("• <i>runs on your server — you can close Telegram and it "
@@ -1809,9 +1950,33 @@ def _send_asset(rel, asset, route, index, total):
         return None
 
     from . import progress as _pg
+    tr = _pg.Tracker(name, size, route=route) if _pg.enabled() else None
+
+    # ---- fast path: stream straight from GitHub to Telegram ----
+    if str(db.get_settings().get("leech_stream") or "1") == "1":
+        try:
+            if tr:
+                tr.uploading()
+            if use_account:
+                r = _stream_upload_account(chat_id, asset, name, thread, tracker=tr)
+            else:
+                stream = HttpStream(asset.get("browser_download_url")
+                                    or asset.get("url"), name, size)
+                try:
+                    r = telegram.send_document(stream, name, caption, chat_id,
+                                               thread_id=thread, tracker=tr)
+                finally:
+                    stream.close()
+            if tr:
+                tr.done()
+            return ((r or {}).get("result") or {}).get("message_id")
+        except Exception as e:
+            log.info("streaming upload failed for %s (%s) - using the file path",
+                     name, e)
+
+    # ---- safe path: download, then upload ----
     with _disk_tmp() as tmp:
         dest = os.path.join(tmp, name)
-        tr = _pg.Tracker(name, size) if _pg.enabled() else None
         try:
             _check_space(asset)
             download_asset(asset, dest, progress=_pg.callback_for(tr),
@@ -1854,12 +2019,33 @@ def _notify_first_run(repo_name, event, route, names):
 
 
 def _post_changelog(rel, route, repo_name=""):
-    """Post the FULL changelog as text message(s). Returns their message ids."""
+    """Post the FULL changelog as text message(s). Returns their message ids.
+
+    Sent by the SAME account as the files: with /leech upload account everything -
+    changelog and attachments - comes from the user account, so a release is not
+    half bot and half you.
+    """
     text = build_changelog_text(rel, repo_name)
+    chat_id = route.get("chat_id")
+    thread = route.get("thread_id") or None
+    via_account = upload_via_account()
     ids = []
     for part in chunk_text(text):
-        r = telegram.send_message(part, chat_id=route.get("chat_id"),
-                                  thread_id=route.get("thread_id") or None)
+        try:
+            if via_account:
+                from . import userbot
+                r = userbot.run_sync(userbot.send_message(chat_id, part, thread),
+                                     timeout=120)
+            else:
+                r = telegram.send_message(part, chat_id=chat_id, thread_id=thread)
+        except Exception as e:
+            log.warning("changelog send failed via %s: %s",
+                        "account" if via_account else "bot", e)
+            # never lose the text: fall back to the other sender
+            try:
+                r = telegram.send_message(part, chat_id=chat_id, thread_id=thread)
+            except Exception:
+                continue
         mid = ((r or {}).get("result") or {}).get("message_id")
         if mid:
             ids.append(mid)
@@ -2270,3 +2456,129 @@ def rebuild_from_channel(limit=100):
         except Exception:
             pass
     return checked, rebuilt
+
+
+# ------------------------------------------------- repo info + stars --------
+def repo_stats(repo_name):
+    """Stars / watchers / releases / description, from the public repo page."""
+    repo_name = normalize_repo(repo_name)
+    html = _web_get(f"https://github.com/{repo_name}")
+    out = {"repo": repo_name}
+
+    def _num(key):
+        m = re.search(r'"%s":\s*(\d+)' % key, html)
+        return int(m.group(1)) if m else 0
+
+    out["stars"] = _num("stargazerCount")
+    out["watchers"] = _num("watcherCount")
+    out["releases"] = _num("releaseCount")
+    m = re.search(r"([\d,]+)\s*</span>\s*forks", html, re.I)
+    out["forks"] = int(m.group(1).replace(",", "")) if m else 0
+    m = re.search(r'<meta name="description" content="([^"]{0,300})', html)
+    desc = _h_unescape(m.group(1)) if m else ""
+    desc = re.sub(r"\s*-\s*" + re.escape(repo_name) + r"\s*$", "", desc)
+    out["description"] = desc
+    langs = re.findall(r'itemprop="programmingLanguage">([^<]{1,30})<', html)
+    out["language"] = langs[0] if langs else ""
+    return out
+
+
+def _h_unescape(t):
+    import html as _h
+    return _h.unescape(t or "").strip()
+
+
+def starred_repos(username, limit=25):
+    """Public repos a user has starred, from their stars page."""
+    user = str(username or "").strip().lstrip("@").strip("/")
+    if not user:
+        raise RuntimeError("give a GitHub username")
+    html = _web_get(f"https://github.com/{user}?tab=stars")
+    seen, out = set(), []
+    for m in re.finditer(r'href="/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"', html):
+        full = m.group(1)
+        if full in seen:
+            continue
+        low = full.lower()
+        if low.startswith(("settings/", "features/", "topics/", "sponsors/",
+                           "marketplace/", "orgs/", "users/", "collections/")):
+            continue
+        seen.add(full)
+        out.append(full)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# --------------------------------------------------- streaming upload -------
+class HttpStream(io.RawIOBase):
+    """A file-like object that reads straight from the GitHub download.
+
+    Uploading this way removes the double write (disk then network): Telegram
+    reads the bytes as GitHub sends them. On a small host that is both faster -
+    the download and the upload overlap - and lighter, because a 107 MB file no
+    longer needs 107 MB of free disk.
+
+    Falls back to a normal temp file if anything goes wrong, so this can only
+    ever be a speed-up.
+    """
+
+    def __init__(self, url, name="file", size=0, timeout=(15, 60)):
+        self.url = url
+        self.name = name
+        self.size = int(size or 0)
+        self._resp = requests.get(url, headers=_headers(), stream=True,
+                                  timeout=timeout)
+        if not self._resp.ok:
+            raise RuntimeError(f"download failed: HTTP {self._resp.status_code}")
+        clen = int(self._resp.headers.get("Content-Length") or 0)
+        if clen:
+            self.size = clen
+        self._it = self._resp.iter_content(1 << 16)
+        self._buf = b""
+        self._done = 0
+
+    # requests/telethon both call read()
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = 1 << 16
+        while len(self._buf) < size:
+            try:
+                chunk = next(self._it)
+            except StopIteration:
+                break
+            if chunk:
+                self._buf += chunk
+        out, self._buf = self._buf[:size], self._buf[size:]
+        self._done += len(out)
+        return out
+
+    def readable(self):
+        return True
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+        try:
+            super().close()
+        except Exception:
+            pass
+
+
+def _stream_upload_account(chat_id, asset, name, thread, tracker=None):
+    """Upload straight from the URL through the user account."""
+    from . import userbot
+    stream = HttpStream(asset.get("browser_download_url") or asset.get("url"),
+                        name, asset.get("size") or 0)
+    try:
+        return userbot.run_sync(
+            userbot.send_stream(chat_id, stream, name, stream.size or
+                                int(asset.get("size") or 0), thread, tracker),
+            timeout=3600)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass

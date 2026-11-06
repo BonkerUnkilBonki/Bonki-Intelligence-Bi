@@ -217,7 +217,11 @@ def send_document(file_path, filename, caption="", chat_id=None, reply_to=None,
         data["allow_sending_without_reply"] = True
     if thread_id:
         data["message_thread_id"] = thread_id
-    if tracker is not None:
+    if hasattr(file_path, "read"):
+        # an open stream (HttpStream): upload while it downloads, no temp file
+        files = {"document": (filename, file_path, "application/octet-stream")}
+        r = requests.post(_url("sendDocument"), data=data, files=files, timeout=3600)
+    elif tracker is not None:
         # wrap the file so upload progress can be measured as requests reads it
         from .progress import ProgressFile
         pf = ProgressFile(file_path, tracker)

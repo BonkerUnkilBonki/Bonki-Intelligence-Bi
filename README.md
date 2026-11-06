@@ -945,6 +945,95 @@ underscore only — a dot ends the tag, so `#Gitly_v7.0.2` would highlight as
 The exact tag is still shown as text on the line below (`v7.0.2 · 🟢 Stable`), so
 nothing is lost.
 
+### Progress in the channel, not just the DM
+
+`/leech progress channel` puts the live download/upload percentage **in the topic
+itself**; `dm`, `both` or `off` for the others. One message per file, edited in
+place, throttled to one edit every 3 seconds.
+
+### One sender per release
+
+The changelog and the files now come from the **same account**. Previously the text
+was posted by the bot and the files by your user account, so a release appeared
+half-and-half. Both follow `/leech upload account|bot`.
+
+### `/leech best` — the fastest settings in one command
+
+All three levers are **already the defaults**, so a fresh install is fast. This just
+forces them (useful after a reset) and reports what is active:
+
+```
+⚡ Fastest settings applied
+
+• streaming upload: on — uploads while downloading
+• part size: 512 KB (Telegram's maximum)
+• sender: your user account
+• check interval: 60s
+```
+
+`/leech` also shows it in the status, so you can confirm at a glance:
+
+```
+• speed: stream ✅ · 512 KB parts · via account
+```
+
+If the user account is not connected, the sender falls back to the bot and the
+command says so — the bot path is slower and cannot stream as well.
+
+### Can Telegram fetch from GitHub directly?
+
+**No.** Neither the Bot API nor MTProto has any method that takes a URL and has
+Telegram pull the file itself. `sendDocument` requires the bytes to be uploaded, and
+MTProto requires `InputFile` bytes too. Every file must pass **through your host**, so
+your uplink is a hard ceiling that no code can lift.
+
+What can be done — all now on:
+
+| Lever | Effect | Cost |
+|---|---|---|
+| **Streaming** (`/leech stream on`) | upload begins while downloading; no temp file | none |
+| **512 KB parts** (`/leech chunk 512`) | Telethon used **128 KB** under 100 MB and 256 KB above; Telegram allows 512 — **half the round-trips** | 512 KB RAM |
+| **User account, not the bot** | MTProto beats a single multipart POST for big files, and resumes | none |
+
+Verified: the part size was genuinely 128/256 KB by Telethon's default
+(`get_appropriated_part_size`) and is now 512 KB.
+
+**What would actually make it much faster, honestly:** a host with a better uplink,
+or one closer to a Telegram datacenter (Amsterdam, Singapore, Miami). If your server
+is far from those, latency dominates and no client setting fixes it.
+
+### Streaming: upload while it downloads
+
+`/leech stream on` (default) feeds the file to Telegram **straight from GitHub**
+instead of writing it to disk first:
+
+| | Before | Streaming |
+|---|---|---|
+| Disk needed for a 107 MB file | 107 MB | **0** |
+| Wall-clock time | download, then upload | both overlap — roughly half |
+
+It falls back to the old download-then-upload path automatically if a stream fails,
+so it can only ever be a speed-up. `/leech stream off` disables it.
+
+**The honest limit:** your host's bandwidth still caps the speed. Streaming removes
+the double write and overlaps the two transfers — that is the largest win available
+without more RAM or disk, and it costs neither.
+
+### `/leech cmd` — the full command list
+
+Every leech command with a one-line explanation, in the chat or the DM.
+
+### Repo info and stars
+
+```
+/leech info                    every watched repo: stars, watchers, forks, releases
+/leech info owner/name         just that one
+/leech stars [username]        repos that user has starred, with descriptions
+```
+
+Both read the public pages — no API, no token, no rate limit. Verified against a
+live repo: `⭐ 4 stars · 👁 1 watching · 🍴 0 forks · 🚀 2 releases`.
+
 ### Where the release list comes from
 
 **The releases page, not the atom feed.** The feed can still list a release that has

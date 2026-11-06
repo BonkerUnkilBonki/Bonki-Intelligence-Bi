@@ -211,6 +211,64 @@ def run_sync(coro, timeout=600):
     return fut.result(timeout=timeout)
 
 
+async def send_stream(handle, stream, filename, size, thread_id=None, tracker=None):
+    """Upload from an open stream (no temp file on disk).
+
+    Telethon needs the byte count up front for a stream, which we take from
+    Content-Length; the filename is passed explicitly because a stream has none.
+    """
+    if _client is None:
+        raise RuntimeError("user account is not connected")
+    from telethon.tl.types import DocumentAttributeFilename
+    entity = await _entity(handle)
+    kwargs = {
+        "file": stream,
+        "file_size": int(size or 0),
+        "force_document": True,
+        "part_size_kb": _part_size(),
+        "attributes": [DocumentAttributeFilename(filename)],
+    }
+    if thread_id:
+        kwargs["reply_to"] = int(thread_id)
+    if tracker is not None:
+        def _cb(sent, total):
+            try:
+                tracker.uploaded(sent)
+            except Exception:
+                pass
+        kwargs["progress_callback"] = _cb
+    msg = await _client.send_file(entity, **kwargs)
+    return {"ok": True, "result": {"message_id": getattr(msg, "id", None)}}
+
+
+def _part_size():
+    """MTProto part size in KB (max 512).
+
+    Telethon picks 128 KB for files under 100 MB and 256 KB above that. Telegram
+    accepts 512 KB, which halves the number of round-trips - the cheapest real
+    speed-up there is, for one 512 KB buffer of RAM.
+    """
+    try:
+        from . import db
+        kb = int(db.get_settings().get("leech_part_kb") or 512)
+    except Exception:
+        kb = 512
+    kb = max(32, min(512, kb))
+    return kb - (kb % 1)
+
+
+async def send_message(handle, text, thread_id=None):
+    """Post a TEXT message as the user account, so a release comes from one sender."""
+    if _client is None:
+        raise RuntimeError("user account is not connected")
+    entity = await _entity(handle)
+    kwargs = {"parse_mode": "html", "link_preview": False}
+    if thread_id:
+        kwargs["reply_to"] = int(thread_id)
+    msg = await _client.send_message(entity, text, **kwargs)
+    return {"ok": True, "result": {"message_id": getattr(msg, "id", None)}}
+
+
 async def send_file(handle, path, caption="", thread_id=None, tracker=None):
     """Upload a file as the USER account - up to 2 GB, not the bot's 50 MB.
 
@@ -224,7 +282,7 @@ async def send_file(handle, path, caption="", thread_id=None, tracker=None):
     if _client is None:
         raise RuntimeError("user account is not connected")
     entity = await _entity(handle)
-    kwargs = {"force_document": True}
+    kwargs = {"force_document": True, "part_size_kb": _part_size()}
     if caption:                      # no caption at all when empty
         kwargs["caption"] = caption[:1024]
         kwargs["parse_mode"] = "html"
