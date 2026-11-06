@@ -957,6 +957,55 @@ The changelog and the files now come from the **same account**. Previously the t
 was posted by the bot and the files by your user account, so a release appeared
 half-and-half. Both follow `/leech upload account|bot`.
 
+### `/leech stars` and `/leech stargazers` — how to use them
+
+**`/leech stars [username]`** — the repos that *someone else* has starred:
+
+```
+/leech stars SwitchToMonk-Stm
+```
+
+```
+⭐ Starred by SwitchToMonk-Stm · 1 repo(s)
+
+• SwitchToMonk-Stm/Gitly ⭐4
+   A GitHub client for Android. The UI is HTML/CSS in a WebView…
+```
+
+Leave the username off and it uses the repo owner.
+
+**`/leech stargazers [owner/repo]`** — *who* starred **your** repo, most recent first:
+
+```
+/leech stargazers SwitchToMonk-Stm/Gitly
+```
+
+```
+⭐ Stargazers — SwitchToMonk-Stm/Gitly
+4 shown, most recent first
+
+1. SwitchToMonk-Stm
+2. bolltvng
+3. BonkerUnkilBonki
+4. Subbarao6338
+```
+
+Leave the repo off and it uses the first watched repo.
+
+**The honest caveat on stargazers:** GitHub frequently answers **404** for that page
+when it is read automatically, even for a public repo. When that happens the bot
+reports the star **count** and links the page instead of pretending the list is empty:
+
+```
+⭐ SwitchToMonk-Stm/Gitly has 4 star(s).
+
+⚠️ GitHub returned HTTP 404 for the stargazers page (it often blocks automated
+   reads) — open https://github.com/SwitchToMonk-Stm/Gitly/stargazers instead
+```
+
+The parser itself is correct — verified against realistic markup, it extracts the
+usernames in order. It will work whenever GitHub serves the page to your host.
+
 ### `/leech best` — the fastest settings in one command
 
 All three levers are **already the defaults**, so a fresh install is fast. This just

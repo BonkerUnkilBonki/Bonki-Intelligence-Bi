@@ -27,7 +27,7 @@ import requests
 from . import db, telegram
 
 log = logging.getLogger("gitly")
-BUILD = "leech-2026-11-06c"   # bump when the leech code changes
+BUILD = "leech-2026-11-06d"   # bump when the leech code changes
 INSTANCE = os.urandom(3).hex()   # identifies THIS process, to spot duplicates
 
 API = "https://api.github.com"
@@ -1168,6 +1168,7 @@ Repeat in each topic. One repo can feed several topics.
 <code>/leech info</code> — stars, watchers, forks, releases of every watched repo
 <code>/leech info owner/name</code> — one repo
 <code>/leech stars [username]</code> — repos that user has starred
+<code>/leech stargazers [owner/repo]</code> — WHO starred your repo
 
 <b>Start over</b>
 <code>/leech reset</code> — delete every stored leech setting (asks first)
@@ -1263,6 +1264,40 @@ async def cmd_leech(chat, msg, user, args):
 
     if sub in ("help", "?", "commands", "cmd", "cmds"):
         return await rose._reply(chat, msg, LEECH_HELP)
+
+    if sub in ("stargazers", "stargazer", "starredby", "stars_of", "who"):
+        target = normalize_repo(rest) if rest else ""
+        if not target:
+            names = sorted({str(r.get("repo")) for r in routes() if r.get("repo")})
+            target = names[0] if names else ""
+        if not target:
+            return await rose._reply(
+                chat, msg,
+                "Which repo? <code>/leech stargazers owner/name</code>")
+        await rose._reply(chat, msg,
+                          f"⭐ Checking who starred <code>{telegram.esc(target)}</code>…")
+        try:
+            users = await asyncio.to_thread(stargazers, target, 30)
+        except Exception as e:
+            try:
+                st = await asyncio.to_thread(repo_stats, target)
+                count = st.get("stars", 0)
+            except Exception:
+                count = 0
+            return await rose._reply(
+                chat, msg,
+                f"⭐ <b>{telegram.esc(target)}</b> has <b>{count}</b> star(s).\n\n"
+                f"⚠️ {telegram.esc(str(e))}")
+        if not users:
+            return await rose._reply(
+                chat, msg,
+                f"⭐ <b>{telegram.esc(target)}</b> — no stargazers found on the "
+                f"page.\nhttps://github.com/{target}/stargazers")
+        lines = [f"⭐ <b>Stargazers — {telegram.esc(target)}</b>",
+                 f"<i>{len(users)} shown, most recent first</i>", ""]
+        for i, u in enumerate(users, 1):
+            lines.append(f"{i}. <a href=\"https://github.com/{u}\">{telegram.esc(u)}</a>")
+        return await rose._reply(chat, msg, "\n".join(lines)[:3900])
 
     if sub in ("stars", "starred"):
         who = rest.strip() or repo().split("/")[0]
@@ -2582,3 +2617,55 @@ def _stream_upload_account(chat_id, asset, name, thread, tracker=None):
             stream.close()
         except Exception:
             pass
+
+
+# ------------------------------------------------------------ stargazers ----
+_BROWSER_UA = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def stargazers(repo_name, limit=30):
+    """Who starred a repo, from the public stargazers page.
+
+    GitHub does not always serve this page to an anonymous client - it can answer
+    404 even though the repo is public. The caller shows the count and a link in
+    that case rather than pretending there are no stargazers.
+    """
+    repo_name = normalize_repo(repo_name)
+    out, seen = [], set()
+    page = 1
+    while len(out) < limit and page <= 3:
+        url = f"https://github.com/{repo_name}/stargazers?page={page}"
+        r = requests.get(url, headers=_BROWSER_UA, timeout=25)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"GitHub returned HTTP {r.status_code} for the stargazers page "
+                f"(it often blocks automated reads) — open "
+                f"https://github.com/{repo_name}/stargazers instead")
+        found = 0
+        for m in re.finditer(r'data-hovercard-url="/users/([A-Za-z0-9-]+)/hovercard"',
+                             r.text):
+            name = m.group(1)
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+                found += 1
+                if len(out) >= limit:
+                    break
+        if not found:
+            # older markup: plain profile links inside the stargazer list
+            for m in re.finditer(r'<a[^>]+href="/([A-Za-z0-9-]+)"[^>]*class="[^"]*'
+                                 r'(?:avatar|Link--secondary)[^"]*"', r.text):
+                name = m.group(1)
+                if name in seen or name in ("login", "signup", "features"):
+                    continue
+                seen.add(name)
+                out.append(name)
+                if len(out) >= limit:
+                    break
+        page += 1
+    return out
